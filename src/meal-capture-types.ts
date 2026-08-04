@@ -95,7 +95,7 @@ function isJsonMetadata(value: unknown, seen = new Set<object>()): boolean {
         if (seen.has(value)) return false;
         seen.add(value);
         try {
-            if (Array.isArray(value))
+            if (isArray(value))
                 return value.every((item) => isJsonMetadata(item, seen));
             const prototype = Object.getPrototypeOf(value);
             if (prototype !== Object.prototype && prototype !== null)
@@ -116,8 +116,16 @@ function isNonEmptyString(value: unknown): value is string {
     return typeof value === "string" && value.trim().length > 0;
 }
 
+function isArray(value: unknown): value is any[] {
+    try {
+        return Array.isArray(value);
+    } catch {
+        return false;
+    }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === "object" && value !== null && !Array.isArray(value);
+    return typeof value === "object" && value !== null && !isArray(value);
 }
 
 function isValidDate(value: unknown): boolean {
@@ -214,16 +222,13 @@ export function normalizePreparedEvidence(
 export function validatePreparedDraft(draft: unknown): string[] {
     const errors: string[] = [];
     const value: Record<string, unknown> = isRecord(draft) ? draft : {};
-    if (!Array.isArray(value.items))
-        errors.push("draft.items must be an array");
-    if (!Array.isArray(value.inputs))
-        errors.push("draft.inputs must be an array");
-    if (!Array.isArray(value.media))
-        errors.push("draft.media must be an array");
-    const items = Array.isArray(value.items) ? value.items : [];
-    const inputs = Array.isArray(value.inputs) ? value.inputs : [];
-    const draftMedia = Array.isArray(value.media) ? value.media : [];
-    if (items.length === 0 && Array.isArray(value.items))
+    if (!isArray(value.items)) errors.push("draft.items must be an array");
+    if (!isArray(value.inputs)) errors.push("draft.inputs must be an array");
+    if (!isArray(value.media)) errors.push("draft.media must be an array");
+    const items = isArray(value.items) ? value.items : [];
+    const inputs = isArray(value.inputs) ? value.inputs : [];
+    const draftMedia = isArray(value.media) ? value.media : [];
+    if (items.length === 0 && isArray(value.items))
         errors.push("draft.items must not be empty");
     const ordinals = items.map((item) => item?.ordinal);
     if (new Set(ordinals).size !== ordinals.length)

@@ -260,6 +260,64 @@ test("public metadata validators fail closed for revoked Proxies", () => {
     ).toEqual(["message raw_metadata must be JSON metadata"]);
 });
 
+test("public validators fail closed for revoked and throwing array-bearing values", () => {
+    const revoked = (value: object) => {
+        const revocable = Proxy.revocable(value, {});
+        revocable.revoke();
+        return revocable.proxy;
+    };
+    const throwing = new Proxy(
+        {},
+        {
+            getPrototypeOf() {
+                throw new Error("prototype trap");
+            },
+        },
+    );
+
+    for (const raw_metadata of [revoked([]), revoked({}), throwing]) {
+        expect(() =>
+            validateCaptureMessage({
+                external_message_id: "m1",
+                kind: "text",
+                raw_metadata,
+            } as never),
+        ).not.toThrow();
+        expect(
+            validateCaptureMessage({
+                external_message_id: "m1",
+                kind: "text",
+                raw_metadata,
+            } as never),
+        ).toEqual(["message raw_metadata must be JSON metadata"]);
+    }
+    for (const metadata of [revoked([]), revoked({}), throwing]) {
+        expect(() =>
+            validateCaptureMedia({ ...validMedia, metadata } as never),
+        ).not.toThrow();
+        expect(
+            validateCaptureMedia({ ...validMedia, metadata } as never),
+        ).toEqual(["media metadata must be JSON metadata"]);
+    }
+    for (const field of ["items", "inputs", "media"] as const) {
+        for (const value of [revoked([]), revoked({}), throwing]) {
+            const draft = {
+                reported_at: "2026-08-04T12:00:00Z",
+                items: [],
+                inputs: [],
+                media: [],
+                parser_policy_version: "v1",
+                created_by: "hermes",
+                [field]: value,
+            };
+            expect(() => validatePreparedDraft(draft as never)).not.toThrow();
+            expect(validatePreparedDraft(draft as never)).toContain(
+                `draft.${field} must be an array`,
+            );
+        }
+    }
+});
+
 test("validators validate identity and provenance fields and MIME syntax", () => {
     expect(
         validateCaptureMedia({
