@@ -42,6 +42,20 @@ function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isCalculationScope(value: unknown): value is CalculationScope {
+    if (!isPlainJsonObject(value)) return false;
+    const keys = Object.keys(value);
+    const ordinal = value.ordinal;
+    return (
+        keys.length === 1 &&
+        keys[0] === "ordinal" &&
+        (ordinal === null ||
+            (typeof ordinal === "number" &&
+                Number.isInteger(ordinal) &&
+                ordinal >= 0))
+    );
+}
+
 function validateNutrients(
     nutrients: Partial<Nutrients> | null | undefined,
     errors: string[],
@@ -73,8 +87,8 @@ export function validateCalculationBundle(bundle: CalculationBundle): string[] {
             errors.push("provider result must be an object");
             continue;
         }
-        if (!isPlainJsonObject(result.scope)) {
-            errors.push("provider result scope must be an object");
+        if (!isCalculationScope(result.scope)) {
+            errors.push("provider result scope is invalid");
             continue;
         }
         if (!isNutritionProvider(result.provider))

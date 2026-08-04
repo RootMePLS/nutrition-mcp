@@ -53,12 +53,12 @@ describeDb("calculation bundle PostgreSQL integration", () => {
             await client.query(
                 `INSERT INTO meal_events (id, user_id, reported_at, consumed_at, idempotency_key)
                  VALUES ($1, 'integration-test', now(), now(), $2)`,
-                ["00000000-0000-0000-0000-000000000001", "bundle-event"],
+                ["00000000-0000-4000-8000-000000000001", "bundle-event"],
             );
             await client.query(
                 `INSERT INTO meal_event_versions (event_id, version, parser_policy_version, created_by)
                  VALUES ($1, 1, 'integration-test', 'integration-test')`,
-                ["00000000-0000-0000-0000-000000000001"],
+                ["00000000-0000-4000-8000-000000000001"],
             );
         } finally {
             client.release();
@@ -228,7 +228,7 @@ describeDb("calculation bundle PostgreSQL integration", () => {
 
 function makeBundle(): CalculationBundleInput {
     const input = {
-        event_id: "00000000-0000-0000-0000-000000000001",
+        event_id: "00000000-0000-4000-8000-000000000001",
         version: 1,
         capture_id: "capture-1",
         resolved_input: { items: [], inputs: [] },

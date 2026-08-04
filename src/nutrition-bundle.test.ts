@@ -82,3 +82,34 @@ test("failed and unavailable provider rows require honest errors", () => {
         "failed/unavailable results require error_code and error_message",
     );
 });
+
+test("calculation bundles reject malformed scopes without throwing", () => {
+    const malformedScopes = [
+        null,
+        1,
+        "event",
+        {},
+        { ordinal: 1.5 },
+        { ordinal: "1" },
+        { ordinal: 1, unexpected: true },
+    ];
+    for (const scope of malformedScopes) {
+        const bundle = {
+            ...base,
+            results: [{ ...base.results[0]!, scope }],
+        } as never;
+        expect(() => validateCalculationBundle(bundle)).not.toThrow();
+        expect(validateCalculationBundle(bundle)).toEqual(
+            expect.arrayContaining(["provider result scope is invalid"]),
+        );
+    }
+});
+
+test("calculation bundles accept null and non-negative integer item scopes", () => {
+    for (const ordinal of [null, 0, 3]) {
+        const result = { ...base.results[0]!, scope: { ordinal } };
+        const bundle = { ...base, results: [result] };
+        bundle.fingerprint = stableBundleFingerprint(bundle);
+        expect(validateCalculationBundle(bundle)).toEqual([]);
+    }
+});

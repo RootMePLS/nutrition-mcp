@@ -241,7 +241,7 @@ describe("calculation bundle commit seam", () => {
 
 function makeBundle(): CalculationBundleInput {
     const input = {
-        event_id: "00000000-0000-0000-0000-000000000001",
+        event_id: "00000000-0000-4000-8000-000000000001",
         version: 1,
         resolved_input: { items: [], inputs: [] },
         results: [
