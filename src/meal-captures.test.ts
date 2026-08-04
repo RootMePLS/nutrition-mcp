@@ -61,6 +61,86 @@ test("capture messages fail closed for missing ids, invalid dates, kinds, and me
     ]);
 });
 
+test("capture and draft validators fail closed for malformed runtime payloads", () => {
+    expect(validateCaptureMessage({} as never)).toEqual([
+        "message external_message_id is required",
+        "message kind is unsupported",
+    ]);
+    expect(validateCaptureMessage(null as never)).toEqual([
+        "message external_message_id is required",
+        "message kind is unsupported",
+    ]);
+    expect(validateCaptureMedia({} as never)).toEqual([
+        "media kind is unsupported",
+        "media storage_key is required",
+        "media byte_size must be a finite non-negative integer",
+        "media sha256 must be a lowercase hexadecimal SHA-256",
+        "media mime_type is invalid for media kind",
+    ]);
+    expect(validatePreparedDraft({} as never)).toEqual([
+        "draft.items must be an array",
+        "draft.inputs must be an array",
+        "draft.media must be an array",
+        "draft reported_at must be a valid timestamp",
+        "draft parser_policy_version is required",
+        "draft created_by is required",
+    ]);
+});
+
+test("metadata rejects every non-JSON runtime value at any nesting depth", () => {
+    const invalidValues = [
+        undefined,
+        () => 1,
+        Symbol("bad"),
+        1n,
+        { nested: ["ok", { bad: undefined }] },
+        { nested: { bad: () => 1 } },
+        { nested: { bad: Symbol("bad") } },
+        { nested: { bad: 1n } },
+    ];
+    for (const value of invalidValues) {
+        expect(
+            validateCaptureMessage({
+                external_message_id: "m1",
+                kind: "text",
+                raw_metadata: value,
+            } as never),
+        ).toEqual(["message raw_metadata must be JSON metadata"]);
+    }
+});
+
+test("validators validate identity and provenance fields and MIME syntax", () => {
+    expect(
+        validateCaptureMedia({
+            ...validMedia,
+            storage_key: 42,
+            mime_type: "image/jpeg; charset=utf-8",
+        } as never),
+    ).toEqual([
+        "media storage_key is required",
+        "media mime_type is invalid for media kind",
+    ]);
+    expect(
+        validatePreparedDraft({
+            reported_at: "2026-08-04T12:00:00Z",
+            items: [{ ordinal: 0, raw_item_text: "oatmeal" }],
+            inputs: [
+                {
+                    source_kind: "user_text",
+                    content: "oatmeal",
+                    content_hash: 42,
+                },
+            ],
+            media: [],
+            parser_policy_version: "v1",
+            created_by: 42,
+        } as never),
+    ).toEqual([
+        "draft created_by is required",
+        "evidence content_hash must be a lowercase hexadecimal SHA-256",
+    ]);
+});
+
 test("capture media validates identity, kind, size, hash, mime, and metadata", () => {
     expect(validateCaptureMedia({ ...validMedia, storage_key: "" })).toContain(
         "media storage_key is required",
