@@ -302,7 +302,152 @@ describeDb("calculation bundle PostgreSQL integration", () => {
             ).rows[0].raw_payload.calories,
         ).toBe(500);
     });
+
+    test("rejects same-key retries whose correction identity is altered", async () => {
+        const original = makeBundle();
+        await commitCalculationBundle(pool, original);
+        const correction = makeBundle();
+        correction.version = 2;
+        correction.results[0]!.source_id = "corrected-local-source";
+        correction.results[0]!.raw_payload = {
+            provider: "nutrition-local",
+            calories: 600,
+        };
+        correction.results[0]!.nutrients = { calories: 600 };
+        correction.fingerprint = stableBundleFingerprint(correction);
+        const metadata: CalculationCorrectionMetadata = {
+            correction_idempotency_key: "correction-identity-1",
+            correction_reason: "portion corrected",
+            correction_author: "hermes",
+            source_timestamp: "2026-08-05T12:00:00.000Z",
+            confirmed: true,
+            external_write_authorized: true,
+            user_id: "integration-test",
+        };
+        await commitCalculationCorrection(pool, correction, metadata);
+        const before = await correctionRows(pool);
+
+        const alteredRequests: Array<{
+            name: string;
+            bundle: CalculationBundleInput;
+            metadata: CalculationCorrectionMetadata;
+        }> = [];
+        const alteredBundle = structuredClone(correction);
+        alteredBundle.results[0]!.raw_payload = {
+            provider: "nutrition-local",
+            calories: 601,
+        };
+        alteredBundle.results[0]!.nutrients = { calories: 601 };
+        alteredBundle.fingerprint = stableBundleFingerprint(alteredBundle);
+        alteredRequests.push({
+            name: "bundle fingerprint/content",
+            bundle: alteredBundle,
+            metadata,
+        });
+        alteredRequests.push({
+            name: "version",
+            bundle: { ...correction, version: 3 },
+            metadata,
+        });
+        for (const [name, change] of [
+            ["correction reason", { correction_reason: "different reason" }],
+            ["correction author", { correction_author: "different-author" }],
+            [
+                "source timestamp",
+                { source_timestamp: "2026-08-05T13:00:00.000Z" },
+            ],
+            ["confirmation", { confirmed: false }],
+            ["authorization", { external_write_authorized: false }],
+            ["user scope", { user_id: "other-user" }],
+        ] as const) {
+            alteredRequests.push({
+                name,
+                bundle: correction,
+                metadata: { ...metadata, ...change },
+            });
+        }
+
+        for (const request of alteredRequests) {
+            await expect(
+                commitCalculationCorrection(
+                    pool,
+                    request.bundle,
+                    request.metadata,
+                ),
+            ).rejects.toBeInstanceOf(CalculationBundleValidationError);
+            expect(await correctionRows(pool)).toEqual(before);
+        }
+    });
+
+    test("keeps an exact same correction request idempotent", async () => {
+        const original = makeBundle();
+        await commitCalculationBundle(pool, original);
+        const correction = makeBundle();
+        correction.version = 2;
+        correction.results[0]!.source_id = "corrected-local-source";
+        correction.results[0]!.raw_payload = {
+            provider: "nutrition-local",
+            calories: 600,
+        };
+        correction.results[0]!.nutrients = { calories: 600 };
+        correction.fingerprint = stableBundleFingerprint(correction);
+        const metadata: CalculationCorrectionMetadata = {
+            correction_idempotency_key: "correction-identity-2",
+            correction_reason: "portion corrected",
+            correction_author: "hermes",
+            source_timestamp: "2026-08-05T12:00:00.000Z",
+            confirmed: true,
+            external_write_authorized: true,
+            user_id: "integration-test",
+        };
+        const first = await commitCalculationCorrection(
+            pool,
+            correction,
+            metadata,
+        );
+        const before = await correctionRows(pool);
+        const second = await commitCalculationCorrection(
+            pool,
+            correction,
+            metadata,
+        );
+        expect(first.deduplicated).toBe(false);
+        expect(second.deduplicated).toBe(true);
+        expect(await correctionRows(pool)).toEqual(before);
+    });
 });
+
+async function correctionRows(pool: Pool) {
+    return {
+        versions: (
+            await pool.query(
+                `SELECT event_id, version, correction_idempotency_key, correction_reason,
+                        correction_author, source_timestamp, confirmation_received,
+                        external_write_authorized, prior_version,
+                        calculation_bundle_fingerprint
+                   FROM meal_event_versions ORDER BY version`,
+            )
+        ).rows,
+        providers: (
+            await pool.query(
+                `SELECT event_id, version, provider, source_id, raw_payload, calories
+                   FROM meal_event_nutrition_results ORDER BY version, provider`,
+            )
+        ).rows,
+        canonical: (
+            await pool.query(
+                `SELECT event_id, version, status, consensus_status, calories,
+                        source_result_ids, audit_evidence, algorithm_version
+                   FROM meal_event_canonical_results ORDER BY version`,
+            )
+        ).rows,
+        event: (
+            await pool.query(
+                "SELECT current_version, external_write_authorized FROM meal_events",
+            )
+        ).rows,
+    };
+}
 
 function makeBundle(): CalculationBundleInput {
     const input = {

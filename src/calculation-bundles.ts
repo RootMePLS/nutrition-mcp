@@ -253,11 +253,36 @@ export async function commitCalculationCorrection(
             ]);
         const prior = Number(root.rows[0].current_version);
         const existing = await client.query(
-            `SELECT version FROM meal_event_versions WHERE event_id = $1 AND correction_idempotency_key = $2`,
+            `SELECT version, calculation_bundle_fingerprint, correction_reason,
+                    correction_author, source_timestamp, confirmation_received,
+                    external_write_authorized
+               FROM meal_event_versions
+              WHERE event_id = $1 AND correction_idempotency_key = $2`,
             [bundle.event_id, metadata.correction_idempotency_key],
         );
         if (existing.rows[0]) {
-            const version = Number(existing.rows[0].version);
+            const persisted = existing.rows[0];
+            const sameSourceTimestamp =
+                persisted.source_timestamp instanceof Date
+                    ? persisted.source_timestamp.getTime() ===
+                      Date.parse(metadata.source_timestamp)
+                    : String(persisted.source_timestamp) ===
+                      metadata.source_timestamp;
+            const sameIdentity =
+                Number(persisted.version) === bundle.version &&
+                persisted.calculation_bundle_fingerprint ===
+                    bundle.fingerprint &&
+                persisted.correction_reason === metadata.correction_reason &&
+                persisted.correction_author === metadata.correction_author &&
+                sameSourceTimestamp &&
+                persisted.confirmation_received === metadata.confirmed &&
+                persisted.external_write_authorized ===
+                    metadata.external_write_authorized;
+            if (!sameIdentity)
+                throw new CalculationBundleValidationError([
+                    "correction idempotency key conflicts with persisted correction identity",
+                ]);
+            const version = Number(persisted.version);
             return {
                 event_id: bundle.event_id,
                 version,
