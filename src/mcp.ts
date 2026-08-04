@@ -24,7 +24,58 @@ import { NUTRIENT_FIELDS, type NutrientField } from "./meal-types.js";
 import {
     validateCalculationBundle,
     type CalculationBundle,
+    type CalculationBundleInput,
 } from "./nutrition-bundle-types.js";
+import { commitCalculationBundle } from "./calculation-bundles.js";
+
+const CALCULATION_BUNDLE_INPUT_SCHEMA = z.object({
+    event_id: z.string().uuid(),
+    version: z.number().int().min(1),
+    capture_id: z.string().min(1).nullable().optional(),
+    resolved_input: z.object({
+        items: z.array(z.unknown()),
+        inputs: z.array(z.unknown()),
+    }),
+    results: z.array(
+        z.object({
+            provider: z.enum(["nutrition-local", "own", "myfitnesspal"]),
+            status: z.enum(["succeeded", "failed", "unavailable"]),
+            scope: z.object({ ordinal: z.number().int().min(0).nullable() }),
+            source_id: z.string().min(1),
+            request_fingerprint: z.string().min(1),
+            algorithm_version: z.string().min(1),
+            basis: z.enum(["per_item", "per_meal", "per_100g", "serving"]),
+            units: z.literal("g_and_kcal"),
+            nutrients: z
+                .object({
+                    calories: z.number().finite().nullable().optional(),
+                    protein_g: z.number().finite().nullable().optional(),
+                    carbs_g: z.number().finite().nullable().optional(),
+                    fat_g: z.number().finite().nullable().optional(),
+                    fiber_g: z.number().finite().nullable().optional(),
+                    sugar_g: z.number().finite().nullable().optional(),
+                    alcohol_g: z.number().finite().nullable().optional(),
+                })
+                .optional(),
+            raw_payload: z.record(z.string(), z.unknown()),
+            error_code: z.string().nullable().optional(),
+            error_message: z.string().nullable().optional(),
+        }),
+    ),
+    fingerprint: z.string().min(1),
+    canonical_proposal: z
+        .object({
+            calories: z.number().finite().nullable().optional(),
+            protein_g: z.number().finite().nullable().optional(),
+            carbs_g: z.number().finite().nullable().optional(),
+            fat_g: z.number().finite().nullable().optional(),
+            fiber_g: z.number().finite().nullable().optional(),
+            sugar_g: z.number().finite().nullable().optional(),
+            alcohol_g: z.number().finite().nullable().optional(),
+        })
+        .nullable()
+        .optional(),
+});
 
 export function recomputeCanonical(bundle: CalculationBundle) {
     const errors = validateCalculationBundle(bundle);
@@ -4481,6 +4532,26 @@ export function registerTools(
                         }),
                     },
                 ],
+            };
+        },
+    );
+
+    server.registerTool(
+        "commit_calculation_bundle",
+        {
+            title: "Commit Calculation Bundle",
+            description:
+                "Persist an already-computed calculation bundle transactionally and return the canonical result. This tool calls no external providers.",
+            inputSchema: { bundle: CALCULATION_BUNDLE_INPUT_SCHEMA },
+        },
+        async ({ bundle }): Promise<any> => {
+            const result = await commitCalculationBundle(
+                mealEventsPool,
+                bundle as CalculationBundleInput,
+            );
+            return {
+                content: [{ type: "text", text: JSON.stringify(result) }],
+                structuredContent: result,
             };
         },
     );

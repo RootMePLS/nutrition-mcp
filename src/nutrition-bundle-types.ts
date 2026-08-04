@@ -69,6 +69,14 @@ export function validateCalculationBundle(bundle: CalculationBundle): string[] {
         return [...errors, "results must be an array"];
     const seen = new Set<string>();
     for (const result of bundle.results) {
+        if (!isPlainJsonObject(result)) {
+            errors.push("provider result must be an object");
+            continue;
+        }
+        if (!isPlainJsonObject(result.scope)) {
+            errors.push("provider result scope must be an object");
+            continue;
+        }
         if (!isNutritionProvider(result.provider))
             errors.push(`unknown provider: ${result.provider}`);
         if (!isProviderResultStatus(result.status))
@@ -76,7 +84,21 @@ export function validateCalculationBundle(bundle: CalculationBundle): string[] {
         const key = `${result.provider}:${result.scope.ordinal ?? "event"}`;
         if (seen.has(key)) errors.push(`duplicate provider scope: ${key}`);
         seen.add(key);
-        validateNutrients(result.nutrients, errors, "");
+        validateNutrients(
+            isPlainJsonObject(result.nutrients)
+                ? (result.nutrients as Partial<Nutrients>)
+                : result.nutrients === undefined
+                  ? undefined
+                  : null,
+            errors,
+            "",
+        );
+        if (
+            result.nutrients !== undefined &&
+            result.nutrients !== null &&
+            !isPlainJsonObject(result.nutrients)
+        )
+            errors.push("nutrients must be an object");
         if (result.status === "succeeded" && !result.request_fingerprint)
             errors.push("successful results require request fingerprints");
         if (!result.source_id) errors.push("provider source_id is required");
