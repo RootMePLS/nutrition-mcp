@@ -133,6 +133,7 @@ export interface MealEventMediaInput {
     duration_ms?: number | null;
     width?: number | null;
     height?: number | null;
+    metadata?: Record<string, unknown>;
 }
 
 export interface ProviderResultInput {
@@ -160,7 +161,6 @@ export interface CreateMealEventCommand {
     provider_results: ProviderResultInput[];
     parser_policy_version: string;
     created_by: string;
-    /** Internal boundary guard used by log_meal_event for staged media. */
     enforce_media_identity?: boolean;
 }
 

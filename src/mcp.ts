@@ -6,7 +6,10 @@ import type { Pool } from "pg";
 import { createMealEvent, getMealEvent } from "./meal-events.js";
 import {
     appendCaptureMessage,
+    cancelMealCapture,
     confirmMealCapture,
+    expireMealCapture,
+    getMealCapture,
     saveCaptureAnswer,
     savePreparedDraft,
     startMealCapture,
@@ -4329,6 +4332,73 @@ export function registerTools(
                 ],
             };
         },
+    );
+
+    server.registerTool(
+        "get_meal_capture",
+        {
+            title: "Get Meal Capture",
+            description: "Read one durable meal capture.",
+            inputSchema: { capture_id: z.string().min(1) },
+        },
+        async ({ capture_id }) => ({
+            content: [
+                {
+                    type: "text",
+                    text: JSON.stringify(
+                        await getMealCapture(
+                            mealEventsPool,
+                            capture_id,
+                            userId,
+                        ),
+                    ),
+                },
+            ],
+        }),
+    );
+    server.registerTool(
+        "cancel_meal_capture",
+        {
+            title: "Cancel Meal Capture",
+            description: "Cancel an editable meal capture.",
+            inputSchema: { capture_id: z.string().min(1) },
+        },
+        async ({ capture_id }) => ({
+            content: [
+                {
+                    type: "text",
+                    text: JSON.stringify(
+                        await cancelMealCapture(
+                            mealEventsPool,
+                            capture_id,
+                            userId,
+                        ),
+                    ),
+                },
+            ],
+        }),
+    );
+    server.registerTool(
+        "expire_meal_capture",
+        {
+            title: "Expire Meal Capture",
+            description: "Expire an overdue meal capture.",
+            inputSchema: { capture_id: z.string().min(1) },
+        },
+        async ({ capture_id }) => ({
+            content: [
+                {
+                    type: "text",
+                    text: JSON.stringify(
+                        await expireMealCapture(
+                            mealEventsPool,
+                            capture_id,
+                            userId,
+                        ),
+                    ),
+                },
+            ],
+        }),
     );
 
     server.registerTool(

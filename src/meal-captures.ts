@@ -306,6 +306,35 @@ export async function confirmMealCapture(
                 "prepared draft is required",
             ]);
         const draft = row.prepared_draft as PreparedMealDraft;
+        const staged = await client.query(
+            `SELECT kind,storage_key,mime_type,byte_size,sha256,duration_ms,width,height,metadata
+             FROM meal_capture_media WHERE capture_id=$1 ORDER BY created_at,id`,
+            [command.capture_id],
+        );
+        const draftMedia = draft.media ?? [];
+        if (
+            staged.rows.length !== draftMedia.length ||
+            staged.rows.some((m, i) => {
+                const d = draftMedia[i];
+                return (
+                    !d ||
+                    m.kind !== d.kind ||
+                    m.storage_key !== d.storage_key ||
+                    m.mime_type !== d.mime_type ||
+                    Number(m.byte_size) !== d.byte_size ||
+                    m.sha256 !== d.sha256 ||
+                    Number(m.duration_ms ?? 0) !== Number(d.duration_ms ?? 0) ||
+                    Number(m.width ?? 0) !== Number(d.width ?? 0) ||
+                    Number(m.height ?? 0) !== Number(d.height ?? 0) ||
+                    JSON.stringify(m.metadata ?? {}) !==
+                        JSON.stringify(d.metadata ?? {})
+                );
+            })
+        ) {
+            throw new MealCaptureValidationError([
+                "media provenance does not match staged capture media",
+            ]);
+        }
         const event = await createMealEvent(
             pool,
             {
@@ -321,7 +350,6 @@ export async function confirmMealCapture(
                 parser_policy_version: draft.parser_policy_version,
                 created_by: draft.created_by,
                 external_write_authorized: true,
-                enforce_media_identity: false,
             },
             client,
         );

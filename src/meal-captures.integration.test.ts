@@ -115,15 +115,24 @@ describeDb("durable meal capture lifecycle", () => {
             conversation_key: "c3",
             idempotency_key: "capture-3",
         });
-        await saveCaptureMedia(pool, capture.capture_id, "a2-user", {
+        const stagedMedia = {
             kind: "photo",
             storage_key: "staged/photo.jpg",
             mime_type: "image/jpeg",
             byte_size: 12,
             sha256: "b".repeat(64),
             metadata: { width: 10 },
+        } as const;
+        await saveCaptureMedia(
+            pool,
+            capture.capture_id,
+            "a2-user",
+            stagedMedia,
+        );
+        await savePreparedDraft(pool, capture.capture_id, {
+            ...draft,
+            media: [stagedMedia],
         });
-        await savePreparedDraft(pool, capture.capture_id, draft);
         const results = await Promise.all([
             confirmMealCapture(
                 pool,
@@ -162,5 +171,56 @@ describeDb("durable meal capture lifecycle", () => {
             storage_key: "staged/photo.jpg",
             sha256: "b".repeat(64),
         });
+        const eventMedia = await pool.query(
+            "SELECT event_id, version, kind, storage_key, mime_type, byte_size, sha256 FROM meal_event_media WHERE event_id=$1",
+            [results[0]!.event_id],
+        );
+        expect(eventMedia.rows).toHaveLength(1);
+        expect(eventMedia.rows[0]).toMatchObject({
+            event_id: results[0]!.event_id,
+            version: 1,
+            kind: stagedMedia.kind,
+            storage_key: stagedMedia.storage_key,
+            mime_type: stagedMedia.mime_type,
+            byte_size: String(stagedMedia.byte_size),
+            sha256: stagedMedia.sha256,
+        });
+    });
+
+    test("rejects draft media that does not exactly match staged capture media", async () => {
+        const capture = await startMealCapture(pool, {
+            user_id: "a2-user",
+            conversation_key: "mismatch",
+            idempotency_key: "capture-mismatch",
+        });
+        await saveCaptureMedia(pool, capture.capture_id, "a2-user", {
+            kind: "photo",
+            storage_key: "staged/right.jpg",
+            mime_type: "image/jpeg",
+            byte_size: 12,
+            sha256: "c".repeat(64),
+        });
+        await savePreparedDraft(pool, capture.capture_id, {
+            ...draft,
+            media: [
+                {
+                    kind: "photo",
+                    storage_key: "staged/wrong.jpg",
+                    mime_type: "image/jpeg",
+                    byte_size: 12,
+                    sha256: "c".repeat(64),
+                },
+            ],
+        });
+        await expect(
+            confirmMealCapture(
+                pool,
+                { capture_id: capture.capture_id, confirmation: "add" },
+                "a2-user",
+            ),
+        ).rejects.toThrow(/media provenance/);
+        expect(
+            (await getMealCapture(pool, capture.capture_id, "a2-user"))?.state,
+        ).toBe("ready_to_confirm");
     });
 });
