@@ -15,6 +15,11 @@ export class CalculationBundleValidationError extends Error {
     }
 }
 
+export interface CalculationBundleCommitOptions {
+    /** Test-only seam for proving the bundle transaction remains atomic. */
+    beforeCommit?: () => Promise<void>;
+}
+
 export interface CalculationBundleCommitResult {
     event_id: string;
     version: number;
@@ -77,6 +82,7 @@ async function readCanonical(
 export async function commitCalculationBundle(
     pool: Pool,
     bundle: CalculationBundleInput,
+    options: CalculationBundleCommitOptions = {},
 ): Promise<CalculationBundleCommitResult> {
     const issues = validateCalculationBundle(bundle);
     if (issues.length) throw new CalculationBundleValidationError(issues);
@@ -173,6 +179,7 @@ export async function commitCalculationBundle(
             `UPDATE meal_event_versions SET calculation_bundle_fingerprint = $3 WHERE event_id = $1 AND version = $2`,
             [bundle.event_id, bundle.version, bundle.fingerprint],
         );
+        await options.beforeCommit?.();
         return {
             event_id: bundle.event_id,
             version: bundle.version,
