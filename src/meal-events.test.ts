@@ -188,6 +188,29 @@ describe("meal event domain contracts", () => {
             ),
         ).toContain("item ordinals must be unique");
     });
+
+    test("public event validation never throws for throwing array Proxy traps", () => {
+        const throwingArray = (trap: string) =>
+            new Proxy([] as unknown[], {
+                get(target, property, receiver) {
+                    if (property === trap) throw new Error(`${trap} trap`);
+                    return Reflect.get(target, property, receiver);
+                },
+            });
+        for (const field of ["items", "inputs", "media"] as const) {
+            for (const trap of ["length", "map", "some", "every", "get"]) {
+                const command = validCommand({
+                    [field]: throwingArray(trap === "get" ? "0" : trap),
+                } as Partial<CreateMealEventCommand>);
+                expect(() =>
+                    validateCreateMealEventCommand(command),
+                ).not.toThrow(`${field}/${trap}`);
+                expect(
+                    validateCreateMealEventCommand(command).length,
+                ).toBeGreaterThan(0);
+            }
+        }
+    });
 });
 
 // ---------------------------------------------------------------------------

@@ -318,6 +318,36 @@ test("public validators fail closed for revoked and throwing array-bearing value
     }
 });
 
+test("prepared draft validation never throws for throwing array Proxy traps", () => {
+    const throwingArray = (trap: string) =>
+        new Proxy([] as unknown[], {
+            get(target, property, receiver) {
+                if (property === trap) throw new Error(`${trap} trap`);
+                return Reflect.get(target, property, receiver);
+            },
+        });
+
+    for (const field of ["items", "inputs", "media"] as const) {
+        for (const trap of ["length", "map", "some", "every", "get"]) {
+            const value = throwingArray(trap === "get" ? "0" : trap);
+            const draft = {
+                reported_at: "2026-08-04T12:00:00Z",
+                items: [],
+                inputs: [],
+                media: [],
+                parser_policy_version: "v1",
+                created_by: "hermes",
+                [field]: value,
+            };
+            let errors: string[] = [];
+            expect(() => {
+                errors = validatePreparedDraft(draft as never);
+            }).not.toThrow(`${field}/${trap}`);
+            expect(errors).toContain(`draft.${field} must be an array`);
+        }
+    }
+});
+
 test("validators validate identity and provenance fields and MIME syntax", () => {
     expect(
         validateCaptureMedia({

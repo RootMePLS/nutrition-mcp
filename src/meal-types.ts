@@ -216,31 +216,54 @@ export function validateCreateMealEventCommand(
     command: CreateMealEventCommand,
 ): string[] {
     const errors: string[] = [];
-    if (command.items.length === 0) errors.push("items must not be empty");
+    const items = safeArraySnapshot(command.items);
+    const inputs = safeArraySnapshot(command.inputs);
+    const media = safeArraySnapshot(command.media);
+    if (!items) errors.push("items must be an array");
+    if (!inputs) errors.push("inputs must be an array");
+    if (!media) errors.push("media must be an array");
+    const safeItems = (items ?? []) as MealEventItemInput[];
+    const safeMedia = (media ?? []) as MealEventMediaInput[];
+    if (safeItems.length === 0 && items) errors.push("items must not be empty");
     const ordinals = new Set<number>();
-    for (const item of command.items) {
+    for (const item of safeItems) {
         if (!Number.isInteger(item.ordinal) || item.ordinal < 0) {
             errors.push("item ordinals must be non-negative integers");
             break;
         }
         ordinals.add(item.ordinal);
     }
-    if (ordinals.size !== command.items.length) {
+    if (ordinals.size !== safeItems.length) {
         errors.push("item ordinals must be unique");
     }
-    for (const item of command.items) {
+    for (const item of safeItems) {
         if (item.raw_item_text.trim() === "") {
             errors.push("item raw_item_text must not be empty");
             break;
         }
     }
-    for (const media of command.media) {
+    for (const media of safeMedia) {
         if (!Number.isFinite(media.byte_size) || media.byte_size < 0) {
             errors.push("media byte_size must be a non-negative number");
             break;
         }
     }
     return errors;
+}
+
+function safeArraySnapshot(value: unknown): unknown[] | null {
+    try {
+        if (!Array.isArray(value)) return null;
+        const array = value as unknown[];
+        array.length;
+        array.map;
+        array.some;
+        array.every;
+        array[0];
+        return Array.from(array);
+    } catch {
+        return null;
+    }
 }
 
 // ---------------------------------------------------------------------------

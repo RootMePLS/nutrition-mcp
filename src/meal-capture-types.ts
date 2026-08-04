@@ -128,6 +128,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !isArray(value);
 }
 
+function safeArraySnapshot(value: unknown): unknown[] | null {
+    if (!isArray(value)) return null;
+    try {
+        const array = value as unknown[];
+        array.length;
+        array.map;
+        array.some;
+        array.every;
+        array[0];
+        return Array.from(array);
+    } catch {
+        return null;
+    }
+}
+
 function isValidDate(value: unknown): boolean {
     if (value == null) return true;
     if (!(typeof value === "string" || value instanceof Date)) return false;
@@ -222,24 +237,26 @@ export function normalizePreparedEvidence(
 export function validatePreparedDraft(draft: unknown): string[] {
     const errors: string[] = [];
     const value: Record<string, unknown> = isRecord(draft) ? draft : {};
-    if (!isArray(value.items)) errors.push("draft.items must be an array");
-    if (!isArray(value.inputs)) errors.push("draft.inputs must be an array");
-    if (!isArray(value.media)) errors.push("draft.media must be an array");
-    const items = isArray(value.items) ? value.items : [];
-    const inputs = isArray(value.inputs) ? value.inputs : [];
-    const draftMedia = isArray(value.media) ? value.media : [];
-    if (items.length === 0 && isArray(value.items))
-        errors.push("draft.items must not be empty");
-    const ordinals = items.map((item) => item?.ordinal);
+    const items = safeArraySnapshot(value.items) as any[] | null;
+    const inputs = safeArraySnapshot(value.inputs) as any[] | null;
+    const draftMedia = safeArraySnapshot(value.media) as any[] | null;
+    if (items === null) errors.push("draft.items must be an array");
+    if (inputs === null) errors.push("draft.inputs must be an array");
+    if (draftMedia === null) errors.push("draft.media must be an array");
+    if (items?.length === 0) errors.push("draft.items must not be empty");
+    const safeItems = items ?? [];
+    const safeInputs = inputs ?? [];
+    const safeMedia = draftMedia ?? [];
+    const ordinals = safeItems.map((item) => item?.ordinal);
     if (new Set(ordinals).size !== ordinals.length)
         errors.push("draft item ordinals must be unique");
     if (
-        items.some(
+        safeItems.some(
             (item) => !Number.isInteger(item?.ordinal) || item.ordinal < 0,
         )
     )
         errors.push("draft item ordinals must be non-negative integers");
-    if (items.some((item) => !isNonEmptyString(item?.raw_item_text)))
+    if (safeItems.some((item) => !isNonEmptyString(item?.raw_item_text)))
         errors.push("draft item text must not be empty");
     if (value.reported_at == null || !isValidDate(value.reported_at))
         errors.push("draft reported_at must be a valid timestamp");
@@ -250,7 +267,7 @@ export function validatePreparedDraft(draft: unknown): string[] {
     if (!isNonEmptyString(value.created_by))
         errors.push("draft created_by is required");
 
-    for (const input of inputs) {
+    for (const input of safeInputs) {
         const evidence = isRecord(input) ? input : {};
         if (!EVIDENCE_KINDS.has(evidence.source_kind as string))
             errors.push("evidence source_kind is unsupported");
@@ -280,7 +297,7 @@ export function validatePreparedDraft(draft: unknown): string[] {
         )
             errors.push("evidence metadata must be JSON metadata");
     }
-    for (const media of draftMedia) {
+    for (const media of safeMedia) {
         errors.push(
             ...validateCaptureMedia(media as CaptureMediaInput).map((error) =>
                 error.replace(/^media /, "draft media "),
