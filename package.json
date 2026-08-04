@@ -33,12 +33,10 @@
         "format": "bunx prettier --write .",
         "format:check": "bunx prettier --check .",
         "typecheck": "bun run scripts/typecheck.ts",
-        "depersonalize": "bun run scripts/depersonalize.ts",
-        "generate-oauth-creds": "echo \"OAUTH_CLIENT_ID=$(openssl rand -hex 16)\" && echo \"OAUTH_CLIENT_SECRET=$(openssl rand -hex 32)\""
+        "depersonalize": "bun run scripts/depersonalize.ts"
     },
     "dependencies": {
         "@modelcontextprotocol/sdk": "^1.29.0",
-        "@supabase/supabase-js": "^2.110.5",
         "@types/pg": "^8.20.4",
         "hono": "^4.12.30",
         "pg": "^8.22.0",

@@ -1,4 +1,4 @@
-import { getSupabase } from "./supabase.js";
+import { getPool } from "./db.js";
 
 interface AnalyticsRecord {
     user_id: string;
@@ -33,14 +33,14 @@ function categorizeError(error: unknown): string {
     if (msg.includes("required") || msg.includes("missing"))
         return "missing_required_param";
     if (
-        msg.includes("supabase") ||
+        msg.includes("database") ||
         msg.includes("failed to insert") ||
         msg.includes("failed to get") ||
         msg.includes("failed to delete") ||
         msg.includes("failed to update") ||
         msg.includes("failed to search")
     )
-        return "supabase_error";
+        return "database_error";
     if (
         msg.includes("network") ||
         msg.includes("fetch") ||
@@ -71,16 +71,28 @@ function calculateDateRangeDays(
 }
 
 function persistAnalytics(record: AnalyticsRecord): void {
-    getSupabase()
-        .from("tool_analytics")
-        .insert(record)
-        .then(({ error }) => {
-            if (error) {
-                console.warn(
-                    `Failed to persist analytics for ${record.tool_name}:`,
-                    error.message,
-                );
-            }
+    getPool()
+        .query(
+            `INSERT INTO tool_analytics
+                (user_id, tool_name, success, duration_ms, error_category,
+                 date_range_days, mcp_session_id, invoked_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [
+                record.user_id,
+                record.tool_name,
+                record.success,
+                record.duration_ms,
+                record.error_category ?? null,
+                record.date_range_days ?? null,
+                record.mcp_session_id ?? null,
+                record.invoked_at,
+            ],
+        )
+        .catch((error: unknown) => {
+            console.warn(
+                `Failed to persist analytics for ${record.tool_name}:`,
+                (error as Error).message,
+            );
         });
 }
 

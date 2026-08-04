@@ -7,7 +7,7 @@ import {
     fetchAllPages,
     type MealInput,
     type Profile,
-} from "./supabase.js";
+} from "./db.js";
 import { rowContentDigest } from "./import.js";
 
 // Every export exercised here is pure: no test in this file constructs a
@@ -264,12 +264,12 @@ describe("no-profile defaults, together", () => {
 // PostgREST's default db-max-rows of 1000, since getAllMeals had no .range()
 // pagination) ----------
 
-/** An in-memory paged source, standing in for a `.range(from, to)` query. */
+/** An in-memory paged source, standing in for a `LIMIT/OFFSET` query. */
 function paged<T>(rows: T[]) {
     const calls: Array<[number, number]> = [];
-    const fetchPage = async (from: number, to: number): Promise<T[]> => {
-        calls.push([from, to]);
-        return rows.slice(from, to + 1);
+    const fetchPage = async (offset: number, limit: number): Promise<T[]> => {
+        calls.push([offset, limit]);
+        return rows.slice(offset, offset + limit);
     };
     return { fetchPage, calls };
 }
@@ -281,13 +281,13 @@ describe("fetchAllPages", () => {
         expect(await fetchAllPages(fetchPage, 1000)).toEqual(rows);
         // A page shorter than pageSize is itself proof there is no more —
         // one fetch should be enough, not a second empty-page round trip.
-        expect(calls).toEqual([[0, 999]]);
+        expect(calls).toEqual([[0, 1000]]);
     });
 
     test("empty source returns an empty array from a single fetch", async () => {
         const { fetchPage, calls } = paged<number>([]);
         expect(await fetchAllPages(fetchPage, 1000)).toEqual([]);
-        expect(calls).toEqual([[0, 999]]);
+        expect(calls).toEqual([[0, 1000]]);
     });
 
     test("pages through a total larger than one page (the reported bug)", async () => {
@@ -299,8 +299,8 @@ describe("fetchAllPages", () => {
         expect(result).toEqual(rows);
         expect(result).toHaveLength(1500);
         expect(calls).toEqual([
-            [0, 999],
-            [1000, 1999],
+            [0, 1000],
+            [1000, 1000],
         ]);
     });
 
@@ -313,9 +313,9 @@ describe("fetchAllPages", () => {
         const result = await fetchAllPages(fetchPage, 1000);
         expect(result).toEqual(rows);
         expect(calls).toEqual([
-            [0, 999],
-            [1000, 1999],
-            [2000, 2999],
+            [0, 1000],
+            [1000, 1000],
+            [2000, 1000],
         ]);
     });
 
@@ -325,9 +325,9 @@ describe("fetchAllPages", () => {
         const result = await fetchAllPages(fetchPage, 10);
         expect(result).toEqual(rows);
         expect(calls).toEqual([
-            [0, 9],
-            [10, 19],
-            [20, 29],
+            [0, 10],
+            [10, 10],
+            [20, 10],
         ]);
     });
 

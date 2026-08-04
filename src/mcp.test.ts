@@ -30,7 +30,7 @@ import {
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import * as actualSupabase from "./supabase.js";
+import * as actualSupabase from "./db.js";
 import { formatFoodResult, type FoodResult } from "./foods.js";
 import {
     buildDailyBuckets,
@@ -38,7 +38,7 @@ import {
     computeWeeklyDigest,
     type DailyBucket,
 } from "./insights.js";
-import type { Meal, NutritionGoals } from "./supabase.js";
+import type { Meal, NutritionGoals } from "./db.js";
 
 function meal(over: Partial<Meal> = {}): Meal {
     return {
@@ -869,7 +869,7 @@ const db = {
     profilePatches: [] as Record<string, unknown>[],
 };
 
-mock.module("./supabase.js", () => ({
+mock.module("./db.js", () => ({
     ...actualSupabase,
     // analytics.ts persists every tool call through getSupabase(); swallow it
     // so a test never depends on Supabase env vars being present.
@@ -918,7 +918,7 @@ mock.module("./supabase.js", () => ({
 }));
 
 afterAll(() => {
-    mock.module("./supabase.js", () => actualSupabase);
+    mock.module("./db.js", () => actualSupabase);
 });
 
 beforeEach(() => {

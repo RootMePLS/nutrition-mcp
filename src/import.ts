@@ -21,7 +21,7 @@
 //      resolveLoggedAt asserts the round trip rather than trusting the math.
 
 import { z } from "zod";
-import type { MealInput, MealInsertResult } from "./supabase.js";
+import type { MealInput, MealInsertResult } from "./db.js";
 import { dateInTz, zonedHourUtc, zonedWallClockToUtc } from "./tz.js";
 import { decodeEscapeSequences } from "./normalize.js";
 import { toStoredInteger } from "./units.js";

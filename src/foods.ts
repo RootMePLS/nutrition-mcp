@@ -7,7 +7,7 @@
 // back to LLM estimation, so the lookup is always additive, never a hard
 // dependency for logging a meal.
 
-import { getSupabase } from "./supabase.js";
+import { getPool } from "./db.js";
 import { gramsFromDrink, formatAlcohol, type DrinkUnit } from "./alcohol.js";
 
 const OFF_PRODUCT_URL = "https://world.openfoodfacts.org/api/v2/product";
@@ -237,13 +237,12 @@ async function getCachedFood(
     ttlMs: number,
 ): Promise<FoodResult | null> {
     try {
-        const { data, error } = await getSupabase()
-            .from("food_cache")
-            .select("payload, fetched_at")
-            .eq("source", source)
-            .eq("source_id", sourceId)
-            .maybeSingle();
-        if (error || !data) return null;
+        const { rows } = await getPool().query(
+            "SELECT payload, fetched_at FROM food_cache WHERE source = $1 AND source_id = $2",
+            [source, sourceId],
+        );
+        if (rows.length === 0) return null;
+        const data = rows[0];
         const ageMs = Date.now() - new Date(data.fetched_at).getTime();
         if (ageMs > ttlMs) return null;
         const payload = data.payload as FoodResult;
@@ -271,14 +270,11 @@ async function putCachedFood(
     payload: FoodResult,
 ): Promise<void> {
     try {
-        await getSupabase().from("food_cache").upsert(
-            {
-                source,
-                source_id: sourceId,
-                payload,
-                fetched_at: new Date().toISOString(),
-            },
-            { onConflict: "source,source_id" },
+        await getPool().query(
+            `INSERT INTO food_cache (source, source_id, payload, fetched_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (source, source_id) DO UPDATE SET payload = $3, fetched_at = $4`,
+            [source, sourceId, JSON.stringify(payload), new Date().toISOString()],
         );
     } catch {
         // best-effort; ignore
