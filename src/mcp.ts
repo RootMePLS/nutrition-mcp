@@ -4351,6 +4351,7 @@ export function registerTools(
             await appendCaptureMessage(
                 mealEventsPool,
                 args.capture_id,
+                userId,
                 args.message as unknown as CaptureMessageInput,
             );
             return {
@@ -4374,6 +4375,7 @@ export function registerTools(
             await savePreparedDraft(
                 mealEventsPool,
                 args.capture_id,
+                userId,
                 args.draft as unknown as PreparedMealDraft,
             );
             return {
@@ -4469,6 +4471,7 @@ export function registerTools(
             await saveCaptureAnswer(
                 mealEventsPool,
                 args.capture_id,
+                userId,
                 args.answer as unknown as ClarificationAnswer,
             );
             return {

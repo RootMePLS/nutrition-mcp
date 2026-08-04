@@ -156,14 +156,15 @@ export const expireMealCapture = (pool: Pool, id: string, userId: string) =>
 export async function appendCaptureMessage(
     pool: Pool,
     captureId: string,
+    userId: string,
     message: CaptureMessageInput,
 ): Promise<void> {
     const errors = validateCaptureMessage(message);
     if (errors.length) throw new MealCaptureValidationError(errors);
     await withTransaction(pool, async (client) => {
         const { rows } = await client.query(
-            `SELECT state FROM meal_captures WHERE id=$1 FOR UPDATE`,
-            [captureId],
+            `SELECT state FROM meal_captures WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+            [captureId, userId],
         );
         if (!rows.length) return notFound();
         if (!["receiving", "ready_to_confirm"].includes(rows[0]!.state))
@@ -186,6 +187,7 @@ export async function appendCaptureMessage(
 export async function saveCaptureAnswer(
     pool: Pool,
     captureId: string,
+    userId: string,
     answer: ClarificationAnswer,
 ): Promise<void> {
     if (!answer.question.trim() || !answer.answer.trim())
@@ -194,8 +196,8 @@ export async function saveCaptureAnswer(
         ]);
     await withTransaction(pool, async (client) => {
         const { rows } = await client.query(
-            `SELECT state FROM meal_captures WHERE id=$1 FOR UPDATE`,
-            [captureId],
+            `SELECT state FROM meal_captures WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+            [captureId, userId],
         );
         if (!rows.length) return notFound();
         if (!["receiving", "ready_to_confirm"].includes(rows[0]!.state))
@@ -252,14 +254,15 @@ export async function saveCaptureMedia(
 export async function savePreparedDraft(
     pool: Pool,
     captureId: string,
+    userId: string,
     draft: PreparedMealDraft,
 ): Promise<void> {
     const errors = validatePreparedDraft(draft);
     if (errors.length) throw new MealCaptureValidationError(errors);
     await withTransaction(pool, async (client) => {
         const { rows } = await client.query(
-            `SELECT state FROM meal_captures WHERE id=$1 FOR UPDATE`,
-            [captureId],
+            `SELECT state FROM meal_captures WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+            [captureId, userId],
         );
         if (!rows.length) return notFound();
         if (!["receiving", "ready_to_confirm"].includes(rows[0]!.state))

@@ -69,21 +69,21 @@ describeDb("durable meal capture lifecycle", () => {
             capture_id: started.capture_id,
             deduplicated: true,
         });
-        await appendCaptureMessage(pool, started.capture_id, {
+        await appendCaptureMessage(pool, started.capture_id, "a2-user", {
             external_message_id: "m1",
             kind: "text",
             text: "hi",
         });
-        await appendCaptureMessage(pool, started.capture_id, {
+        await appendCaptureMessage(pool, started.capture_id, "a2-user", {
             external_message_id: "m1",
             kind: "text",
             text: "changed",
         });
-        await saveCaptureAnswer(pool, started.capture_id, {
+        await saveCaptureAnswer(pool, started.capture_id, "a2-user", {
             question: "how much?",
             answer: "one bowl",
         });
-        await saveCaptureAnswer(pool, started.capture_id, {
+        await saveCaptureAnswer(pool, started.capture_id, "a2-user", {
             question: "how much?",
             answer: "one bowl",
         });
@@ -129,7 +129,7 @@ describeDb("durable meal capture lifecycle", () => {
             "a2-user",
             stagedMedia,
         );
-        await savePreparedDraft(pool, capture.capture_id, {
+        await savePreparedDraft(pool, capture.capture_id, "a2-user", {
             ...draft,
             media: [stagedMedia],
         });
@@ -200,7 +200,7 @@ describeDb("durable meal capture lifecycle", () => {
             byte_size: 12,
             sha256: "c".repeat(64),
         });
-        await savePreparedDraft(pool, capture.capture_id, {
+        await savePreparedDraft(pool, capture.capture_id, "a2-user", {
             ...draft,
             media: [
                 {
@@ -243,7 +243,7 @@ describeDb("durable meal capture lifecycle", () => {
             "rollback-user",
             stagedMedia,
         );
-        await savePreparedDraft(pool, capture.capture_id, {
+        await savePreparedDraft(pool, capture.capture_id, "rollback-user", {
             ...draft,
             media: [stagedMedia],
         });

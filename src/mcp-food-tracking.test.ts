@@ -316,6 +316,74 @@ describeDb("meal capture MCP lifecycle tools", () => {
             client.release();
         }
     });
+    test("rejects cross-user capture message, answer, and draft mutations", async () => {
+        const other = await startMealCapture(pool, {
+            user_id: "u2",
+            conversation_key: "other-mutators",
+            idempotency_key: "mcp-other-mutators",
+        });
+        await withTools(pool, async (call) => {
+            expect(
+                (
+                    await call("append_meal_capture_message", {
+                        capture_id: other.capture_id,
+                        message: {
+                            external_message_id: "cross-user-message",
+                            kind: "text",
+                            text: "no",
+                        },
+                    })
+                ).isError,
+            ).toBe(true);
+            expect(
+                (
+                    await call("answer_meal_capture", {
+                        capture_id: other.capture_id,
+                        answer: { question: "q", answer: "a" },
+                    })
+                ).isError,
+            ).toBe(true);
+            expect(
+                (
+                    await call("save_meal_capture_draft", {
+                        capture_id: other.capture_id,
+                        draft: {
+                            reported_at: "2026-08-05T12:00:00Z",
+                            items: [{ ordinal: 0, raw_item_text: "oatmeal" }],
+                            inputs: [],
+                            media: [],
+                            parser_policy_version: "hermes.v1",
+                            created_by: "hermes",
+                        },
+                    })
+                ).isError,
+            ).toBe(true);
+        });
+        const row = await pool.query(
+            "SELECT state, prepared_draft FROM meal_captures WHERE id=$1",
+            [other.capture_id],
+        );
+        expect(row.rows[0]).toMatchObject({
+            state: "receiving",
+            prepared_draft: null,
+        });
+        expect(
+            (
+                await pool.query(
+                    "SELECT count(*) AS n FROM meal_capture_messages WHERE capture_id=$1",
+                    [other.capture_id],
+                )
+            ).rows[0]!.n,
+        ).toBe("0");
+        expect(
+            (
+                await pool.query(
+                    "SELECT count(*) AS n FROM meal_capture_answers WHERE capture_id=$1",
+                    [other.capture_id],
+                )
+            ).rows[0]!.n,
+        ).toBe("0");
+    });
     test("discovers and calls get/cancel/expire with user scoping and states", async () => {
         const own = await startMealCapture(pool, {
             user_id: "u1",
@@ -358,5 +426,73 @@ describeDb("meal capture MCP lifecycle tools", () => {
             });
             expect(illegal.isError).toBe(true);
         });
+    });
+    test("rejects cross-user capture message, answer, and draft mutations", async () => {
+        const other = await startMealCapture(pool, {
+            user_id: "u2",
+            conversation_key: "other-mutators",
+            idempotency_key: "mcp-other-mutators",
+        });
+        await withTools(pool, async (call) => {
+            expect(
+                (
+                    await call("append_meal_capture_message", {
+                        capture_id: other.capture_id,
+                        message: {
+                            external_message_id: "cross-user-message",
+                            kind: "text",
+                            text: "no",
+                        },
+                    })
+                ).isError,
+            ).toBe(true);
+            expect(
+                (
+                    await call("answer_meal_capture", {
+                        capture_id: other.capture_id,
+                        answer: { question: "q", answer: "a" },
+                    })
+                ).isError,
+            ).toBe(true);
+            expect(
+                (
+                    await call("save_meal_capture_draft", {
+                        capture_id: other.capture_id,
+                        draft: {
+                            reported_at: "2026-08-05T12:00:00Z",
+                            items: [{ ordinal: 0, raw_item_text: "oatmeal" }],
+                            inputs: [],
+                            media: [],
+                            parser_policy_version: "hermes.v1",
+                            created_by: "hermes",
+                        },
+                    })
+                ).isError,
+            ).toBe(true);
+        });
+        const row = await pool.query(
+            "SELECT state, prepared_draft FROM meal_captures WHERE id=$1",
+            [other.capture_id],
+        );
+        expect(row.rows[0]).toMatchObject({
+            state: "receiving",
+            prepared_draft: null,
+        });
+        expect(
+            (
+                await pool.query(
+                    "SELECT count(*) AS n FROM meal_capture_messages WHERE capture_id=$1",
+                    [other.capture_id],
+                )
+            ).rows[0]!.n,
+        ).toBe("0");
+        expect(
+            (
+                await pool.query(
+                    "SELECT count(*) AS n FROM meal_capture_answers WHERE capture_id=$1",
+                    [other.capture_id],
+                )
+            ).rows[0]!.n,
+        ).toBe("0");
     });
 });
