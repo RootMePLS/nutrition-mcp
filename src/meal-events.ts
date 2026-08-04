@@ -259,17 +259,18 @@ async function insertVersionChildren(
         const scope = r.ordinal ?? null;
         const { rows } = await client.query(
             `INSERT INTO meal_event_nutrition_results
-                (event_id, version, ordinal, provider, status,
+                (event_id, version, ordinal, provider, source_id, status,
                  request_fingerprint, algorithm_version, raw_payload,
                  ${NUTRIENT_COLUMNS}, error_code, error_message)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-                     $9, $10, $11, $12, $13, $14, $15, $16, $17)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                     $10, $11, $12, $13, $14, $15, $16, $17, $18)
              RETURNING id`,
             [
                 eventId,
                 version,
                 scope,
                 r.provider,
+                `${r.provider}:${r.request_fingerprint}`,
                 r.status,
                 r.request_fingerprint,
                 r.algorithm_version,

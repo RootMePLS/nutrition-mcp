@@ -177,6 +177,7 @@ CREATE TABLE IF NOT EXISTS meal_event_nutrition_results (
         CASE WHEN ordinal IS NULL THEN 'event' ELSE 'item:' || ordinal::text END
     ) STORED,
     provider text NOT NULL CHECK (provider IN ('nutrition-local', 'own', 'myfitnesspal')),
+    source_id text,
     status text NOT NULL CHECK (status IN ('succeeded', 'failed', 'unavailable')),
     request_fingerprint text NOT NULL,
     algorithm_version text NOT NULL,

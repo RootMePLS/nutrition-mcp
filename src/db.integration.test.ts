@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Pool, type PoolClient } from "pg";
+import { createMealEvent } from "./meal-events.js";
 
 // Opt-in integration suite against a real disposable PostgreSQL database.
 // Skipped loudly unless DATABASE_URL_TEST points at a scratch database the
@@ -151,6 +152,42 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         expect(tables).not.toContain(LEGACY_TABLE);
     });
 
+    test("migration: normal meal event writes source_id after 004", async () => {
+        await resetSchema(client);
+        await applyMigration(client, MIGRATION_001);
+        await applyMigration(client, MIGRATION_002);
+        await applyMigration(client, MIGRATION_003);
+        await applyMigration(client, MIGRATION_004);
+        const event = await createMealEvent(
+            pool,
+            {
+                user_id: "u1",
+                idempotency_key: "normal-after-004",
+                reported_at: "2026-08-05T12:00:00.000Z",
+                items: [{ ordinal: 0, raw_item_text: "oats" }],
+                inputs: [],
+                media: [],
+                provider_results: [
+                    {
+                        provider: "own",
+                        status: "succeeded",
+                        request_fingerprint: "normal-fp",
+                        algorithm_version: "v1",
+                        nutrients: { calories: 100 },
+                        raw_payload: { calories: 100 },
+                    },
+                ],
+                parser_policy_version: "test",
+                created_by: "test",
+            },
+            client,
+        );
+        const { rows } = await client.query(
+            "SELECT source_id FROM meal_event_nutrition_results WHERE event_id = $1",
+            [event.event_id],
+        );
+        expect(rows[0].source_id).toBe("own:normal-fp");
+    });
     test("migration: public_landing_stats counts meal_events current versions", async () => {
         await resetSchema(client);
         await applyMigration(client, MIGRATION_001);
@@ -181,7 +218,6 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         );
         const stats = rows[0].stats;
         expect(stats.food_logs).toBe(1);
-        // Only the current version (v2: 400 kcal) counts, not v1's 100.
         expect(Number(stats.total_calories)).toBe(400);
         expect(Number(stats.total_protein_g)).toBe(10);
         expect(Number(stats.total_carbs_g)).toBe(20);
