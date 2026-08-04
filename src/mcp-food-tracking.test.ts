@@ -11,6 +11,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerTools } from "./mcp.js";
+import { startMealCapture } from "./meal-captures.js";
 
 // ---------------------------------------------------------------------------
 // Bounded MCP tool: log_meal_event. The caller supplies already-prepared
@@ -42,6 +43,7 @@ async function withTools(
             name: string,
             args?: Record<string, unknown>,
         ) => Promise<ToolResult>,
+        client?: Client,
     ) => Promise<void>,
 ): Promise<void> {
     const server = new McpServer(
@@ -63,6 +65,7 @@ async function withTools(
                     name,
                     arguments: args,
                 }) as Promise<ToolResult>,
+            client,
         );
     } finally {
         await client.close();
@@ -285,6 +288,75 @@ describeDb("log_meal_event MCP tool (requires DATABASE_URL_TEST)", () => {
                 "SELECT count(*) AS n FROM meal_events",
             );
             expect(Number(rows[0]!.n)).toBe(0);
+        });
+    });
+});
+
+describeDb("meal capture MCP lifecycle tools", () => {
+    let pool: Pool;
+    beforeAll(() => {
+        pool = new Pool({ connectionString: DATABASE_URL_TEST });
+    });
+    afterAll(() => pool.end());
+    beforeEach(async () => {
+        const client = await pool.connect();
+        try {
+            await client.query(
+                "DROP SCHEMA public CASCADE; CREATE SCHEMA public;",
+            );
+            for (const path of [
+                "001_initial_schema.sql",
+                "002_food_tracking.sql",
+                "003_meal_captures.sql",
+            ])
+                await client.query(
+                    await Bun.file(`db/migrations/${path}`).text(),
+                );
+        } finally {
+            client.release();
+        }
+    });
+    test("discovers and calls get/cancel/expire with user scoping and states", async () => {
+        const own = await startMealCapture(pool, {
+            user_id: "u1",
+            conversation_key: "own",
+            idempotency_key: "mcp-own",
+        });
+        const other = await startMealCapture(pool, {
+            user_id: "u2",
+            conversation_key: "other",
+            idempotency_key: "mcp-other",
+        });
+        await withTools(pool, async (call, client) => {
+            const listed = await client!.listTools();
+            expect(listed.tools.map((tool) => tool.name)).toEqual(
+                expect.arrayContaining([
+                    "get_meal_capture",
+                    "cancel_meal_capture",
+                    "expire_meal_capture",
+                ]),
+            );
+            const hidden = await call("get_meal_capture", {
+                capture_id: other.capture_id,
+            });
+            expect(JSON.parse(hidden.content[0]!.text!)).toBeNull();
+            const read = await call("get_meal_capture", {
+                capture_id: own.capture_id,
+            });
+            expect(JSON.parse(read.content[0]!.text!)).toMatchObject({
+                capture_id: own.capture_id,
+                state: "receiving",
+            });
+            const cancelled = await call("cancel_meal_capture", {
+                capture_id: own.capture_id,
+            });
+            expect(JSON.parse(cancelled.content[0]!.text!)).toMatchObject({
+                state: "cancelled",
+            });
+            const illegal = await call("expire_meal_capture", {
+                capture_id: own.capture_id,
+            });
+            expect(illegal.isError).toBe(true);
         });
     });
 });

@@ -1,5 +1,5 @@
 import { withTransaction } from "./db.js";
-import { createMealEvent } from "./meal-events.js";
+import { createMealEvent, type CreateMealEventResult } from "./meal-events.js";
 import {
     validateCaptureMedia,
     validateCaptureMessage,
@@ -273,10 +273,15 @@ export async function savePreparedDraft(
     });
 }
 
+export interface MealCaptureConfirmationDependencies {
+    afterEventPersist?: (event: CreateMealEventResult) => void | Promise<void>;
+}
+
 export async function confirmMealCapture(
     pool: Pool,
     command: ConfirmCaptureCommand,
     userId: string,
+    dependencies: MealCaptureConfirmationDependencies = {},
 ): Promise<CaptureResult> {
     if (!isExplicitConfirmation(command.confirmation))
         throw new MealCaptureValidationError([
@@ -353,6 +358,7 @@ export async function confirmMealCapture(
             },
             client,
         );
+        await dependencies.afterEventPersist?.(event);
         await client.query(
             `UPDATE meal_captures SET state='confirmed',confirmed_at=now(),event_id=$2,event_version=$3,updated_at=now() WHERE id=$1`,
             [command.capture_id, event.event_id, event.version],

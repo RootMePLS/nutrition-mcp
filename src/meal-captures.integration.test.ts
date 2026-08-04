@@ -223,4 +223,82 @@ describeDb("durable meal capture lifecycle", () => {
             (await getMealCapture(pool, capture.capture_id, "a2-user"))?.state,
         ).toBe("ready_to_confirm");
     });
+
+    test("rolls back event aggregate when confirmation fails before capture update, then retries", async () => {
+        const capture = await startMealCapture(pool, {
+            user_id: "rollback-user",
+            conversation_key: "rollback",
+            idempotency_key: "capture-rollback",
+        });
+        const stagedMedia = {
+            kind: "photo" as const,
+            storage_key: "staged/rollback.jpg",
+            mime_type: "image/jpeg",
+            byte_size: 12,
+            sha256: "d".repeat(64),
+        };
+        await saveCaptureMedia(
+            pool,
+            capture.capture_id,
+            "rollback-user",
+            stagedMedia,
+        );
+        await savePreparedDraft(pool, capture.capture_id, {
+            ...draft,
+            media: [stagedMedia],
+        });
+
+        await expect(
+            confirmMealCapture(
+                pool,
+                { capture_id: capture.capture_id, confirmation: "add" },
+                "rollback-user",
+                {
+                    afterEventPersist: () => {
+                        throw new Error("injected confirmation failure");
+                    },
+                },
+            ),
+        ).rejects.toThrow("injected confirmation failure");
+
+        const afterFailure = await pool.query(
+            `SELECT
+                (SELECT count(*) FROM meal_events WHERE idempotency_key=$1) AS events,
+                (SELECT count(*) FROM meal_event_versions WHERE event_id IN (SELECT id FROM meal_events WHERE idempotency_key=$1)) AS versions,
+                (SELECT count(*) FROM meal_event_items WHERE event_id IN (SELECT id FROM meal_events WHERE idempotency_key=$1)) AS items,
+                (SELECT count(*) FROM meal_event_media WHERE event_id IN (SELECT id FROM meal_events WHERE idempotency_key=$1)) AS media`,
+            [`capture:${capture.capture_id}`],
+        );
+        expect(afterFailure.rows[0]).toMatchObject({
+            events: "0",
+            versions: "0",
+            items: "0",
+            media: "0",
+        });
+        expect(
+            (await getMealCapture(pool, capture.capture_id, "rollback-user"))
+                ?.state,
+        ).toBe("ready_to_confirm");
+
+        const retried = await confirmMealCapture(
+            pool,
+            { capture_id: capture.capture_id, confirmation: "add" },
+            "rollback-user",
+        );
+        expect(retried.state).toBe("confirmed");
+        const final = await pool.query(
+            `SELECT
+                (SELECT count(*) FROM meal_events WHERE idempotency_key=$1) AS events,
+                (SELECT count(*) FROM meal_event_versions WHERE event_id=$2) AS versions,
+                (SELECT count(*) FROM meal_event_items WHERE event_id=$2) AS items,
+                (SELECT count(*) FROM meal_event_media WHERE event_id=$2) AS media`,
+            [`capture:${capture.capture_id}`, retried.event_id],
+        );
+        expect(final.rows[0]).toMatchObject({
+            events: "1",
+            versions: "1",
+            items: "2",
+            media: "1",
+        });
+    });
 });
