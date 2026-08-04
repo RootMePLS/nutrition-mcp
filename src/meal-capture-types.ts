@@ -174,7 +174,7 @@ function contentSha256(content: string): string {
     return new Bun.CryptoHasher("sha256").update(content).digest("hex");
 }
 
-export function validateCaptureMessage(message: unknown): string[] {
+function validateCaptureMessageUnsafe(message: unknown): string[] {
     const errors: string[] = [];
     const value: Record<string, unknown> = isRecord(message) ? message : {};
     if (!isNonEmptyString(value.external_message_id))
@@ -191,7 +191,23 @@ export function validateCaptureMessage(message: unknown): string[] {
     return errors;
 }
 
+export function validateCaptureMessage(message: unknown): string[] {
+    try {
+        return validateCaptureMessageUnsafe(message);
+    } catch {
+        return ["message must be a readable object"];
+    }
+}
+
 export function validateCaptureMedia(media: unknown): string[] {
+    try {
+        return validateCaptureMediaUnsafe(media);
+    } catch {
+        return ["media must be a readable object"];
+    }
+}
+
+function validateCaptureMediaUnsafe(media: unknown): string[] {
     const errors: string[] = [];
     const value: Record<string, unknown> = isRecord(media) ? media : {};
     if (!MEDIA_KINDS.has(value.kind as string))
@@ -234,7 +250,7 @@ export function normalizePreparedEvidence(
         .map(({ input }) => input);
 }
 
-export function validatePreparedDraft(draft: unknown): string[] {
+function validatePreparedDraftUnsafe(draft: unknown): string[] {
     const errors: string[] = [];
     const value: Record<string, unknown> = isRecord(draft) ? draft : {};
     const items = safeArraySnapshot(value.items) as any[] | null;
@@ -305,4 +321,12 @@ export function validatePreparedDraft(draft: unknown): string[] {
         );
     }
     return errors;
+}
+
+export function validatePreparedDraft(draft: unknown): string[] {
+    try {
+        return validatePreparedDraftUnsafe(draft);
+    } catch {
+        return ["draft must be a readable object"];
+    }
 }

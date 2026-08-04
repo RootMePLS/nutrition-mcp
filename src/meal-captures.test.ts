@@ -348,6 +348,68 @@ test("prepared draft validation never throws for throwing array Proxy traps", ()
     }
 });
 
+test("capture and draft validators fail closed for throwing top-level Proxies", () => {
+    const throwingTopLevel = (
+        trap: "get" | "has" | "ownKeys" | "getPrototypeOf",
+    ) =>
+        new Proxy(
+            {},
+            {
+                get() {
+                    if (trap === "get") throw new Error("top-level get trap");
+                    return undefined;
+                },
+                has() {
+                    if (trap === "has") throw new Error("top-level has trap");
+                    return false;
+                },
+                ownKeys() {
+                    if (trap === "ownKeys")
+                        throw new Error("top-level ownKeys trap");
+                    return [];
+                },
+                getPrototypeOf() {
+                    if (trap === "getPrototypeOf")
+                        throw new Error("top-level getPrototypeOf trap");
+                    return Object.prototype;
+                },
+            },
+        );
+    for (const trap of ["get", "has", "ownKeys", "getPrototypeOf"] as const) {
+        for (const validator of [
+            validateCaptureMessage,
+            validateCaptureMedia,
+            validatePreparedDraft,
+        ]) {
+            const value = throwingTopLevel(trap);
+            let first: string[] = [];
+            let second: string[] = [];
+            expect(() => {
+                first = validator(value);
+                second = validator(value);
+            }).not.toThrow();
+            expect(first.length).toBeGreaterThan(0);
+            expect(second).toEqual(first);
+        }
+    }
+});
+
+test("capture and draft validators fail closed for revoked top-level Proxies", () => {
+    for (const validator of [
+        validateCaptureMessage,
+        validateCaptureMedia,
+        validatePreparedDraft,
+    ]) {
+        const revocable = Proxy.revocable({}, {});
+        revocable.revoke();
+        let errors: string[] = [];
+        expect(() => {
+            errors = validator(revocable.proxy);
+        }).not.toThrow();
+        expect(errors.length).toBeGreaterThan(0);
+    }
+});
+
 test("validators validate identity and provenance fields and MIME syntax", () => {
     expect(
         validateCaptureMedia({

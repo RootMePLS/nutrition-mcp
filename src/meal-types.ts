@@ -212,7 +212,7 @@ export function sortInputsByPrecedence(
     );
 }
 
-export function validateCreateMealEventCommand(
+function validateCreateMealEventCommandUnsafe(
     command: CreateMealEventCommand,
 ): string[] {
     const errors: string[] = [];
@@ -249,6 +249,16 @@ export function validateCreateMealEventCommand(
         }
     }
     return errors;
+}
+
+export function validateCreateMealEventCommand(
+    command: CreateMealEventCommand,
+): string[] {
+    try {
+        return validateCreateMealEventCommandUnsafe(command);
+    } catch {
+        return ["command must be a readable object"];
+    }
 }
 
 function safeArraySnapshot(value: unknown): unknown[] | null {

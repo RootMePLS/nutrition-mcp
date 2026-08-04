@@ -213,6 +213,51 @@ describe("meal event domain contracts", () => {
     });
 });
 
+test("public event validation fails closed for throwing and revoked top-level Proxies", () => {
+    const throwingTopLevel = (
+        trap: "get" | "has" | "ownKeys" | "getPrototypeOf",
+    ) =>
+        new Proxy(
+            {},
+            {
+                get() {
+                    if (trap === "get") throw new Error("top-level get trap");
+                    return undefined;
+                },
+                has() {
+                    if (trap === "has") throw new Error("top-level has trap");
+                    return false;
+                },
+                ownKeys() {
+                    if (trap === "ownKeys")
+                        throw new Error("top-level ownKeys trap");
+                    return [];
+                },
+                getPrototypeOf() {
+                    if (trap === "getPrototypeOf")
+                        throw new Error("top-level getPrototypeOf trap");
+                    return Object.prototype;
+                },
+            },
+        );
+    const values: unknown[] = (
+        ["get", "has", "ownKeys", "getPrototypeOf"] as const
+    ).map(throwingTopLevel);
+    const revocable = Proxy.revocable({}, {});
+    revocable.revoke();
+    values.push(revocable.proxy);
+    for (const value of values) {
+        let first: string[] = [];
+        let second: string[] = [];
+        expect(() => {
+            first = validateCreateMealEventCommand(value as never);
+            second = validateCreateMealEventCommand(value as never);
+        }).not.toThrow();
+        expect(first.length).toBeGreaterThan(0);
+        expect(second).toEqual(first);
+    }
+});
+
 // ---------------------------------------------------------------------------
 // Repository integration tests: real PostgreSQL only. Skipped loudly when
 // DATABASE_URL_TEST is not set — never reported as success without a DB.
