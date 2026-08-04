@@ -34,11 +34,12 @@ import {
     getProfile,
     countMeals,
     existingIdempotencyKeys,
+    SINGLE_USER_ID,
     type Meal,
     type NutritionGoals,
     type WaterEntry,
     type WeightEntry,
-} from "./supabase.js";
+} from "./db.js";
 import { withAnalytics } from "./analytics.js";
 import {
     todayInTz,
@@ -3933,7 +3934,7 @@ export const handleMcp = async (c: Context) => {
         );
     }
 
-    const userId = c.get("userId") as string;
+    const userId = SINGLE_USER_ID;
 
     const transport = new WebStandardStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,

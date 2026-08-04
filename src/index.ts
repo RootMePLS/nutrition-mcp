@@ -1,36 +1,28 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { bodyLimit } from "hono/body-limit";
-import { createOAuthRouter } from "./oauth.js";
-import {
-    authenticateBearer,
-    rateLimit,
-    banRepeatAuthFailures,
-} from "./middleware.js";
 import { handleMcp } from "./mcp.js";
 import { startExportCleanup } from "./export.js";
-import { getLandingStats, type LandingStats } from "./supabase.js";
-import { registerDiscoveryRoutes } from "./discovery.js";
+import { getLandingStats, type LandingStats } from "./db.js";
 import { maskIp } from "./net.js";
 import { warmWidgets } from "./widgets.js";
+import { checkRateLimit } from "./rate-limit.js";
+import { SINGLE_USER_ID, closePool } from "./db.js";
 
 const app = new Hono();
 
 // Access log — records every non-health HTTP request (method, path, status,
 // duration, masked client subnet) so traffic that never reaches a tool handler
 // — and is therefore invisible to tool analytics — is still attributable in the
-// runtime logs: unauthenticated /mcp probes (401), rate-limited hits (429),
-// OAuth discovery crawls, vuln scanners. Registered first so it runs outermost
+// runtime logs: unauthenticated /mcp probes, rate-limited hits (429),
+// discovery crawls, vuln scanners. Registered first so it runs outermost
 // and observes the final response status. /health is skipped to keep the
 // platform's frequent health checks from evicting real traffic from the buffer.
-// Requests from IPs banned for repeated auth failures are skipped too — they are
-// announced once by a [ban] line and would otherwise dominate the log.
 app.use("*", async (c, next) => {
     const path = new URL(c.req.url).pathname;
     if (path === "/health") return next();
     const start = performance.now();
     await next();
-    if (c.get("suppressAccessLog")) return;
     const ms = Math.round(performance.now() - start);
     const ip = maskIp(c.req.header("x-forwarded-for"));
     console.log(
@@ -97,11 +89,6 @@ app.use(
     }),
 );
 
-// OAuth discovery metadata (MCP spec requirement) — protected-resource and
-// authorization-server documents, served at the root and at the path-folded
-// variants clients derive from the /mcp endpoint. See src/discovery.ts.
-registerDiscoveryRoutes(app);
-
 // Glama connector ownership verification. Glama polls this file and matches the
 // maintainer email against the Glama account email to claim the listing.
 app.get("/.well-known/glama.json", (c) => {
@@ -111,18 +98,38 @@ app.get("/.well-known/glama.json", (c) => {
     });
 });
 
-// OAuth routes
-app.route("/", createOAuthRouter());
+// MCP endpoint — bare, no auth middleware. Rate limiting still applies keyed
+// on the hardcoded single-user ID so a runaway tool-call loop is throttled.
+app.all("/mcp", async (c, next) => {
+    const result = checkRateLimit(SINGLE_USER_ID);
+    if (!result.allowed) {
+        c.header("Retry-After", String(result.retryAfterSeconds ?? 60));
+        return c.json(
+            {
+                error: "rate_limited",
+                retryAfterSeconds: result.retryAfterSeconds,
+            },
+            429,
+        );
+    }
+    return handleMcp(c);
+});
 
-// MCP endpoint (protected). banRepeatAuthFailures runs first so a client stuck
-// in a failed-auth retry loop is rejected before any token verification.
-app.all(
-    "/mcp",
-    banRepeatAuthFailures,
-    authenticateBearer,
-    rateLimit,
-    handleMcp,
-);
+// Export download route — serves exported CSV files from the local filesystem.
+app.get("/exports/:userId/meals.csv", async (c) => {
+    const userId = c.req.param("userId");
+    const file = Bun.file(`./exports/${userId}/meals.csv`);
+    try {
+        const exists = await file.exists();
+        if (!exists) return c.notFound();
+        return c.body(await file.text(), 200, {
+            "Content-Type": "text/csv",
+            "Cache-Control": "private, max-age=3600",
+        });
+    } catch {
+        return c.notFound();
+    }
+});
 
 // Aggregate landing-page stats, cached in-memory so page views don't each hit
 // the DB. The numbers move slowly, so a stale value for a few minutes is fine.
@@ -274,16 +281,17 @@ console.log(`Nutrition MCP server listening on 0.0.0.0:${port}`);
 // @include/partial fails fast at boot rather than on a client's first tool call.
 await warmWidgets();
 
-// Periodically delete expired meal-export files from the storage bucket.
+// Periodically delete expired meal-export files from the local filesystem.
 startExportCleanup();
 
 // Exit cleanly on shutdown signals (e.g. deploys). /mcp is stateless — no
 // server-side sessions are held, so there is nothing to tear down; just exit.
 let shuttingDown = false;
-function shutdown(signal: string): void {
+async function shutdown(signal: string): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`Received ${signal}, shutting down...`);
+    await closePool();
     process.exit(0);
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
