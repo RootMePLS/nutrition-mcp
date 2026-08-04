@@ -87,6 +87,67 @@ test("capture and draft validators fail closed for malformed runtime payloads", 
     ]);
 });
 
+test("all public validators fail closed for null, malformed, nested-null, and primitive payloads", () => {
+    const probes: Array<[string, (value: unknown) => string[], unknown[]]> = [
+        [
+            "message",
+            validateCaptureMessage as (value: unknown) => string[],
+            [null, undefined, [], "bad", 42, true, { raw_metadata: null }],
+        ],
+        [
+            "media",
+            validateCaptureMedia as (value: unknown) => string[],
+            [
+                null,
+                undefined,
+                [],
+                "bad",
+                42,
+                true,
+                { content_hash: null, metadata: null },
+            ],
+        ],
+        [
+            "draft",
+            validatePreparedDraft as (value: unknown) => string[],
+            [
+                null,
+                undefined,
+                [],
+                "bad",
+                42,
+                true,
+                { items: null, inputs: null, media: null },
+                { items: [null], inputs: [null], media: [null] },
+                {
+                    items: [{ ordinal: null, raw_item_text: null }],
+                    inputs: [{ content_hash: null }],
+                    media: [{ metadata: null }],
+                },
+                { items: "bad", inputs: "bad", media: "bad" },
+            ],
+        ],
+    ];
+    for (const [name, validator, values] of probes) {
+        for (const value of values) {
+            let first: string[] = [];
+            let second: string[] = [];
+            expect(
+                () => {
+                    first = validator(value);
+                    second = validator(value);
+                },
+                `${name} validator should not throw for ${String(value)}`,
+            ).not.toThrow();
+            expect(
+                first!,
+                `${name} validator should return errors`,
+            ).not.toHaveLength(0);
+            expect(second).toEqual(first);
+        }
+    }
+});
+
 test("metadata rejects every non-JSON runtime value at any nesting depth", () => {
     const invalidValues = [
         undefined,

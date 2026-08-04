@@ -109,6 +109,10 @@ function isNonEmptyString(value: unknown): value is string {
     return typeof value === "string" && value.trim().length > 0;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function isValidDate(value: unknown): boolean {
     if (value == null) return true;
     if (!(typeof value === "string" || value instanceof Date)) return false;
@@ -140,46 +144,47 @@ function contentSha256(content: string): string {
     return new Bun.CryptoHasher("sha256").update(content).digest("hex");
 }
 
-export function validateCaptureMessage(message: CaptureMessageInput): string[] {
+export function validateCaptureMessage(message: unknown): string[] {
     const errors: string[] = [];
-    if (!isNonEmptyString(message?.external_message_id))
+    const value: Record<string, unknown> = isRecord(message) ? message : {};
+    if (!isNonEmptyString(value.external_message_id))
         errors.push("message external_message_id is required");
-    if (!MESSAGE_KINDS.has(message?.kind as string))
+    if (!MESSAGE_KINDS.has(value.kind as string))
         errors.push("message kind is unsupported");
-    if (!isValidDate(message?.received_at))
+    if (!isValidDate(value.received_at))
         errors.push("message received_at must be a valid timestamp");
     if (
-        message != null &&
-        Object.prototype.hasOwnProperty.call(message, "raw_metadata") &&
-        !isJsonMetadata(message?.raw_metadata)
+        Object.prototype.hasOwnProperty.call(value, "raw_metadata") &&
+        !isJsonMetadata(value.raw_metadata)
     )
         errors.push("message raw_metadata must be JSON metadata");
     return errors;
 }
 
-export function validateCaptureMedia(media: CaptureMediaInput): string[] {
+export function validateCaptureMedia(media: unknown): string[] {
     const errors: string[] = [];
-    if (!MEDIA_KINDS.has(media?.kind as string))
+    const value: Record<string, unknown> = isRecord(media) ? media : {};
+    if (!MEDIA_KINDS.has(value.kind as string))
         errors.push("media kind is unsupported");
-    if (!isNonEmptyString(media?.storage_key))
+    if (!isNonEmptyString(value.storage_key))
         errors.push("media storage_key is required");
     if (
-        !Number.isFinite(media?.byte_size) ||
-        !Number.isInteger(media?.byte_size) ||
-        media?.byte_size < 0
+        !Number.isFinite(value.byte_size) ||
+        !Number.isInteger(value.byte_size) ||
+        (value.byte_size as number) < 0
     )
         errors.push("media byte_size must be a finite non-negative integer");
     if (
         !/^[0-9a-f]{64}$/.test(
-            typeof media?.sha256 === "string" ? media.sha256 : "",
+            typeof value.sha256 === "string" ? value.sha256 : "",
         )
     )
         errors.push("media sha256 must be a lowercase hexadecimal SHA-256");
-    if (!isCompatibleMime(media?.mime_type, media?.kind))
+    if (!isCompatibleMime(value.mime_type, value.kind))
         errors.push("media mime_type is invalid for media kind");
     if (
-        Object.prototype.hasOwnProperty.call(media, "metadata") &&
-        !isJsonMetadata(media?.metadata)
+        Object.prototype.hasOwnProperty.call(value, "metadata") &&
+        !isJsonMetadata(value.metadata)
     )
         errors.push("media metadata must be JSON metadata");
     return errors;
@@ -199,18 +204,19 @@ export function normalizePreparedEvidence(
         .map(({ input }) => input);
 }
 
-export function validatePreparedDraft(draft: PreparedMealDraft): string[] {
+export function validatePreparedDraft(draft: unknown): string[] {
     const errors: string[] = [];
-    if (!Array.isArray(draft?.items))
+    const value: Record<string, unknown> = isRecord(draft) ? draft : {};
+    if (!Array.isArray(value.items))
         errors.push("draft.items must be an array");
-    if (!Array.isArray(draft?.inputs))
+    if (!Array.isArray(value.inputs))
         errors.push("draft.inputs must be an array");
-    if (!Array.isArray(draft?.media))
+    if (!Array.isArray(value.media))
         errors.push("draft.media must be an array");
-    const items = Array.isArray(draft?.items) ? draft.items : [];
-    const inputs = Array.isArray(draft?.inputs) ? draft.inputs : [];
-    const draftMedia = Array.isArray(draft?.media) ? draft.media : [];
-    if (items.length === 0 && Array.isArray(draft?.items))
+    const items = Array.isArray(value.items) ? value.items : [];
+    const inputs = Array.isArray(value.inputs) ? value.inputs : [];
+    const draftMedia = Array.isArray(value.media) ? value.media : [];
+    if (items.length === 0 && Array.isArray(value.items))
         errors.push("draft.items must not be empty");
     const ordinals = items.map((item) => item?.ordinal);
     if (new Set(ordinals).size !== ordinals.length)
@@ -223,28 +229,32 @@ export function validatePreparedDraft(draft: PreparedMealDraft): string[] {
         errors.push("draft item ordinals must be non-negative integers");
     if (items.some((item) => !isNonEmptyString(item?.raw_item_text)))
         errors.push("draft item text must not be empty");
-    if (draft?.reported_at == null || !isValidDate(draft.reported_at))
+    if (value.reported_at == null || !isValidDate(value.reported_at))
         errors.push("draft reported_at must be a valid timestamp");
-    if (!isValidDate(draft.consumed_at))
+    if (!isValidDate(value.consumed_at))
         errors.push("draft consumed_at must be a valid timestamp");
-    if (!isNonEmptyString(draft?.parser_policy_version))
+    if (!isNonEmptyString(value.parser_policy_version))
         errors.push("draft parser_policy_version is required");
-    if (!isNonEmptyString(draft?.created_by))
+    if (!isNonEmptyString(value.created_by))
         errors.push("draft created_by is required");
 
     for (const input of inputs) {
-        if (!EVIDENCE_KINDS.has(input?.source_kind))
+        const evidence = isRecord(input) ? input : {};
+        if (!EVIDENCE_KINDS.has(evidence.source_kind as string))
             errors.push("evidence source_kind is unsupported");
-        if (!isNonEmptyString(input?.content))
+        if (!isNonEmptyString(evidence.content))
             errors.push("evidence content is required");
-        const withHash = input as MealEventInputEvidence & {
-            content_hash?: string;
-        };
+        const withHash = evidence;
         if (
             withHash.content_hash !== undefined &&
             (typeof withHash.content_hash !== "string" ||
                 !/^[0-9a-f]{64}$/.test(withHash.content_hash) ||
-                withHash.content_hash !== contentSha256(input.content ?? ""))
+                withHash.content_hash !==
+                    contentSha256(
+                        typeof evidence.content === "string"
+                            ? evidence.content
+                            : "",
+                    ))
         )
             errors.push(
                 typeof withHash.content_hash === "string" &&
@@ -253,8 +263,8 @@ export function validatePreparedDraft(draft: PreparedMealDraft): string[] {
                     : "evidence content_hash must be a lowercase hexadecimal SHA-256",
             );
         if (
-            Object.prototype.hasOwnProperty.call(input, "metadata") &&
-            !isJsonMetadata(input?.metadata)
+            Object.prototype.hasOwnProperty.call(evidence, "metadata") &&
+            !isJsonMetadata(evidence.metadata)
         )
             errors.push("evidence metadata must be JSON metadata");
     }
