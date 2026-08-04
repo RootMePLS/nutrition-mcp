@@ -11,6 +11,7 @@ const MIGRATION_001 = "db/migrations/001_initial_schema.sql";
 const MIGRATION_002 = "db/migrations/002_food_tracking.sql";
 const MIGRATION_003 = "db/migrations/003_meal_captures.sql";
 const MIGRATION_004 = "db/migrations/004_calculation_bundles.sql";
+const MIGRATION_005 = "db/migrations/005_calculation_corrections.sql";
 
 const NEW_TABLES = [
     "meal_events",
@@ -78,6 +79,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_002);
         await applyMigration(client, MIGRATION_003);
         await applyMigration(client, MIGRATION_004);
+        await applyMigration(client, MIGRATION_005);
 
         const tables = await tableNames(client);
         for (const table of NEW_TABLES) {
@@ -119,6 +121,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_002);
         await applyMigration(client, MIGRATION_003);
         await applyMigration(client, MIGRATION_004);
+        await applyMigration(client, MIGRATION_005);
 
         const tables = await tableNames(client);
         expect(tables).not.toContain(LEGACY_TABLE);
@@ -144,6 +147,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_002);
         await applyMigration(client, MIGRATION_003);
         await applyMigration(client, MIGRATION_004);
+        await applyMigration(client, MIGRATION_005);
 
         const tables = await tableNames(client);
         for (const table of NEW_TABLES) {
@@ -158,6 +162,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_002);
         await applyMigration(client, MIGRATION_003);
         await applyMigration(client, MIGRATION_004);
+        await applyMigration(client, MIGRATION_005);
         const event = await createMealEvent(
             pool,
             {

@@ -9,9 +9,39 @@ import {
     type CalculationBundleInput,
 } from "./nutrition-bundle-types.js";
 import { commitCalculationBundle } from "./calculation-bundles.js";
+import {
+    validateCalculationCorrection,
+    type CalculationCorrectionMetadata,
+} from "./calculation-bundles.js";
 import { registerTools } from "./mcp.js";
 
 describe("calculation bundle commit seam", () => {
+    test("requires explicit confirmation and complete correction provenance", () => {
+        const base: CalculationCorrectionMetadata = {
+            correction_idempotency_key: "corr-1",
+            correction_reason: "portion clarified",
+            correction_author: "hermes",
+            source_timestamp: "2026-08-05T12:00:00.000Z",
+            confirmed: false,
+            external_write_authorized: false,
+        };
+        expect(validateCalculationCorrection(base)).toContain(
+            "explicit confirmation is required",
+        );
+        expect(
+            validateCalculationCorrection({
+                ...base,
+                confirmed: true,
+                correction_reason: "",
+            }),
+        ).toContain("correction reason is required");
+        expect(
+            validateCalculationCorrection({
+                ...base,
+                confirmed: true,
+            }),
+        ).toEqual([]);
+    });
     test("discovers additive commit tool and rejects malformed bundles", async () => {
         const server = new McpServer(
             { name: "test", version: "0.0.0" },

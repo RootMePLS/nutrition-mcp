@@ -10,6 +10,8 @@ import { Pool, type PoolClient } from "pg";
 import {
     CalculationBundleValidationError,
     commitCalculationBundle,
+    commitCalculationCorrection,
+    type CalculationCorrectionMetadata,
 } from "./calculation-bundles.js";
 import {
     stableBundleFingerprint,
@@ -23,6 +25,7 @@ const migrationPaths = [
     "db/migrations/002_food_tracking.sql",
     "db/migrations/003_meal_captures.sql",
     "db/migrations/004_calculation_bundles.sql",
+    "db/migrations/005_calculation_corrections.sql",
 ];
 
 if (!DATABASE_URL_TEST) {
@@ -223,6 +226,81 @@ describeDb("calculation bundle PostgreSQL integration", () => {
                 )
             ).rows[0].calculation_bundle_fingerprint,
         ).toBeNull();
+    });
+
+    test("persists an immutable correction with audit and journal provenance", async () => {
+        const original = makeBundle();
+        await commitCalculationBundle(pool, original);
+        const correction = makeBundle();
+        correction.version = 2;
+        correction.results[0]!.source_id = "corrected-local-source";
+        correction.results[0]!.raw_payload = {
+            provider: "nutrition-local",
+            calories: 600,
+        };
+        correction.results[0]!.nutrients = { calories: 600 };
+        correction.fingerprint = stableBundleFingerprint(correction);
+        const metadata: CalculationCorrectionMetadata = {
+            correction_idempotency_key: "correction-1",
+            correction_reason: "portion corrected",
+            correction_author: "hermes",
+            source_timestamp: "2026-08-05T12:00:00.000Z",
+            confirmed: true,
+            external_write_authorized: true,
+            user_id: "integration-test",
+        };
+        const result = await commitCalculationCorrection(
+            pool,
+            correction,
+            metadata,
+        );
+        expect(result.version).toBe(2);
+        expect(result.canonical.nutrients.calories).toBe(555);
+        const rows = await pool.query(
+            "SELECT version, prior_version, correction_reason, correction_author, confirmation_received, calculation_bundle_fingerprint FROM meal_event_versions ORDER BY version",
+        );
+        expect(rows.rows[0].calculation_bundle_fingerprint ?? null).toBe(
+            original.fingerprint,
+        );
+        expect(rows.rows[1]).toMatchObject({
+            version: 2,
+            prior_version: 1,
+            correction_reason: "portion corrected",
+            correction_author: "hermes",
+            confirmation_received: true,
+        });
+        const audit = await pool.query(
+            "SELECT audit_evidence, algorithm_version FROM meal_event_canonical_results WHERE version = 2",
+        );
+        expect(audit.rows[0].audit_evidence).toMatchObject({
+            prior_version: 1,
+            correction_reason: "portion corrected",
+        });
+        expect(audit.rows[0].algorithm_version).toBe("consensus-10pct-v1");
+        expect(
+            (
+                await pool.query(
+                    "SELECT state FROM meal_event_sync_journal WHERE version = 2",
+                )
+            ).rows[0].state,
+        ).toBe("pending");
+        const retry = await commitCalculationCorrection(
+            pool,
+            correction,
+            metadata,
+        );
+        expect(retry.deduplicated).toBe(true);
+        expect(
+            (await pool.query("SELECT count(*) FROM meal_event_versions"))
+                .rows[0].count,
+        ).toBe("2");
+        expect(
+            (
+                await pool.query(
+                    "SELECT raw_payload FROM meal_event_nutrition_results WHERE version = 1 AND provider = 'nutrition-local'",
+                )
+            ).rows[0].raw_payload.calories,
+        ).toBe(500);
     });
 });
 
