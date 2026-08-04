@@ -1,4 +1,4 @@
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 import { zonedDayStartUtc, zonedNextDayStartUtc } from "./tz.js";
 import { decodeEscapeSequences } from "./normalize.js";
 import { isWeightUnit, toStoredInteger, type WeightUnit } from "./units.js";
@@ -23,6 +23,27 @@ export function getPool(): Pool {
 // Graceful shutdown: call pool.end() before process exit.
 export async function closePool(): Promise<void> {
     await pool.end();
+}
+
+// Narrowly scoped transaction helper for the append-only food-tracking model
+// (src/meal-events.ts). Takes the pool explicitly so integration tests can
+// point at a scratch database; legacy code above keeps using `pool` directly.
+export async function withTransaction<T>(
+    targetPool: Pool,
+    fn: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+    const client = await targetPool.connect();
+    try {
+        await client.query("BEGIN");
+        const result = await fn(client);
+        await client.query("COMMIT");
+        return result;
+    } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+    } finally {
+        client.release();
+    }
 }
 
 // ============================================================================
