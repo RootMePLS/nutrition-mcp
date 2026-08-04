@@ -84,15 +84,7 @@ function validArgs(overrides: Record<string, unknown> = {}) {
                 content: "oatmeal 80g and a banana",
             },
         ],
-        media: [
-            {
-                kind: "photo",
-                storage_key: "evt/1/photo-abc",
-                mime_type: "image/jpeg",
-                byte_size: 123,
-                sha256: "a".repeat(64),
-            },
-        ],
+        media: [],
         provider_results: [
             {
                 provider: "nutrition-local",
@@ -228,7 +220,29 @@ describeDb("log_meal_event MCP tool (requires DATABASE_URL_TEST)", () => {
             expect(Number(rows[0]!.journal)).toBe(1);
         });
     });
-
+    test("rejects safe but unrelated media storage keys", async () => {
+        await withTools(pool, async (call) => {
+            const r = await call(
+                "log_meal_event",
+                validArgs({
+                    media: [
+                        {
+                            kind: "photo",
+                            storage_key: "evt/1/photo-abc",
+                            mime_type: "image/jpeg",
+                            byte_size: 123,
+                            sha256: "a".repeat(64),
+                        },
+                    ],
+                }),
+            );
+            expect(r.isError).toBe(true);
+            const { rows } = await pool.query(
+                "SELECT count(*) AS n FROM meal_events",
+            );
+            expect(Number(rows[0]!.n)).toBe(0);
+        });
+    });
     test("validation rejects malformed input before any write", async () => {
         await withTools(pool, async (call) => {
             const cases: Record<string, unknown>[] = [

@@ -4133,6 +4133,7 @@ export function registerTools(
                         provider_results: args.provider_results ?? [],
                         parser_policy_version: "log_meal_event.v1",
                         created_by: "log_meal_event",
+                        enforce_media_identity: true,
                     };
                     const result = await createMealEvent(
                         mealEventsPool,

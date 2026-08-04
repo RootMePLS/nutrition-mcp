@@ -22,6 +22,7 @@
 //   failure the caller deletes staged bytes. This module never touches bytes.
 
 import type { Pool, PoolClient } from "pg";
+import { isGeneratedStorageKey } from "./media-store.js";
 import { withTransaction } from "./db.js";
 import { computeConsensus } from "./meal-consensus.js";
 import {
@@ -350,14 +351,16 @@ export async function createMealEvent(
 
     try {
         return await withTransaction(pool, async (client) => {
+            const eventId = crypto.randomUUID();
             const { rows } = await client.query(
                 `INSERT INTO meal_events
-                    (user_id, reported_at, consumed_at, meal_type,
+                    (id, user_id, reported_at, consumed_at, meal_type,
                      idempotency_key, external_write_authorized)
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT (user_id, idempotency_key) DO NOTHING
                  RETURNING id`,
                 [
+                    eventId,
                     command.user_id,
                     reportedAt.toISOString(),
                     consumedAt.toISOString(),
@@ -368,21 +371,59 @@ export async function createMealEvent(
             );
 
             if (rows.length === 0) {
-                // Idempotent retry: the unique constraint resolved the race;
-                // return the original aggregate, insert nothing.
                 const existing = await client.query(
                     `SELECT id, current_version FROM meal_events
-                     WHERE user_id = $1 AND idempotency_key = $2`,
+                     WHERE user_id = $1 AND idempotency_key = $2
+                     FOR UPDATE`,
                     [command.user_id, command.idempotency_key],
                 );
+                const existingEvent = existing.rows[0]!;
+                if (command.external_write_authorized === true) {
+                    await client.query(
+                        `UPDATE meal_events
+                         SET external_write_authorized = true, updated_at = now()
+                         WHERE id = $1 AND external_write_authorized = false`,
+                        [existingEvent.id],
+                    );
+                    await client.query(
+                        `INSERT INTO meal_event_sync_journal
+                            (event_id, version, system, operation,
+                             request_fingerprint, authorization_source, state)
+                         VALUES ($1, $2, 'myfitnesspal', 'create_meal_event',
+                                 $3, 'explicit_add_intent', 'pending')
+                         ON CONFLICT (system, operation, request_fingerprint)
+                         DO NOTHING`,
+                        [
+                            existingEvent.id,
+                            existingEvent.current_version,
+                            deriveCreateFingerprint(command),
+                        ],
+                    );
+                }
                 return {
-                    event_id: existing.rows[0]!.id as string,
-                    version: existing.rows[0]!.current_version as number,
+                    event_id: existingEvent.id as string,
+                    version: existingEvent.current_version as number,
                     deduplicated: true,
                 };
             }
 
-            const eventId = rows[0]!.id as string;
+            if (command.enforce_media_identity) {
+                for (const media of command.media) {
+                    if (
+                        !isGeneratedStorageKey({
+                            storage_key: media.storage_key,
+                            event_id: eventId,
+                            version: 1,
+                            kind: media.kind,
+                            sha256: media.sha256,
+                        })
+                    ) {
+                        throw new MealEventValidationError([
+                            `media storage_key is not generated for event/version/content: ${media.storage_key}`,
+                        ]);
+                    }
+                }
+            }
             await client.query(
                 `INSERT INTO meal_event_versions
                     (event_id, version, parser_policy_version, created_by)
@@ -424,6 +465,35 @@ export async function createMealEvent(
                 [command.user_id, command.idempotency_key],
             );
             if (rows.length > 0) {
+                if (command.external_write_authorized === true) {
+                    await withTransaction(pool, async (client) => {
+                        const { rows: locked } = await client.query(
+                            `SELECT id, current_version FROM meal_events
+                             WHERE id = $1 FOR UPDATE`,
+                            [rows[0]!.id],
+                        );
+                        await client.query(
+                            `UPDATE meal_events
+                             SET external_write_authorized = true, updated_at = now()
+                             WHERE id = $1`,
+                            [locked[0]!.id],
+                        );
+                        await client.query(
+                            `INSERT INTO meal_event_sync_journal
+                                (event_id, version, system, operation,
+                                 request_fingerprint, authorization_source, state)
+                             VALUES ($1, $2, 'myfitnesspal', 'create_meal_event',
+                                     $3, 'explicit_add_intent', 'pending')
+                             ON CONFLICT (system, operation, request_fingerprint)
+                             DO NOTHING`,
+                            [
+                                locked[0]!.id,
+                                locked[0]!.current_version,
+                                deriveCreateFingerprint(command),
+                            ],
+                        );
+                    });
+                }
                 return {
                     event_id: rows[0]!.id as string,
                     version: rows[0]!.current_version as number,

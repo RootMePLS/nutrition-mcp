@@ -76,7 +76,20 @@ Read the story behind it: [How I Replaced MyFitnessPal and Other Apps with a Sin
 | `get_alcohol_tracking`     | Get whether alcohol tracking is on and which standard drink it's displayed in                                                                    |
 | `delete_account`           | Permanently delete account and all associated data                                                                                               |
 
-## MCP Resources
+## Food-tracking storage and scope
+
+Food tracking uses an append-only `meal_events` aggregate: each correction creates a
+new version and advances the root pointer; historical versions and evidence remain
+readable. The legacy meal tables are reset destructively by migration `002` when it
+is applied, so take an export before upgrading. Event media bytes live under
+`MEDIA_ROOT`; PostgreSQL stores only the generated event/version/content-hash key
+and metadata. `DATABASE_URL_TEST` points integration tests at an isolated PostgreSQL
+database (the local default is `postgres://localhost:5432/nutrition_mcp_test`).
+
+The sync journal records explicit MyFitnessPal add authorization as **pending** only.
+This slice intentionally makes no real MFP calls and ships no automatic backup
+scheduler or cloud backup service; backup manifests are a contract for an
+operator-run backup, not proof that backups ran.
 
 | URI                          | Description                                                                       |
 | ---------------------------- | --------------------------------------------------------------------------------- |

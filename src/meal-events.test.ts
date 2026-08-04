@@ -308,6 +308,42 @@ describeDb("meal event repository (requires DATABASE_URL_TEST)", () => {
         expect(await tableCount(pool, "meal_event_inputs")).toBe(1);
     });
 
+    test("analyze-first then explicit add retry authorizes root and creates one journal", async () => {
+        const analyzed = await createMealEvent(pool, validCommand());
+        const add = await createMealEvent(
+            pool,
+            validCommand({ external_write_authorized: true }),
+        );
+        expect(add.event_id).toBe(analyzed.event_id);
+        const aggregate = await getMealEvent(pool, analyzed.event_id);
+        expect(aggregate!.event.external_write_authorized).toBe(true);
+        expect(aggregate!.journal.length).toBe(1);
+        expect(aggregate!.journal[0]!.state).toBe("pending");
+        const replay = await createMealEvent(
+            pool,
+            validCommand({ external_write_authorized: true }),
+        );
+        expect(replay.deduplicated).toBe(true);
+        expect(
+            (await getMealEvent(pool, analyzed.event_id))!.journal.length,
+        ).toBe(1);
+    });
+
+    test("concurrent explicit add retries after analyze create one journal", async () => {
+        await createMealEvent(pool, validCommand());
+        const results = await Promise.all(
+            Array.from({ length: 5 }, () =>
+                createMealEvent(
+                    pool,
+                    validCommand({ external_write_authorized: true }),
+                ),
+            ),
+        );
+        expect(results.every((result) => result.deduplicated)).toBe(true);
+        const aggregate = await getMealEvent(pool, results[0]!.event_id);
+        expect(aggregate!.event.external_write_authorized).toBe(true);
+        expect(aggregate!.journal.length).toBe(1);
+    });
     test("create: concurrent same-key creates yield one aggregate", async () => {
         const results = await Promise.all(
             Array.from({ length: 5 }, () =>

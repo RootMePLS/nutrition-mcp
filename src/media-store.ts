@@ -82,6 +82,16 @@ export function generateStorageKey(args: {
     return `${args.event_id}/${args.version}/${args.kind}-${args.sha256}`;
 }
 
+export function isGeneratedStorageKey(args: {
+    storage_key: string;
+    event_id: string;
+    version: number;
+    kind: "photo" | "audio";
+    sha256: string;
+}): boolean {
+    return args.storage_key === generateStorageKey(args);
+}
+
 function sha256Hex(bytes: Uint8Array): string {
     return new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
 }
