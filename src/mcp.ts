@@ -4,6 +4,47 @@ import { z } from "zod";
 import type { Context } from "hono";
 import type { Pool } from "pg";
 import { createMealEvent, getMealEvent } from "./meal-events.js";
+import {
+    appendCaptureMessage,
+    confirmMealCapture,
+    saveCaptureAnswer,
+    savePreparedDraft,
+    startMealCapture,
+} from "./meal-captures.js";
+import type {
+    CaptureMessageInput,
+    ClarificationAnswer,
+    PreparedMealDraft,
+} from "./meal-capture-types.js";
+import { computeConsensus } from "./meal-consensus.js";
+import { NUTRIENT_FIELDS, type NutrientField } from "./meal-types.js";
+import {
+    validateCalculationBundle,
+    type CalculationBundle,
+} from "./nutrition-bundle-types.js";
+
+export function recomputeCanonical(bundle: CalculationBundle) {
+    const errors = validateCalculationBundle(bundle);
+    if (errors.length)
+        throw new Error(`invalid calculation bundle: ${errors.join("; ")}`);
+    return computeConsensus(
+        bundle.results.map((result) => ({
+            provider: result.provider,
+            status: result.status,
+            nutrients: result.nutrients,
+        })),
+    );
+}
+
+export function canonicalNutrients(bundle: CalculationBundle) {
+    const result = recomputeCanonical(bundle);
+    return Object.fromEntries(
+        NUTRIENT_FIELDS.map((field: NutrientField) => [
+            field,
+            result.nutrients[field],
+        ]),
+    );
+}
 import type {
     CreateMealEventCommand,
     MealEventItemInput,
@@ -4203,6 +4244,174 @@ export function registerTools(
                 },
                 { userId },
             );
+        },
+    );
+
+    server.registerTool(
+        "start_meal_capture",
+        {
+            title: "Start Meal Capture",
+            description:
+                "Start a durable transport-neutral meal capture. Hermes supplies messages and prepared data; this server does not parse Telegram, audio, or images.",
+            annotations: {
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                conversation_key: z.string().min(1),
+                idempotency_key: z.string().min(1),
+                expires_at: z.string().optional(),
+            },
+        },
+        async (args) => ({
+            content: [
+                {
+                    type: "text",
+                    text: JSON.stringify(
+                        await startMealCapture(mealEventsPool, {
+                            user_id: userId,
+                            ...args,
+                        }),
+                    ),
+                },
+            ],
+        }),
+    );
+
+    server.registerTool(
+        "append_meal_capture_message",
+        {
+            title: "Append Meal Capture Message",
+            description:
+                "Retain raw agent-supplied message metadata for a durable capture. No media download or interpretation occurs here.",
+            inputSchema: {
+                capture_id: z.string().min(1),
+                message: z.record(z.string(), z.unknown()),
+            },
+        },
+        async (args) => {
+            await appendCaptureMessage(
+                mealEventsPool,
+                args.capture_id,
+                args.message as unknown as CaptureMessageInput,
+            );
+            return {
+                content: [{ type: "text", text: "Capture message retained." }],
+            };
+        },
+    );
+
+    server.registerTool(
+        "save_meal_capture_draft",
+        {
+            title: "Save Meal Capture Draft",
+            description:
+                "Store a prepared meal draft supplied by Hermes. The draft is not committed to a meal event until explicit confirmation.",
+            inputSchema: {
+                capture_id: z.string().min(1),
+                draft: z.record(z.string(), z.unknown()),
+            },
+        },
+        async (args) => {
+            await savePreparedDraft(
+                mealEventsPool,
+                args.capture_id,
+                args.draft as unknown as PreparedMealDraft,
+            );
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: "Meal draft ready for explicit confirmation.",
+                    },
+                ],
+            };
+        },
+    );
+
+    server.registerTool(
+        "answer_meal_capture",
+        {
+            title: "Answer Meal Capture Question",
+            description:
+                "Retain a clarification question and answer supplied by Hermes; this server does not generate questions.",
+            inputSchema: {
+                capture_id: z.string().min(1),
+                answer: z.record(z.string(), z.unknown()),
+            },
+        },
+        async (args) => {
+            await saveCaptureAnswer(
+                mealEventsPool,
+                args.capture_id,
+                args.answer as unknown as ClarificationAnswer,
+            );
+            return {
+                content: [{ type: "text", text: "Capture answer retained." }],
+            };
+        },
+    );
+
+    server.registerTool(
+        "confirm_meal_capture",
+        {
+            title: "Confirm Meal Capture",
+            description:
+                "Commit one prepared capture only after the explicit user add confirmation 'добавь' (or equivalent add command). Replays are idempotent; MyFitnessPal remains a pending journal intent, never a claimed sync.",
+            annotations: {
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                capture_id: z.string().min(1),
+                confirmation: z.string().min(1),
+                event_idempotency_key: z.string().optional(),
+            },
+        },
+        async (args) => ({
+            content: [
+                {
+                    type: "text",
+                    text: JSON.stringify(
+                        await confirmMealCapture(
+                            mealEventsPool,
+                            {
+                                ...args,
+                                confirmation: args.confirmation as "добавь",
+                            },
+                            userId,
+                        ),
+                    ),
+                },
+            ],
+        }),
+    );
+
+    server.registerTool(
+        "validate_calculation_bundle",
+        {
+            title: "Validate Calculation Bundle",
+            description:
+                "Validate Hermes-supplied nutrition-local, own, and myfitnesspal result metadata. This server does not call external MCP providers.",
+            inputSchema: { bundle: z.record(z.string(), z.unknown()) },
+        },
+        async ({ bundle }) => {
+            const issues = validateCalculationBundle(bundle as never);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify({
+                            status: issues.length ? "failed" : "ready",
+                            issues,
+                        }),
+                    },
+                ],
+            };
         },
     );
 }

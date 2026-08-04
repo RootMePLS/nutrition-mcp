@@ -138,7 +138,13 @@ backfill and there is no rollback for the legacy meal reset.
 
 > **Making it yours:** The public site includes the maintainer's personal bits — Google Analytics, Patreon/GitHub/contact links, and the `nutrition-mcp.com` domain. Run `bun run depersonalize` to strip them all in one pass (analytics + CSP, the Support/Contact sections, social links, and the domain → a `your-domain.com` placeholder). Use `bun run depersonalize --dry` to preview without writing. Afterwards, swap in your own `public/og.png`, `favicon.ico`, and `apple-touch-icon.png`, and replace the domain placeholder with your real domain.
 
-## Development
+## Agent-driven meal capture
+
+The append-only meal-event path is also exposed as a transport-neutral, durable capture flow for an agent host. Hermes supplies raw message/evidence/media metadata, clarification answers, prepared drafts, and provider result bundles; this server does not receive Telegram updates, download media, run STT/OCR/vision, or call external MCP servers.
+
+Use `start_meal_capture`, `append_meal_capture_message`, `answer_meal_capture`, and `save_meal_capture_draft` for restart-safe multi-turn storage. `confirm_meal_capture` is the explicit authorization gate: only the user's unambiguous add command (including `добавь`) commits one prepared capture to one `meal_event`; MyFitnessPal authorization remains a pending journal row, never a claim of successful sync. `validate_calculation_bundle` accepts and validates Hermes-supplied `nutrition-local`, `own`, and `myfitnesspal` result metadata. Canonical nutrition is recomputed by the existing `consensus-10pct-v1` policy; missing, failed, and unavailable values are not treated as zero.
+
+Migration order for a new or test database is `001_initial_schema.sql`, `002_food_tracking.sql`, then `003_meal_captures.sql`.
 
 ```bash
 bun install
