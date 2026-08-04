@@ -2,6 +2,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 import type { Context } from "hono";
+import type { Pool } from "pg";
+import { createMealEvent, getMealEvent } from "./meal-events.js";
+import type {
+    CreateMealEventCommand,
+    MealEventItemInput,
+} from "./meal-types.js";
 import {
     insertMeal,
     getMealsByDate,
@@ -34,6 +40,7 @@ import {
     getProfile,
     countMeals,
     existingIdempotencyKeys,
+    getPool,
     SINGLE_USER_ID,
     type Meal,
     type NutritionGoals,
@@ -409,6 +416,62 @@ const MEAL_PROGRESS_OUTPUT_SCHEMA = {
     goals: GOALS_ITEM.nullable(),
     totals: TOTALS_ITEM,
     meals: z.array(MEAL_BREAKDOWN_ITEM),
+};
+
+// log_meal_event (append-only food tracking) structured payload. Nullable
+// fields are emitted as required-with-null, so the handler always builds a
+// complete literal. `external_sync` can only ever be "not_authorized" or
+// "pending" in this slice — "synced" is not a representable value.
+export const LOG_MEAL_EVENT_OUTPUT_SCHEMA = {
+    event_id: z.string(),
+    version: z.number(),
+    deduplicated: z.boolean(),
+    positions: z.array(
+        z.object({
+            ordinal: z.number(),
+            raw_item_text: z.string(),
+        }),
+    ),
+    evidence: z.array(
+        z.object({
+            source_kind: z.string(),
+            precedence: z.number(),
+            content_hash: z.string(),
+        }),
+    ),
+    provider_statuses: z.array(
+        z.object({
+            provider: z.string(),
+            status: z.string(),
+            error_code: z.string().nullable(),
+        }),
+    ),
+    canonical: z
+        .object({
+            status: z.string(),
+            consensus_status: z.string(),
+            calories: z.number().nullable(),
+            protein_g: z.number().nullable(),
+            carbs_g: z.number().nullable(),
+            fat_g: z.number().nullable(),
+            fiber_g: z.number().nullable(),
+            sugar_g: z.number().nullable(),
+            alcohol_g: z.number().nullable(),
+            eligible_providers: z.array(z.string()),
+            outlier_providers: z.array(z.string()),
+            threshold_percent: z.number(),
+            policy_version: z.string(),
+        })
+        .nullable(),
+    journal: z.array(
+        z.object({
+            system: z.string(),
+            operation: z.string(),
+            state: z.string(),
+            attempts: z.number(),
+        }),
+    ),
+    external_sync: z.enum(["not_authorized", "pending"]),
 };
 
 // Both payloads carry alcohol as a nullable number for the same reason
@@ -979,6 +1042,9 @@ export function registerTools(
     userId: string,
     widgetsEnabled: boolean,
     alcohol: AlcoholDisplay,
+    // Optional dependency seam for tests: the food-tracking tool writes
+    // through this pool instead of the global one when provided.
+    deps: { mealEventsPool?: Pool } = {},
 ) {
     // Link a tool to its widget only when this user has widgets enabled. Because
     // buildMcpServer registers tools per request, this makes widget display a
@@ -3850,6 +3916,288 @@ export function registerTools(
                                 text: "Your account and all associated data have been permanently deleted.",
                             },
                         ],
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    // ----------------------------------------------------------------------
+    // Append-only food tracking (new event model)
+    // ----------------------------------------------------------------------
+    // Bounded first slice: the caller supplies already-prepared text, media
+    // metadata and provider estimates. This tool runs NO Telegram/vision/OCR
+    // pipeline and makes NO real MyFitnessPal call — external_write_authorized
+    // only records the explicit "добавь" intent as a pending sync-journal row.
+    const mealEventsPool = deps.mealEventsPool ?? getPool();
+
+    server.registerTool(
+        "log_meal_event",
+        {
+            title: "Log Meal Event",
+            description:
+                "Log one eating occurrence as an append-only meal event with ordered item positions, raw evidence and optional prepared media metadata and provider nutrient estimates. You supply text/metadata that is ALREADY available — this tool does not download attachments, run OCR/vision, or parse photos. Timestamps: reported_at is required (when the user told you), consumed_at defaults to reported_at when omitted. Corrections never mutate past events: use a new call with the same idempotency rules via the correction flow (not yet exposed as a separate tool). If the user explicitly asked to also add the meal to MyFitnessPal ('добавь'), set external_write_authorized=true — this records a PENDING sync-journal entry only; nothing is sent to MyFitnessPal yet and the result is 'pending', never 'synced'.",
+            annotations: {
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                idempotency_key: z
+                    .string()
+                    .min(1)
+                    .max(255)
+                    .describe(
+                        "Stable key for safe retries: replaying the same key returns the original event instead of duplicating it.",
+                    ),
+                reported_at: z
+                    .string()
+                    .refine((s) => !Number.isNaN(Date.parse(s)), {
+                        message:
+                            "reported_at must be a valid ISO 8601 timestamp",
+                    })
+                    .describe(
+                        "ISO 8601 timestamp of when the meal was reported. If you don't know the current date or time, ask the user before calling this tool.",
+                    ),
+                consumed_at: z
+                    .string()
+                    .refine((s) => !Number.isNaN(Date.parse(s)), {
+                        message:
+                            "consumed_at must be a valid ISO 8601 timestamp",
+                    })
+                    .optional()
+                    .describe(
+                        "ISO 8601 timestamp of when the meal was eaten. Defaults to reported_at when omitted.",
+                    ),
+                meal_type: z
+                    .enum(["breakfast", "lunch", "dinner", "snack"])
+                    .optional()
+                    .describe("Type of meal, if known."),
+                items: z
+                    .array(
+                        z.object({
+                            ordinal: z
+                                .number()
+                                .int()
+                                .min(0)
+                                .describe("Stable position within the event"),
+                            raw_item_text: z
+                                .string()
+                                .min(1)
+                                .describe("The item as the user wrote it"),
+                            normalized_name: z.string().optional(),
+                            quantity: z.number().optional(),
+                            portion_value: z.number().optional(),
+                            portion_unit: z.string().optional(),
+                            notes: z.string().optional(),
+                        }),
+                    )
+                    .min(1)
+                    .refine(
+                        (items) =>
+                            new Set(items.map((i) => i.ordinal)).size ===
+                            items.length,
+                        { message: "item ordinals must be unique" },
+                    )
+                    .describe("One or more ordered item positions."),
+                inputs: z
+                    .array(
+                        z.object({
+                            source_kind: z
+                                .enum([
+                                    "user_text",
+                                    "audio_transcript",
+                                    "photo_ocr",
+                                    "photo_vision",
+                                    "model_assumption",
+                                ])
+                                .describe(
+                                    "Evidence kind. Precedence is fixed: explicit user text outranks transcripts, photo-derived text and assumptions; all inputs are retained.",
+                                ),
+                            content: z.string().min(1),
+                            metadata: z
+                                .record(z.string(), z.unknown())
+                                .optional(),
+                        }),
+                    )
+                    .optional()
+                    .describe(
+                        "Raw evidence for this event (the user's text, transcripts, derived text).",
+                    ),
+                media: z
+                    .array(
+                        z.object({
+                            kind: z.enum(["photo", "audio"]),
+                            storage_key: z
+                                .string()
+                                .min(1)
+                                .describe(
+                                    "Server-generated opaque relative key from the media store — never a caller-chosen path.",
+                                ),
+                            mime_type: z
+                                .string()
+                                .regex(
+                                    /^[\w.+-]+\/[\w.+-]+$/,
+                                    "mime_type must look like 'type/subtype'",
+                                ),
+                            byte_size: z.number().int().min(0),
+                            sha256: z
+                                .string()
+                                .regex(
+                                    /^[0-9a-f]{64}$/,
+                                    "sha256 must be 64 lowercase hex chars",
+                                ),
+                            duration_ms: z.number().int().min(0).optional(),
+                            width: z.number().int().min(0).optional(),
+                            height: z.number().int().min(0).optional(),
+                        }),
+                    )
+                    .optional()
+                    .describe(
+                        "Metadata for media already staged in the media store. Bytes are never passed through this tool.",
+                    ),
+                provider_results: z
+                    .array(
+                        z.object({
+                            provider: z.enum([
+                                "nutrition-local",
+                                "own",
+                                "myfitnesspal",
+                            ]),
+                            status: z.enum([
+                                "succeeded",
+                                "failed",
+                                "unavailable",
+                            ]),
+                            request_fingerprint: z.string().min(1),
+                            algorithm_version: z.string().min(1),
+                            ordinal: z
+                                .number()
+                                .int()
+                                .min(0)
+                                .optional()
+                                .describe(
+                                    "Item scope; omit for the event aggregate.",
+                                ),
+                            nutrients: z
+                                .object({
+                                    calories: z.number().nullish(),
+                                    protein_g: z.number().nullish(),
+                                    carbs_g: z.number().nullish(),
+                                    fat_g: z.number().nullish(),
+                                    fiber_g: z.number().nullish(),
+                                    sugar_g: z.number().nullish(),
+                                    alcohol_g: z.number().nullish(),
+                                })
+                                .optional()
+                                .describe(
+                                    "Normalized nutrients. Missing values stay NULL — never report zero for a value you don't have.",
+                                ),
+                            error_code: z.string().optional(),
+                            error_message: z.string().optional(),
+                            raw_payload: z
+                                .record(z.string(), z.unknown())
+                                .optional(),
+                        }),
+                    )
+                    .optional()
+                    .describe(
+                        "Already-computed provider estimates. The canonical result is derived from these with the 10% consensus policy.",
+                    ),
+                external_write_authorized: z
+                    .boolean()
+                    .optional()
+                    .describe(
+                        "Set true only when the user explicitly asked to add this meal to MyFitnessPal. Records a pending sync-journal entry; no external call is made in this slice.",
+                    ),
+            },
+            outputSchema: LOG_MEAL_EVENT_OUTPUT_SCHEMA,
+        },
+        async (args) => {
+            return withAnalytics(
+                "log_meal_event",
+                async () => {
+                    const command: CreateMealEventCommand = {
+                        user_id: userId,
+                        idempotency_key: args.idempotency_key,
+                        reported_at: args.reported_at,
+                        consumed_at: args.consumed_at,
+                        meal_type: args.meal_type ?? null,
+                        external_write_authorized:
+                            args.external_write_authorized ?? false,
+                        items: args.items as MealEventItemInput[],
+                        inputs: args.inputs ?? [],
+                        media: args.media ?? [],
+                        provider_results: args.provider_results ?? [],
+                        parser_policy_version: "log_meal_event.v1",
+                        created_by: "log_meal_event",
+                    };
+                    const result = await createMealEvent(
+                        mealEventsPool,
+                        command,
+                    );
+                    const aggregate = await getMealEvent(
+                        mealEventsPool,
+                        result.event_id,
+                    );
+                    if (!aggregate) {
+                        throw new Error(
+                            `meal event vanished after create: ${result.event_id}`,
+                        );
+                    }
+
+                    const authorized =
+                        aggregate.event.external_write_authorized;
+                    const structuredContent = {
+                        event_id: aggregate.event.id,
+                        version: result.version,
+                        deduplicated: result.deduplicated,
+                        positions: aggregate.items.map((i) => ({
+                            ordinal: i.ordinal,
+                            raw_item_text: i.raw_item_text,
+                        })),
+                        evidence: aggregate.inputs.map((i) => ({
+                            source_kind: i.source_kind,
+                            precedence: i.precedence,
+                            content_hash: i.content_hash,
+                        })),
+                        provider_statuses: aggregate.provider_results.map(
+                            (r) => ({
+                                provider: r.provider,
+                                status: r.status,
+                                error_code: r.error_code,
+                            }),
+                        ),
+                        canonical: aggregate.canonical,
+                        journal: aggregate.journal.map((j) => ({
+                            system: j.system,
+                            operation: j.operation,
+                            state: j.state,
+                            attempts: j.attempts,
+                        })),
+                        // Hard boundary: this slice can only ever report
+                        // not_authorized or pending — never synced.
+                        external_sync: authorized
+                            ? ("pending" as const)
+                            : ("not_authorized" as const),
+                    };
+
+                    const header = result.deduplicated
+                        ? "Meal event already logged (idempotent retry):"
+                        : "Meal event logged:";
+                    const syncNote = authorized
+                        ? "\nMyFitnessPal write authorized: recorded as a pending sync-journal entry. Nothing was sent — external sync is not implemented yet."
+                        : "";
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: `${header}\n${JSON.stringify(structuredContent, null, 2)}${syncNote}`,
+                            },
+                        ],
+                        structuredContent,
                     };
                 },
                 { userId },

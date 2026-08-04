@@ -213,9 +213,7 @@ export async function insertMeal(
                 return { meal: mealFromRow(rows[0]!), deduplicated: true };
             }
         }
-        throw new Error(
-            `Failed to insert meal: ${(error as Error).message}`,
-        );
+        throw new Error(`Failed to insert meal: ${(error as Error).message}`);
     }
 }
 
@@ -287,7 +285,10 @@ export async function existingIdempotencyKeys(
         );
         return new Set(
             rows
-                .map((r: { idempotency_key: string | null }) => r.idempotency_key)
+                .map(
+                    (r: { idempotency_key: string | null }) =>
+                        r.idempotency_key,
+                )
                 .filter((k: string | null): k is string => k !== null),
         );
     } catch (error) {
@@ -395,10 +396,10 @@ export async function searchMeals(
 
 export async function deleteMeal(userId: string, id: string): Promise<void> {
     try {
-        await pool.query(
-            `DELETE FROM meals WHERE id = $1 AND user_id = $2`,
-            [id, userId],
-        );
+        await pool.query(`DELETE FROM meals WHERE id = $1 AND user_id = $2`, [
+            id,
+            userId,
+        ]);
     } catch (error) {
         throw new Error(`Failed to delete meal: ${(error as Error).message}`);
     }
@@ -527,12 +528,14 @@ function profileFromRow(row: Record<string, unknown>): Profile {
         alcohol_tracking_enabled:
             (row.alcohol_tracking_enabled as boolean) ?? false,
         preferred_drink_unit: isDrinkUnit(du) ? (du as DrinkUnit) : null,
-        created_at: (row.created_at instanceof Date
-            ? row.created_at.toISOString()
-            : String(row.created_at)),
-        updated_at: (row.updated_at instanceof Date
-            ? row.updated_at.toISOString()
-            : String(row.updated_at)),
+        created_at:
+            row.created_at instanceof Date
+                ? row.created_at.toISOString()
+                : String(row.created_at),
+        updated_at:
+            row.updated_at instanceof Date
+                ? row.updated_at.toISOString()
+                : String(row.updated_at),
     };
 }
 
@@ -684,9 +687,10 @@ function goalsFromRow(row: Record<string, unknown>): NutritionGoals {
         daily_alcohol_g: num(row.daily_alcohol_g),
         daily_water_ml: num(row.daily_water_ml),
         target_weight_g: num(row.target_weight_g),
-        updated_at: (row.updated_at instanceof Date
-            ? row.updated_at.toISOString()
-            : String(row.updated_at)),
+        updated_at:
+            row.updated_at instanceof Date
+                ? row.updated_at.toISOString()
+                : String(row.updated_at),
     };
 }
 
@@ -783,13 +787,15 @@ function waterFromRow(row: Record<string, unknown>): WaterEntry {
         id: row.id as string,
         user_id: row.user_id as string,
         amount_ml: num(row.amount_ml) ?? 0,
-        logged_at: (row.logged_at instanceof Date
-            ? row.logged_at.toISOString()
-            : String(row.logged_at)),
+        logged_at:
+            row.logged_at instanceof Date
+                ? row.logged_at.toISOString()
+                : String(row.logged_at),
         notes: (row.notes as string | null) ?? null,
-        created_at: (row.created_at instanceof Date
-            ? row.created_at.toISOString()
-            : String(row.created_at)),
+        created_at:
+            row.created_at instanceof Date
+                ? row.created_at.toISOString()
+                : String(row.created_at),
         idempotency_key: (row.idempotency_key as string | null) ?? null,
     };
 }
@@ -818,7 +824,13 @@ export async function insertWater(
             `INSERT INTO water_log (user_id, amount_ml, logged_at, notes, idempotency_key)
              VALUES ($1, $2, $3, $4, $5)
              RETURNING *`,
-            [userId, input.amount_ml, loggedAt, input.notes ?? null, idempotencyKey],
+            [
+                userId,
+                input.amount_ml,
+                loggedAt,
+                input.notes ?? null,
+                idempotencyKey,
+            ],
         );
         return { entry: waterFromRow(rows[0]!), deduplicated: false };
     } catch (error) {
@@ -920,13 +932,15 @@ function weightFromRow(row: Record<string, unknown>): WeightEntry {
         id: row.id as string,
         user_id: row.user_id as string,
         weight_g: num(row.weight_g) ?? 0,
-        logged_at: (row.logged_at instanceof Date
-            ? row.logged_at.toISOString()
-            : String(row.logged_at)),
+        logged_at:
+            row.logged_at instanceof Date
+                ? row.logged_at.toISOString()
+                : String(row.logged_at),
         notes: (row.notes as string | null) ?? null,
-        created_at: (row.created_at instanceof Date
-            ? row.created_at.toISOString()
-            : String(row.created_at)),
+        created_at:
+            row.created_at instanceof Date
+                ? row.created_at.toISOString()
+                : String(row.created_at),
         idempotency_key: (row.idempotency_key as string | null) ?? null,
     };
 }
@@ -955,7 +969,13 @@ export async function insertWeight(
             `INSERT INTO weight_log (user_id, weight_g, logged_at, notes, idempotency_key)
              VALUES ($1, $2, $3, $4, $5)
              RETURNING *`,
-            [userId, input.weight_g, loggedAt, input.notes ?? null, idempotencyKey],
+            [
+                userId,
+                input.weight_g,
+                loggedAt,
+                input.notes ?? null,
+                idempotencyKey,
+            ],
         );
         return { entry: weightFromRow(rows[0]!), deduplicated: false };
     } catch (error) {
