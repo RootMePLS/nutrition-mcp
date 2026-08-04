@@ -1,7 +1,10 @@
 import { withTransaction } from "./db.js";
 import { createMealEvent } from "./meal-events.js";
 import {
+    validateCaptureMedia,
+    validateCaptureMessage,
     validatePreparedDraft,
+    type CaptureMediaInput,
     type CaptureMessageInput,
     type CaptureResult,
     type ClarificationAnswer,
@@ -9,16 +12,18 @@ import {
     type PreparedMealDraft,
     type StartCaptureCommand,
 } from "./meal-capture-types.js";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 
 export class MealCaptureValidationError extends Error {
     constructor(public readonly issues: string[]) {
         super(`invalid meal capture: ${issues.join("; ")}`);
     }
 }
-
 export function isExplicitConfirmation(value: string): boolean {
     return ["добавь", "add", "confirm"].includes(value.trim().toLowerCase());
+}
+function notFound(): never {
+    throw new MealCaptureValidationError(["capture not found"]);
 }
 
 export async function startMealCapture(
@@ -43,7 +48,7 @@ export async function startMealCapture(
                 command.expires_at ?? null,
             ],
         );
-        if (inserted.rows.length > 0)
+        if (inserted.rows.length)
             return {
                 capture_id: inserted.rows[0]!.id as string,
                 state: inserted.rows[0]!.state as CaptureResult["state"],
@@ -56,35 +61,128 @@ export async function startMealCapture(
         return {
             capture_id: row.id as string,
             state: row.state as CaptureResult["state"],
-            event_id: (row.event_id as string | null) ?? undefined,
-            version: (row.event_version as number | null) ?? undefined,
+            event_id: row.event_id ?? undefined,
+            version: row.event_version ?? undefined,
             deduplicated: true,
         };
     });
 }
+
+export interface MealCaptureRead extends CaptureResult {
+    user_id: string;
+    conversation_key: string;
+    expires_at: string | null;
+    prepared_draft: PreparedMealDraft | null;
+    messages: Record<string, unknown>[];
+    answers: Record<string, unknown>[];
+    media: Record<string, unknown>[];
+}
+export async function getMealCapture(
+    pool: Pool,
+    captureId: string,
+    userId: string,
+): Promise<MealCaptureRead | null> {
+    const { rows } = await pool.query(
+        `SELECT * FROM meal_captures WHERE id=$1 AND user_id=$2`,
+        [captureId, userId],
+    );
+    if (!rows.length) return null;
+    const row = rows[0]!;
+    const [messages, answers, media] = await Promise.all([
+        pool.query(
+            `SELECT * FROM meal_capture_messages WHERE capture_id=$1 ORDER BY received_at,id`,
+            [captureId],
+        ),
+        pool.query(
+            `SELECT * FROM meal_capture_answers WHERE capture_id=$1 ORDER BY created_at,id`,
+            [captureId],
+        ),
+        pool.query(
+            `SELECT * FROM meal_capture_media WHERE capture_id=$1 ORDER BY created_at,id`,
+            [captureId],
+        ),
+    ]);
+    return {
+        capture_id: row.id,
+        user_id: row.user_id,
+        conversation_key: row.conversation_key,
+        state: row.state,
+        expires_at: row.expires_at?.toISOString?.() ?? row.expires_at ?? null,
+        prepared_draft: row.prepared_draft,
+        event_id: row.event_id ?? undefined,
+        version: row.event_version ?? undefined,
+        messages: messages.rows,
+        answers: answers.rows,
+        media: media.rows,
+    } as MealCaptureRead;
+}
+
+async function transitionCapture(
+    pool: Pool,
+    id: string,
+    userId: string,
+    target: "cancelled" | "expired",
+): Promise<CaptureResult> {
+    return withTransaction(pool, async (client) => {
+        const { rows } = await client.query(
+            `SELECT id,state,event_id,event_version,expires_at FROM meal_captures WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+            [id, userId],
+        );
+        if (!rows.length) return notFound();
+        const row = rows[0]!;
+        if (row.state === target)
+            return { capture_id: row.id, state: target, deduplicated: true };
+        if (row.state !== "receiving" && row.state !== "ready_to_confirm")
+            throw new MealCaptureValidationError([
+                `capture cannot transition from state ${row.state}`,
+            ]);
+        if (
+            target === "expired" &&
+            (!row.expires_at || new Date(row.expires_at).getTime() > Date.now())
+        )
+            throw new MealCaptureValidationError(["capture has not expired"]);
+        await client.query(
+            `UPDATE meal_captures SET state=$2,updated_at=now() WHERE id=$1`,
+            [id, target],
+        );
+        return { capture_id: id, state: target };
+    });
+}
+export const cancelMealCapture = (pool: Pool, id: string, userId: string) =>
+    transitionCapture(pool, id, userId, "cancelled");
+export const expireMealCapture = (pool: Pool, id: string, userId: string) =>
+    transitionCapture(pool, id, userId, "expired");
 
 export async function appendCaptureMessage(
     pool: Pool,
     captureId: string,
     message: CaptureMessageInput,
 ): Promise<void> {
-    if (!message.external_message_id || !message.kind)
-        throw new MealCaptureValidationError([
-            "message id and kind are required",
-        ]);
-    await pool.query(
-        `INSERT INTO meal_capture_messages (capture_id,external_message_id,kind,text,raw_metadata,received_at) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (capture_id,external_message_id) DO NOTHING`,
-        [
-            captureId,
-            message.external_message_id,
-            message.kind,
-            message.text ?? null,
-            JSON.stringify(message.raw_metadata ?? {}),
-            message.received_at ?? new Date().toISOString(),
-        ],
-    );
+    const errors = validateCaptureMessage(message);
+    if (errors.length) throw new MealCaptureValidationError(errors);
+    await withTransaction(pool, async (client) => {
+        const { rows } = await client.query(
+            `SELECT state FROM meal_captures WHERE id=$1 FOR UPDATE`,
+            [captureId],
+        );
+        if (!rows.length) return notFound();
+        if (!["receiving", "ready_to_confirm"].includes(rows[0]!.state))
+            throw new MealCaptureValidationError([
+                "capture is no longer editable",
+            ]);
+        await client.query(
+            `INSERT INTO meal_capture_messages (capture_id,external_message_id,kind,text,raw_metadata,received_at) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (capture_id,external_message_id) DO NOTHING`,
+            [
+                captureId,
+                message.external_message_id,
+                message.kind,
+                message.text ?? null,
+                JSON.stringify(message.raw_metadata ?? {}),
+                message.received_at ?? new Date().toISOString(),
+            ],
+        );
+    });
 }
-
 export async function saveCaptureAnswer(
     pool: Pool,
     captureId: string,
@@ -94,39 +192,77 @@ export async function saveCaptureAnswer(
         throw new MealCaptureValidationError([
             "question and answer are required",
         ]);
-    await pool.query(
-        `INSERT INTO meal_capture_answers (capture_id,question,answer,message_id,metadata) VALUES ($1,$2,$3,$4,$5)`,
-        [
-            captureId,
-            answer.question,
-            answer.answer,
-            answer.message_id ?? null,
-            JSON.stringify(answer.metadata ?? {}),
-        ],
-    );
+    await withTransaction(pool, async (client) => {
+        const { rows } = await client.query(
+            `SELECT state FROM meal_captures WHERE id=$1 FOR UPDATE`,
+            [captureId],
+        );
+        if (!rows.length) return notFound();
+        if (!["receiving", "ready_to_confirm"].includes(rows[0]!.state))
+            throw new MealCaptureValidationError([
+                "capture is no longer editable",
+            ]);
+        await client.query(
+            `INSERT INTO meal_capture_answers (capture_id,question,answer,message_id,metadata) VALUES ($1,$2,$3,$4,$5)`,
+            [
+                captureId,
+                answer.question,
+                answer.answer,
+                answer.message_id ?? null,
+                JSON.stringify(answer.metadata ?? {}),
+            ],
+        );
+    });
 }
-
+export async function saveCaptureMedia(
+    pool: Pool,
+    captureId: string,
+    userId: string,
+    media: CaptureMediaInput,
+): Promise<void> {
+    const errors = validateCaptureMedia(media);
+    if (errors.length) throw new MealCaptureValidationError(errors);
+    await withTransaction(pool, async (client) => {
+        const { rows } = await client.query(
+            `SELECT state FROM meal_captures WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+            [captureId, userId],
+        );
+        if (!rows.length) return notFound();
+        if (!["receiving", "ready_to_confirm"].includes(rows[0]!.state))
+            throw new MealCaptureValidationError([
+                "capture is no longer editable",
+            ]);
+        await client.query(
+            `INSERT INTO meal_capture_media (capture_id,kind,storage_key,mime_type,byte_size,sha256,duration_ms,width,height,metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (capture_id,sha256) DO NOTHING`,
+            [
+                captureId,
+                media.kind,
+                media.storage_key,
+                media.mime_type,
+                media.byte_size,
+                media.sha256,
+                media.duration_ms ?? null,
+                media.width ?? null,
+                media.height ?? null,
+                JSON.stringify(media.metadata ?? {}),
+            ],
+        );
+    });
+}
 export async function savePreparedDraft(
     pool: Pool,
     captureId: string,
     draft: PreparedMealDraft,
 ): Promise<void> {
     const errors = validatePreparedDraft(draft);
-    if (errors.length > 0) throw new MealCaptureValidationError(errors);
+    if (errors.length) throw new MealCaptureValidationError(errors);
     await withTransaction(pool, async (client) => {
-        const locked = await client.query(
+        const { rows } = await client.query(
             `SELECT state FROM meal_captures WHERE id=$1 FOR UPDATE`,
             [captureId],
         );
-        if (locked.rows.length === 0)
-            throw new MealCaptureValidationError([
-                `capture not found: ${captureId}`,
-            ]);
-        if (
-            !["receiving", "ready_to_confirm"].includes(
-                locked.rows[0]!.state as string,
-            )
-        )
+        if (!rows.length) return notFound();
+        if (!["receiving", "ready_to_confirm"].includes(rows[0]!.state))
             throw new MealCaptureValidationError([
                 "capture is no longer editable",
             ]);
@@ -146,60 +282,59 @@ export async function confirmMealCapture(
         throw new MealCaptureValidationError([
             "explicit confirmation 'добавь' is required",
         ]);
-    const { rows } = await pool.query(
-        `SELECT * FROM meal_captures WHERE id=$1 AND user_id=$2`,
-        [command.capture_id, userId],
-    );
-    if (rows.length === 0)
-        throw new MealCaptureValidationError(["capture not found"]);
-    const row = rows[0]!;
-    if (row.state === "confirmed")
-        return {
-            capture_id: row.id as string,
-            state: "confirmed",
-            event_id: row.event_id as string,
-            version: row.event_version as number,
-            deduplicated: true,
-        };
-    if (row.state !== "ready_to_confirm")
-        throw new MealCaptureValidationError([
-            `capture cannot be confirmed from state ${row.state}`,
-        ]);
-    if (!row.prepared_draft)
-        throw new MealCaptureValidationError(["prepared draft is required"]);
-    const draft = row.prepared_draft as PreparedMealDraft;
-    const event = await createMealEvent(pool, {
-        user_id: userId,
-        idempotency_key:
-            command.event_idempotency_key ?? `capture:${command.capture_id}`,
-        reported_at: draft.reported_at,
-        consumed_at: draft.consumed_at ?? undefined,
-        meal_type: draft.meal_type ?? null,
-        items: draft.items,
-        inputs: draft.inputs,
-        media: draft.media,
-        provider_results: draft.provider_results ?? [],
-        parser_policy_version: draft.parser_policy_version,
-        created_by: draft.created_by,
-        external_write_authorized: true,
-        enforce_media_identity: false,
-    });
-    await withTransaction(pool, async (client) => {
-        const locked = await client.query(
-            `SELECT state FROM meal_captures WHERE id=$1 FOR UPDATE`,
-            [command.capture_id],
+    return withTransaction(pool, async (client) => {
+        const { rows } = await client.query(
+            `SELECT * FROM meal_captures WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+            [command.capture_id, userId],
         );
-        if (locked.rows[0]?.state === "confirmed") return;
+        if (!rows.length) return notFound();
+        const row = rows[0]!;
+        if (row.state === "confirmed")
+            return {
+                capture_id: row.id,
+                state: "confirmed",
+                event_id: row.event_id,
+                version: row.event_version,
+                deduplicated: true,
+            };
+        if (row.state !== "ready_to_confirm")
+            throw new MealCaptureValidationError([
+                `capture cannot be confirmed from state ${row.state}`,
+            ]);
+        if (!row.prepared_draft)
+            throw new MealCaptureValidationError([
+                "prepared draft is required",
+            ]);
+        const draft = row.prepared_draft as PreparedMealDraft;
+        const event = await createMealEvent(
+            pool,
+            {
+                user_id: userId,
+                idempotency_key: `capture:${command.capture_id}`,
+                reported_at: draft.reported_at,
+                consumed_at: draft.consumed_at ?? undefined,
+                meal_type: draft.meal_type ?? null,
+                items: draft.items,
+                inputs: draft.inputs,
+                media: draft.media,
+                provider_results: draft.provider_results ?? [],
+                parser_policy_version: draft.parser_policy_version,
+                created_by: draft.created_by,
+                external_write_authorized: true,
+                enforce_media_identity: false,
+            },
+            client,
+        );
         await client.query(
             `UPDATE meal_captures SET state='confirmed',confirmed_at=now(),event_id=$2,event_version=$3,updated_at=now() WHERE id=$1`,
             [command.capture_id, event.event_id, event.version],
         );
+        return {
+            capture_id: command.capture_id,
+            state: "confirmed",
+            event_id: event.event_id,
+            version: event.version,
+            deduplicated: event.deduplicated,
+        };
     });
-    return {
-        capture_id: command.capture_id,
-        state: "confirmed",
-        event_id: event.event_id,
-        version: event.version,
-        deduplicated: event.deduplicated,
-    };
 }

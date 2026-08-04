@@ -339,6 +339,7 @@ async function insertVersionChildren(
 export async function createMealEvent(
     pool: Pool,
     command: CreateMealEventCommand,
+    transactionClient?: PoolClient,
 ): Promise<CreateMealEventResult> {
     const issues = validateCreateMealEventCommand(command);
     if (issues.length > 0) throw new MealEventValidationError(issues);
@@ -350,7 +351,9 @@ export async function createMealEvent(
     );
 
     try {
-        return await withTransaction(pool, async (client) => {
+        const persist = async (
+            client: PoolClient,
+        ): Promise<CreateMealEventResult> => {
             const eventId = crypto.randomUUID();
             const { rows } = await client.query(
                 `INSERT INTO meal_events
@@ -454,7 +457,10 @@ export async function createMealEvent(
             }
 
             return { event_id: eventId, version: 1, deduplicated: false };
-        });
+        };
+        return await (transactionClient
+            ? persist(transactionClient)
+            : withTransaction(pool, persist));
     } catch (err) {
         if (isUniqueViolation(err, "uniq_meal_events_user_idem")) {
             // Concurrent same-key create lost the race before ON CONFLICT
