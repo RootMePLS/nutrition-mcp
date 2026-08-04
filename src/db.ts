@@ -590,13 +590,19 @@ export async function upsertProfile(
         const { rows } = await pool.query(
             `INSERT INTO profiles (user_id, timezone, preferred_weight_unit,
                  widgets_enabled, alcohol_tracking_enabled, preferred_drink_unit, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             VALUES ($1,
+                 COALESCE($2, 'UTC'),
+                 $3,
+                 COALESCE($4, true),
+                 COALESCE($5, false),
+                 $6,
+                 $7)
              ON CONFLICT (user_id) DO UPDATE SET
                  timezone = COALESCE(EXCLUDED.timezone, profiles.timezone),
-                 preferred_weight_unit = COALESCE(EXCLUDED.preferred_weight_unit, profiles.preferred_weight_unit),
+                 preferred_weight_unit = EXCLUDED.preferred_weight_unit,
                  widgets_enabled = COALESCE(EXCLUDED.widgets_enabled, profiles.widgets_enabled),
                  alcohol_tracking_enabled = COALESCE(EXCLUDED.alcohol_tracking_enabled, profiles.alcohol_tracking_enabled),
-                 preferred_drink_unit = COALESCE(EXCLUDED.preferred_drink_unit, profiles.preferred_drink_unit),
+                 preferred_drink_unit = EXCLUDED.preferred_drink_unit,
                  updated_at = EXCLUDED.updated_at
              RETURNING *`,
             [
