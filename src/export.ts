@@ -1,13 +1,10 @@
-import {
-    getSupabase,
-    getAllMeals,
-    getUserTimezone,
-    type Meal,
-} from "./supabase.js";
+import { getAllMeals, getUserTimezone, type Meal } from "./db.js";
 import { formatLocalDateTime } from "./tz.js";
+import { readdirSync, statSync, unlinkSync, rmdirSync, mkdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
 
-const EXPORT_BUCKET = "exports";
-// Signed link lifetime. The cleanup sweep ages files out on the same horizon.
+const EXPORT_DIR = "./exports";
+// A local export file is reachable for as long as the link lifetime.
 const EXPORT_TTL_SECONDS = 60 * 60; // 60 minutes
 const SWEEP_INTERVAL_MS = 10 * 60 * 1000; // every 10 minutes
 
@@ -40,7 +37,7 @@ const CSV_COLUMNS = [
 function csvEscape(value: string | number | null | undefined): string {
     if (value == null) return "";
     const str = String(value);
-    if (/[",\r\n]/.test(str)) {
+    if (/[\",\r\n]/.test(str)) {
         return `"${str.replace(/"/g, '""')}"`;
     }
     return str;
@@ -81,9 +78,9 @@ export interface MealsExportResult {
 }
 
 /**
- * Generate a CSV of all the user's meals, upload it to the private `exports`
- * bucket under a fixed per-user path (so each export overwrites the previous
- * one), and return a signed download link valid for EXPORT_TTL_SECONDS.
+ * Generate a CSV of all the user's meals, write it to the local filesystem
+ * under `./exports/${userId}/meals.csv`, and return the path so the caller can
+ * construct a download URL.
  */
 export async function exportMeals(userId: string): Promise<MealsExportResult> {
     const meals = await getAllMeals(userId);
@@ -91,80 +88,63 @@ export async function exportMeals(userId: string): Promise<MealsExportResult> {
 
     const tz = await getUserTimezone(userId);
     const csv = buildMealsCsv(meals, tz);
-    const path = `${userId}/meals.csv`;
 
-    const storage = getSupabase().storage.from(EXPORT_BUCKET);
+    // Ensure the per-user directory exists.
+    const dir = join(EXPORT_DIR, userId);
+    if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+    }
 
-    const { error: uploadErr } = await storage.upload(path, csv, {
-        contentType: "text/csv",
-        upsert: true,
-    });
-    if (uploadErr)
-        throw new Error(`Failed to upload export: ${uploadErr.message}`);
+    const path = join(dir, "meals.csv");
+    await Bun.write(path, csv);
 
-    const { data, error: signErr } = await storage.createSignedUrl(
-        path,
-        EXPORT_TTL_SECONDS,
-    );
-    if (signErr || !data)
-        throw new Error(
-            `Failed to create download link: ${signErr?.message ?? "unknown error"}`,
-        );
-
-    return { count: meals.length, url: data.signedUrl };
+    return { count: meals.length, url: `/exports/${userId}/meals.csv` };
 }
 
 /**
- * Delete export files older than the link TTL. Runs as a background sweep so no
- * export file outlives its signed URL by more than one sweep interval, even
- * across server restarts and for users who never export again.
+ * Delete export files older than EXPORT_TTL_SECONDS. Runs as a background
+ * sweep so no export file outlives its link by more than one sweep interval,
+ * even across server restarts and for users who never export again.
  */
-export async function sweepStaleExports(): Promise<void> {
-    const storage = getSupabase().storage.from(EXPORT_BUCKET);
+export function sweepStaleExports(): void {
     const cutoff = Date.now() - EXPORT_TTL_SECONDS * 1000;
 
-    // Files live under per-user folders, so list the root to enumerate folders,
-    // then list each folder to reach the files (with their timestamps).
-    const { data: folders, error: rootErr } = await storage.list("", {
-        limit: 1000,
-    });
-    if (rootErr) {
-        console.warn("Export sweep: failed to list bucket:", rootErr.message);
-        return;
-    }
-    if (!folders) return;
+    if (!existsSync(EXPORT_DIR)) return;
 
-    const stalePaths: string[] = [];
-    for (const folder of folders) {
-        const { data: files, error: listErr } = await storage.list(
-            folder.name,
-            { limit: 1000 },
-        );
-        if (listErr) {
-            console.warn(
-                `Export sweep: failed to list ${folder.name}:`,
-                listErr.message,
-            );
-            continue;
-        }
-        for (const file of files ?? []) {
-            const ts = file.updated_at ?? file.created_at;
-            if (ts && new Date(ts).getTime() < cutoff) {
-                stalePaths.push(`${folder.name}/${file.name}`);
+    let removed = 0;
+    try {
+        const userDirs = readdirSync(EXPORT_DIR, { withFileTypes: true });
+        for (const entry of userDirs) {
+            if (!entry.isDirectory()) continue;
+            const dirPath = join(EXPORT_DIR, entry.name);
+            const filePath = join(dirPath, "meals.csv");
+
+            try {
+                const st = statSync(filePath);
+                if (st.mtimeMs < cutoff) {
+                    // Delete the file and the user directory.
+                    unlinkSync(filePath);
+                    try {
+                        // rmdir only succeeds if the directory is empty.
+                        // This is fine — we only create one file per user dir.
+                        rmdirSync(dirPath);
+                    } catch {
+                        // Directory not empty or still in use; leave it.
+                    }
+                    removed++;
+                }
+            } catch {
+                // File doesn't exist; skip.
             }
         }
-    }
-
-    if (stalePaths.length === 0) return;
-    const { error: removeErr } = await storage.remove(stalePaths);
-    if (removeErr) {
-        console.warn(
-            "Export sweep: failed to remove files:",
-            removeErr.message,
-        );
+    } catch (err) {
+        console.warn("Export sweep: failed to scan exports dir:", (err as Error).message);
         return;
     }
-    console.log(`Export sweep: removed ${stalePaths.length} stale file(s).`);
+
+    if (removed > 0) {
+        console.log(`Export sweep: removed ${removed} stale file(s).`);
+    }
 }
 
 let sweepRunning = false;
@@ -174,8 +154,10 @@ export function startExportCleanup(): void {
     setInterval(() => {
         if (sweepRunning) return;
         sweepRunning = true;
-        sweepStaleExports().finally(() => {
+        try {
+            sweepStaleExports();
+        } finally {
             sweepRunning = false;
-        });
+        }
     }, SWEEP_INTERVAL_MS);
 }

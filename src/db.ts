@@ -4,6 +4,7 @@ import { decodeEscapeSequences } from "./normalize.js";
 import { isWeightUnit, toStoredInteger, type WeightUnit } from "./units.js";
 import { isDrinkUnit, type DrinkUnit } from "./alcohol.js";
 import { escapeLikePattern, tokenizeQuery } from "./search.js";
+import { existsSync, unlinkSync } from "node:fs";
 
 // ============================================================================
 // CONNECTION POOL & SINGLE USER
@@ -1099,6 +1100,16 @@ export async function deleteAllUserData(userId: string): Promise<void> {
                 `Failed to delete ${table}: ${(error as Error).message}`,
             );
         }
+    }
+
+    // Clean up any local export file (best-effort; ENOENT is not an error).
+    try {
+        const exportPath = `./exports/${userId}/meals.csv`;
+        if (existsSync(exportPath)) {
+            unlinkSync(exportPath);
+        }
+    } catch {
+        // Ignore — the export file is transient.
     }
 }
 
