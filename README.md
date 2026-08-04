@@ -140,6 +140,8 @@ backfill and there is no rollback for the legacy meal reset.
 
 ## Agent-driven meal capture
 
+The complete boundary, lifecycle, provenance, migration, rollback, and retry contract is documented in [docs/food-tracking-agent-driven.md](docs/food-tracking-agent-driven.md).
+
 The append-only meal-event path is also exposed as a transport-neutral, durable capture flow for an agent host. Hermes supplies raw message/evidence/media metadata, clarification answers, prepared drafts, and provider result bundles; this server does not receive Telegram updates, download media, run STT/OCR/vision, or call external MCP servers.
 
 Use `start_meal_capture`, `append_meal_capture_message`, `answer_meal_capture`, and `save_meal_capture_draft` for restart-safe multi-turn storage. `confirm_meal_capture` is the explicit authorization gate: only the user's unambiguous add command (including `добавь`) commits one prepared capture to one `meal_event`; MyFitnessPal authorization remains a pending journal row, never a claim of successful sync. `validate_calculation_bundle` accepts and validates Hermes-supplied `nutrition-local`, `own`, and `myfitnesspal` result metadata. Canonical nutrition is recomputed by the existing `consensus-10pct-v1` policy; missing, failed, and unavailable values are not treated as zero.
