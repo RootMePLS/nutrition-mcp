@@ -83,30 +83,32 @@ const MESSAGE_KINDS = new Set(["text", "answer", "photo", "audio"]);
 const MEDIA_KINDS = new Set(["photo", "audio"]);
 
 function isJsonMetadata(value: unknown, seen = new Set<object>()): boolean {
-    if (
-        value === null ||
-        typeof value === "string" ||
-        typeof value === "boolean"
-    )
-        return true;
-    if (typeof value === "number") return Number.isFinite(value);
-    if (typeof value !== "object") return false;
-    if (seen.has(value)) return false;
-    seen.add(value);
     try {
-        if (Array.isArray(value))
-            return value.every((item) => isJsonMetadata(item, seen));
         if (
-            Object.getPrototypeOf(value) !== Object.prototype &&
-            Object.getPrototypeOf(value) !== null
+            value === null ||
+            typeof value === "string" ||
+            typeof value === "boolean"
         )
-            return false;
-        return Object.entries(value as Record<string, unknown>).every(
-            ([key, item]) =>
-                typeof key === "string" && isJsonMetadata(item, seen),
-        );
-    } finally {
-        seen.delete(value);
+            return true;
+        if (typeof value === "number") return Number.isFinite(value);
+        if (typeof value !== "object") return false;
+        if (seen.has(value)) return false;
+        seen.add(value);
+        try {
+            if (Array.isArray(value))
+                return value.every((item) => isJsonMetadata(item, seen));
+            const prototype = Object.getPrototypeOf(value);
+            if (prototype !== Object.prototype && prototype !== null)
+                return false;
+            return Object.entries(value as Record<string, unknown>).every(
+                ([key, item]) =>
+                    typeof key === "string" && isJsonMetadata(item, seen),
+            );
+        } finally {
+            seen.delete(value);
+        }
+    } catch {
+        return false;
     }
 }
 

@@ -202,6 +202,64 @@ test("metadata rejects every non-JSON runtime value at any nesting depth", () =>
     }
 });
 
+test("public metadata validators fail closed for throwing Proxy traps", () => {
+    const throwingMetadata = new Proxy(
+        {},
+        {
+            getPrototypeOf() {
+                throw new Error("prototype trap");
+            },
+        },
+    );
+
+    expect(() =>
+        validateCaptureMessage({
+            external_message_id: "m1",
+            kind: "text",
+            raw_metadata: throwingMetadata,
+        } as never),
+    ).not.toThrow();
+    expect(
+        validateCaptureMessage({
+            external_message_id: "m1",
+            kind: "text",
+            raw_metadata: throwingMetadata,
+        } as never),
+    ).toEqual(["message raw_metadata must be JSON metadata"]);
+
+    const throwingEntries = new Proxy(Object.create(null), {
+        ownKeys() {
+            throw new Error("ownKeys trap");
+        },
+    });
+    expect(
+        validateCaptureMedia({
+            ...validMedia,
+            metadata: throwingEntries,
+        } as never),
+    ).toEqual(["media metadata must be JSON metadata"]);
+});
+
+test("public metadata validators fail closed for revoked Proxies", () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+
+    expect(() =>
+        validateCaptureMessage({
+            external_message_id: "m1",
+            kind: "text",
+            raw_metadata: proxy,
+        } as never),
+    ).not.toThrow();
+    expect(
+        validateCaptureMessage({
+            external_message_id: "m1",
+            kind: "text",
+            raw_metadata: proxy,
+        } as never),
+    ).toEqual(["message raw_metadata must be JSON metadata"]);
+});
+
 test("validators validate identity and provenance fields and MIME syntax", () => {
     expect(
         validateCaptureMedia({
