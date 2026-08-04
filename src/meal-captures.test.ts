@@ -148,6 +148,38 @@ test("all public validators fail closed for null, malformed, nested-null, and pr
     }
 });
 
+test("metadata accepts shared aliases but rejects true cycles", () => {
+    const shared = { label: "shared" };
+    const nestedShared = { child: shared };
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const nestedCyclic: Record<string, unknown> = {};
+    nestedCyclic.child = nestedCyclic;
+
+    for (const raw_metadata of [
+        { a: shared, b: shared },
+        { left: nestedShared, right: nestedShared },
+        { left: { child: shared }, right: { child: shared } },
+    ]) {
+        expect(
+            validateCaptureMessage({
+                external_message_id: "m1",
+                kind: "text",
+                raw_metadata,
+            } as never),
+        ).toEqual([]);
+    }
+    for (const raw_metadata of [cyclic, { nested: nestedCyclic }]) {
+        expect(
+            validateCaptureMessage({
+                external_message_id: "m1",
+                kind: "text",
+                raw_metadata,
+            } as never),
+        ).toEqual(["message raw_metadata must be JSON metadata"]);
+    }
+});
+
 test("metadata rejects every non-JSON runtime value at any nesting depth", () => {
     const invalidValues = [
         undefined,
