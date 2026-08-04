@@ -8,15 +8,20 @@ A remote MCP server for personal nutrition tracking — log meals with calories,
 
 ## Quick Start
 
-Already hosted and ready to use — just connect it to your MCP client:
+The current runtime is a single-user, no-auth Bun server backed by local
+PostgreSQL. It exposes the MCP protocol at `POST /mcp`; there is no
+Supabase, OAuth, email/password, or account-registration step.
 
+```bash
+bun install
+cp .env.example .env
+# Ensure PostgreSQL is running and DATABASE_URL points at the database to use.
+bun run start
 ```
-https://nutrition-mcp.com/mcp
-```
 
-**On Claude.ai:** Customize → Connectors → + → Add custom connector → paste the URL → Connect
-
-On first connect you'll be asked to register with an email and password. Your data persists across reconnections.
+Then configure an MCP client with `http://localhost:8080/mcp`. The hosted URL
+`https://nutrition-mcp.com/mcp` is a deployment-specific endpoint, not a
+different authentication flow.
 
 Switching from another tracker? See the [nutrition-app alternatives](https://nutrition-mcp.com/alternatives) — how it compares to [MyFitnessPal](https://nutrition-mcp.com/myfitnesspal-mcp), [Cronometer](https://nutrition-mcp.com/cronometer-mcp), [Lose It!](https://nutrition-mcp.com/lose-it-mcp), [MacroFactor](https://nutrition-mcp.com/macrofactor-mcp), [Yazio](https://nutrition-mcp.com/yazio-mcp), and [Lifesum](https://nutrition-mcp.com/lifesum-mcp). Bring your history with you: say "import my meals" and an importer opens in the chat, where you pick the CSV you exported from your old app, map its columns, and check what will be added before anything is saved. Exports from MyFitnessPal, Cronometer, Lose It! and MacroFactor are recognised automatically; any other CSV works by mapping its columns yourself. In clients that can't show in-chat panels, paste the export instead and the AI imports it for you. If your export has an alcohol column and you want it kept, turn alcohol tracking on before importing — the importer skips that column while tracking is off, and re-importing the same file later won't backfill it.
 
@@ -31,8 +36,8 @@ Read the story behind it: [How I Replaced MyFitnessPal and Other Apps with a Sin
 - **Bun** — runtime and package manager
 - **Hono** — HTTP framework
 - **MCP SDK** — Model Context Protocol over Streamable HTTP
-- **Supabase** — PostgreSQL database + user authentication
-- **OAuth 2.0** — authentication for Claude.ai connectors
+- **PostgreSQL** — local database, configured with `DATABASE_URL`
+- **No authentication** — this runtime is single-user and exposes `/mcp` directly
 
 ## MCP Tools
 
@@ -91,94 +96,93 @@ This slice intentionally makes no real MFP calls and ships no automatic backup
 scheduler or cloud backup service; backup manifests are a contract for an
 operator-run backup, not proof that backups ran.
 
+Food-import calls accept at most 50 rows. Each row is limited to 20,000 kcal,
+5,000 g for ordinary macros, and 500 g of alcohol; split larger files into
+chunks while keeping all rows for a calendar date together. The importer is
+idempotent, but it is not an MFP writer or a cloud backup system.
+
 | URI                          | Description                                                                       |
 | ---------------------------- | --------------------------------------------------------------------------------- |
 | `nutrition://weekly-summary` | Rolling 7-day digest (averages vs targets, best/roughest day) for proactive pulls |
 
 ## Self-hosting
 
-### 1. Supabase setup
+This section describes the current local PostgreSQL/Bun runtime. Older
+Supabase, OAuth, and email/password deployment notes are obsolete and must not
+be used for this checkout.
 
-1. Create a [Supabase](https://supabase.com) project.
-2. Enable **Email Auth** (Authentication → Providers → Email) and disable email confirmation.
-3. Apply the schema. The full schema lives in [`supabase/migrations/`](supabase/migrations/). With the [Supabase CLI](https://supabase.com/docs/guides/local-development/cli/getting-started):
+### 1. PostgreSQL and migrations
 
-    ```bash
-    supabase link --project-ref <your-project-ref>
-    supabase db push
-    ```
+Create the database named by `DATABASE_URL`, then apply the migrations in order:
 
-    This creates every table, index, RLS policy, and foreign key the app needs. No local Postgres is involved — migrations run against your hosted project.
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/001_initial_schema.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/002_food_tracking.sql
+```
 
-4. Copy the **service role key** from Project Settings → API and use it as `SUPABASE_SECRET_KEY`.
+Migration `002_food_tracking.sql` is **destructive**: it deletes the legacy
+`meals` rows and drops the legacy `meals` table before creating the append-only
+food-tracking schema. Export any data you need before applying it. Migration
+`002` is safe to rerun after a complete or interrupted run, but it is not a
+backfill and there is no rollback for the legacy meal reset.
 
 ### 2. Environment variables
 
-| Variable               | Description                                                                   |
-| ---------------------- | ----------------------------------------------------------------------------- |
-| `SUPABASE_URL`         | Your Supabase project URL                                                     |
-| `SUPABASE_SECRET_KEY`  | Supabase service role key (bypasses RLS)                                      |
-| `OAUTH_CLIENT_ID`      | Random string for OAuth client identification                                 |
-| `OAUTH_CLIENT_SECRET`  | Random string for OAuth client authentication                                 |
-| `GOOGLE_CLIENT_ID`     | _(optional)_ Google OAuth client ID for "Sign in with Google"                 |
-| `GOOGLE_CLIENT_SECRET` | _(optional)_ Google OAuth client secret                                       |
-| `OFF_USER_AGENT`       | Open Food Facts User-Agent for barcode lookups, in the form `AppName (email)` |
-| `PORT`                 | Server port (default: `8080`)                                                 |
+| Variable            | Description                                                                                                                 |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`      | PostgreSQL connection string for the runtime database (default example: `postgres://localhost:5432/nutrition_mcp`)          |
+| `DATABASE_URL_TEST` | Isolated PostgreSQL database used by integration tests (default example: `postgres://localhost:5432/nutrition_mcp_test`)    |
+| `MEDIA_ROOT`        | Local directory for event media bytes (default example: `./data/media`); PostgreSQL stores metadata and keys, not the bytes |
+| `OFF_USER_AGENT`    | Open Food Facts User-Agent for barcode lookups, in the form `AppName (email)`                                               |
+| `PORT`              | Server port (default: `8080`)                                                                                               |
 
 > **Making it yours:** The public site includes the maintainer's personal bits — Google Analytics, Patreon/GitHub/contact links, and the `nutrition-mcp.com` domain. Run `bun run depersonalize` to strip them all in one pass (analytics + CSP, the Support/Contact sections, social links, and the domain → a `your-domain.com` placeholder). Use `bun run depersonalize --dry` to preview without writing. Afterwards, swap in your own `public/og.png`, `favicon.ico`, and `apple-touch-icon.png`, and replace the domain placeholder with your real domain.
-
-Generate OAuth credentials:
-
-```bash
-openssl rand -hex 16   # use as OAUTH_CLIENT_ID
-openssl rand -hex 32   # use as OAUTH_CLIENT_SECRET
-```
-
-### 3. Google sign-in (optional)
-
-Email/password works out of the box. To also offer **"Continue with Google"**,
-follow [`docs/google-auth-setup.md`](docs/google-auth-setup.md) to create a
-Google OAuth client, enable the Google provider in Supabase, and set
-`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`.
 
 ## Development
 
 ```bash
 bun install
-cp .env.example .env   # fill in your credentials
+cp .env.example .env   # set DATABASE_URL and any local overrides
 bun run dev             # starts with hot reload on http://localhost:8080
+```
+
+Run the actual MCP server with `bun run start` (or `bun run src/index.ts`).
+`GET /health` returns `ok`; MCP clients must use `POST /mcp`.
+
+For the full test suite, point integration tests at a disposable database:
+
+```bash
+DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test bun test
+bun run typecheck
+bun run format:check
 ```
 
 ## Connect to Claude.ai
 
-1. Open [Claude.ai](https://claude.ai) and click **Customize**
-2. Click **Connectors**, then the **+** button
-3. Click **Add custom connector**
-4. Fill in:
-    - **Name**: Nutrition Tracker
-    - **Remote MCP Server URL**: `https://nutrition-mcp.com/mcp`
-5. Click **Connect** — sign in or register when prompted
-6. After signing in, Claude can use your nutrition tools. If you reconnect later, sign in with the same email and password to keep your data.
+1. Start the server locally with `bun run start`.
+2. Add a custom connector named **Nutrition Tracker**.
+3. Use `http://localhost:8080/mcp` as the MCP URL.
+4. Connect; no sign-in or registration is expected.
 
 ## API Endpoints
 
-| Endpoint                                      | Description                            |
-| --------------------------------------------- | -------------------------------------- |
-| `GET /health`                                 | Health check                           |
-| `GET /.well-known/oauth-authorization-server` | OAuth metadata discovery               |
-| `POST /register`                              | Dynamic client registration            |
-| `GET /authorize`                              | OAuth authorization (shows login page) |
-| `POST /approve`                               | Login/register handler                 |
-| `POST /token`                                 | Token exchange                         |
-| `GET /favicon.ico`                            | Server icon                            |
-| `ALL /mcp`                                    | MCP endpoint (authenticated)           |
+| Endpoint           | Description                      |
+| ------------------ | -------------------------------- |
+| `GET /health`      | Health check                     |
+| `POST /mcp`        | Stateless MCP endpoint (no auth) |
+| `GET /favicon.ico` | Server icon                      |
+
+The old OAuth discovery, registration, authorize, approve, and token paths are
+not part of this runtime.
 
 ## Deploy
 
-The project includes a `Dockerfile` for container-based deployment.
+The project includes a `Dockerfile` for container-based deployment. The
+container still requires a reachable PostgreSQL `DATABASE_URL`; it does not
+provide Supabase or OAuth services.
 
 1. Push your repo to a hosting provider (e.g. DigitalOcean App Platform)
-2. Set the environment variables listed above
+2. Set the runtime environment variables listed above, including `DATABASE_URL`
 3. The app auto-detects the Dockerfile and deploys on port `8080`
 4. Point your domain to the deployed URL
 
