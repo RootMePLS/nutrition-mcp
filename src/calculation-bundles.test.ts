@@ -43,6 +43,42 @@ describe("calculation bundle commit seam", () => {
         }
     });
 
+    test("rejects calculation bundle scopes with unknown keys through MCP", async () => {
+        const bundle = makeBundle();
+        bundle.event_id = "00000000-0000-4000-8000-000000000001";
+        bundle.fingerprint = stableBundleFingerprint(bundle);
+        bundle.results[0]!.scope = { ordinal: null, unexpected: true } as never;
+        const server = new McpServer(
+            { name: "test", version: "0.0.0" },
+            { capabilities: { tools: {}, resources: {} } },
+        );
+        registerTools(server, "u1", false, null, {
+            mealEventsPool: {
+                connect: async () => ({
+                    release: () => undefined,
+                }),
+            } as never,
+        });
+        const [clientTransport, serverTransport] =
+            InMemoryTransport.createLinkedPair();
+        const client = new Client({ name: "test", version: "0.0.0" });
+        await Promise.all([
+            server.connect(serverTransport),
+            client.connect(clientTransport),
+        ]);
+        try {
+            const result = await client.callTool({
+                name: "commit_calculation_bundle",
+                arguments: { bundle },
+            });
+            expect(result.isError).toBe(true);
+            expect(JSON.stringify(result)).toContain("unexpected");
+        } finally {
+            await client.close();
+            await server.close();
+        }
+    });
+
     test("calls the commit tool through MCP and returns idempotent retries", async () => {
         const bundle = makeBundle();
         bundle.event_id = "00000000-0000-4000-8000-000000000001";

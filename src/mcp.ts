@@ -40,7 +40,9 @@ const CALCULATION_BUNDLE_INPUT_SCHEMA = z.object({
         z.object({
             provider: z.enum(["nutrition-local", "own", "myfitnesspal"]),
             status: z.enum(["succeeded", "failed", "unavailable"]),
-            scope: z.object({ ordinal: z.number().int().min(0).nullable() }),
+            scope: z
+                .object({ ordinal: z.number().int().min(0).nullable() })
+                .strict(),
             source_id: z.string().min(1),
             request_fingerprint: z.string().min(1),
             algorithm_version: z.string().min(1),
