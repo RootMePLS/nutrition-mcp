@@ -22,6 +22,7 @@ import {
     TOTALS_ITEM,
     TRENDS_DAY_ITEM,
     MEAL_BREAKDOWN_ITEM,
+    MEAL_PROGRESS_OUTPUT_SCHEMA,
     MAX_CALORIES,
     MAX_MACRO_G,
     MAX_ALCOHOL_G,
@@ -44,6 +45,55 @@ import {
     type DailyBucket,
 } from "./insights.js";
 import type { Meal, NutritionGoals } from "./db.js";
+import { writeProvenanceFields } from "./meal-events.js";
+
+// The shared builder behind the provenance disclosure fields on log_meal,
+// update_meal and bulk_import_meals: it maps the persisted write readback
+// (readPersistedWriteStatus) onto the public vocabulary. A compatibility
+// write is never allowed to masquerade as a complete bundle, and a
+// bundle-backed version never reports "compatibility".
+describe("writeProvenanceFields", () => {
+    test("compatibility write discloses compatibility, no bundle", () => {
+        const fields = writeProvenanceFields({
+            version: 1,
+            provenance_status: "pending",
+            compatibility: true,
+        });
+        expect(fields).toEqual({
+            provenance_status: "compatibility",
+            event_version: 1,
+            has_calculation_bundle: false,
+            provenance_note: expect.any(String),
+        });
+        expect(fields.provenance_note.length).toBeGreaterThan(0);
+    });
+
+    test("bundle-backed version with ready evidence reports complete", () => {
+        const fields = writeProvenanceFields({
+            version: 2,
+            provenance_status: "ready",
+            compatibility: false,
+        });
+        expect(fields.provenance_status).toBe("complete");
+        expect(fields.event_version).toBe(2);
+        expect(fields.has_calculation_bundle).toBe(true);
+        expect(fields.provenance_note.length).toBeGreaterThan(0);
+    });
+
+    test("bundle-backed version with incomplete evidence reports pending", () => {
+        for (const status of ["pending", "unavailable", "missing"] as const) {
+            const fields = writeProvenanceFields({
+                version: 3,
+                provenance_status: status,
+                compatibility: false,
+            });
+            expect(fields.provenance_status).toBe("pending");
+            expect(fields.event_version).toBe(3);
+            expect(fields.has_calculation_bundle).toBe(true);
+            expect(fields.provenance_note.length).toBeGreaterThan(0);
+        }
+    });
+});
 
 function meal(over: Partial<Meal> = {}): Meal {
     return {
@@ -1338,7 +1388,15 @@ mock.module("./db.js", () => ({
         db.inserted.push(input);
         const saved = storedMeal(input);
         db.meals = [saved];
-        return { meal: saved, deduplicated: false };
+        return {
+            meal: saved,
+            deduplicated: false,
+            provenance: writeProvenanceFields({
+                version: 1,
+                provenance_status: "pending",
+                compatibility: true,
+            }),
+        };
     },
     updateMeal: async (
         _userId: string,
@@ -1347,7 +1405,14 @@ mock.module("./db.js", () => ({
     ) => {
         const saved = storedMeal({ ...fields, id });
         db.meals = [saved];
-        return saved;
+        return {
+            meal: saved,
+            provenance: writeProvenanceFields({
+                version: 2,
+                provenance_status: "pending",
+                compatibility: true,
+            }),
+        };
     },
     countMeals: async () => db.meals.length,
     existingIdempotencyKeys: async () => new Set<string>(),
@@ -1385,6 +1450,7 @@ beforeEach(() => {
 interface ToolResult {
     content: { type: string; text: string }[];
     isError?: boolean;
+    structuredContent?: Record<string, unknown>;
 }
 
 type CallTool = (
@@ -1427,6 +1493,44 @@ async function withTools(
 const textOf = (r: ToolResult) => r.content.map((c) => c.text).join("\n");
 
 // ---------- (1) numeric bounds ----------
+
+describe("legacy write provenance disclosure", () => {
+    test("log_meal structuredContent discloses the compatibility write", async () => {
+        await withTools(null, async (call) => {
+            const r = await call("log_meal", {
+                description: "Oatmeal",
+                meal_type: "breakfast",
+                calories: 300,
+            });
+            expect(r.isError).toBeFalsy();
+            const parsed = z
+                .object(MEAL_PROGRESS_OUTPUT_SCHEMA)
+                .parse(r.structuredContent);
+            expect(parsed.provenance_status).toBe("compatibility");
+            expect(parsed.event_version).toBe(1);
+            expect(parsed.has_calculation_bundle).toBe(false);
+            expect(parsed.provenance_note.length).toBeGreaterThan(0);
+        });
+    });
+
+    test("update_meal structuredContent discloses the compatibility write", async () => {
+        await withTools(null, async (call) => {
+            const r = await call("update_meal", {
+                id: "m1",
+                calories: 350,
+            });
+            expect(r.isError).toBeFalsy();
+            const parsed = z
+                .object(MEAL_PROGRESS_OUTPUT_SCHEMA)
+                .parse(r.structuredContent);
+            expect(parsed.action).toBe("updated");
+            expect(parsed.provenance_status).toBe("compatibility");
+            expect(parsed.event_version).toBe(2);
+            expect(parsed.has_calculation_bundle).toBe(false);
+            expect(parsed.provenance_note.length).toBeGreaterThan(0);
+        });
+    });
+});
 
 describe("write-tool numeric bounds", () => {
     // These bounds must equal the ones bulk_import_meals enforces, or the same

@@ -18,6 +18,7 @@ import {
     type ImportDeps,
 } from "./import.js";
 import { dateInTz } from "./tz.js";
+import { writeProvenanceFields } from "./meal-events.js";
 
 const NOW = Date.parse("2026-07-25T12:00:00Z");
 const TZ = "Europe/Kyiv";
@@ -33,6 +34,7 @@ function makeStore(
     } = {},
 ) {
     const byKey = new Map<string, Meal>();
+    const provenanceByKey = new Map<string, MealInsertResult["provenance"]>();
     const inserted: MealInput[] = [];
     let counter = 0;
     const deps: ImportDeps = {
@@ -44,7 +46,13 @@ function makeStore(
             if (opts.failOn?.(input)) throw new Error("simulated db failure");
             const key = input.idempotency_key!;
             const existing = byKey.get(key);
-            if (existing) return { meal: existing, deduplicated: true };
+            if (existing) {
+                return {
+                    meal: existing,
+                    deduplicated: true,
+                    provenance: provenanceByKey.get(key)!,
+                };
+            }
             const meal = {
                 id: `meal-${++counter}`,
                 user_id: "user-1",
@@ -58,9 +66,15 @@ function makeStore(
                 notes: input.notes ?? null,
                 idempotency_key: key,
             } as Meal;
+            const provenance = writeProvenanceFields({
+                version: 1,
+                provenance_status: "pending",
+                compatibility: true,
+            });
             byKey.set(key, meal);
+            provenanceByKey.set(key, provenance);
             inserted.push({ ...input });
-            return { meal, deduplicated: false };
+            return { meal, deduplicated: false, provenance };
         },
         async existingKeys(keys: string[]) {
             return new Set(keys.filter((k) => byKey.has(k)));
@@ -993,6 +1007,10 @@ test("serialized output validates against the declared outputSchema on every pat
                 "logged_at",
                 "meal_type",
                 "error",
+                "provenance_status",
+                "event_version",
+                "has_calculation_bundle",
+                "provenance_note",
             ]) {
                 expect(Object.hasOwn(r, key)).toBe(true);
             }
@@ -1001,6 +1019,74 @@ test("serialized output validates against the declared outputSchema on every pat
                 expect(Object.hasOwn(r.error, "suggested_fix")).toBe(true);
             }
         }
+    }
+});
+
+test("written rows disclose compatibility provenance; unwritten rows null it", async () => {
+    // A row that never reached the database (dry run, validation failure,
+    // not attempted) has no event whose provenance could be reported, so all
+    // four fields are explicit nulls — never a fabricated "compatibility".
+    const schema = z.object(BULK_IMPORT_OUTPUT_SCHEMA);
+
+    const { deps } = makeStore();
+    const written = serializeImportResult(
+        await runImport(
+            args([row({ source_line: 2 }), row({ source_line: 3 })]),
+            deps,
+        ),
+    );
+    const parsed = schema.parse(written);
+    for (const r of parsed.results) {
+        expect(r.status).toBe("created");
+        expect(r.provenance_status).toBe("compatibility");
+        expect(r.event_version).toBe(1);
+        expect(r.has_calculation_bundle).toBe(false);
+        expect(r.provenance_note!.length).toBeGreaterThan(0);
+    }
+
+    // Deduplicated rows still reference a real event, so they keep the real
+    // provenance of that event instead of going null.
+    const deduped = serializeImportResult(
+        await runImport(
+            args([row({ source_line: 2 }), row({ source_line: 3 })]),
+            deps,
+        ),
+    );
+    for (const r of schema.parse(deduped).results) {
+        expect(r.status).toBe("deduplicated");
+        expect(r.provenance_status).toBe("compatibility");
+        expect(r.event_version).toBe(1);
+        expect(r.has_calculation_bundle).toBe(false);
+    }
+
+    const { deps: dryDeps } = makeStore();
+    const dryRun = serializeImportResult(
+        await runImport(
+            args([row({ source_line: 2 })], { dry_run: true }),
+            dryDeps,
+        ),
+    );
+    for (const r of schema.parse(dryRun).results) {
+        expect(r.status).toBe("would_create");
+        expect(r.provenance_status).toBeNull();
+        expect(r.event_version).toBeNull();
+        expect(r.has_calculation_bundle).toBeNull();
+        expect(r.provenance_note).toBeNull();
+    }
+
+    const { deps: failDeps } = makeStore();
+    const failed = serializeImportResult(
+        await runImport(
+            args([row({ source_line: 2, logged_at: "nope" })]),
+            failDeps,
+        ),
+    );
+    for (const r of schema.parse(failed).results) {
+        expect(r.status).toBe("failed");
+        expect(r.provenance_status).toBeNull();
+        expect(r.event_version).toBeNull();
+        expect(r.has_calculation_bundle).toBeNull();
+        expect(r.provenance_note).toBeNull();
     }
 });
 

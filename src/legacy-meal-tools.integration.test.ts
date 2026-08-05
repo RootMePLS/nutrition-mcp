@@ -14,6 +14,8 @@ import { Pool } from "pg";
 import { registerTools, TOTALS_ITEM, TRENDS_DAY_ITEM } from "./mcp.js";
 import { z } from "zod";
 import { flushAnalytics } from "./analytics.js";
+import { MEAL_PROGRESS_OUTPUT_SCHEMA } from "./mcp.js";
+import { BULK_IMPORT_OUTPUT_SCHEMA } from "./import.js";
 import {
     CALCULATION_BUNDLE_OUTPUT_SCHEMA,
     CALCULATION_CORRECTION_OUTPUT_SCHEMA,
@@ -1714,6 +1716,275 @@ describeDb("legacy meal MCP tools use the event projection", () => {
             ]);
         },
     );
+
+    test.serial(
+        "log_meal discloses compatibility provenance, honestly on idempotent retry",
+        async () => {
+            await callTools(async (call) => {
+                const args = {
+                    description: "provenance oats",
+                    meal_type: "breakfast",
+                    calories: 410,
+                    logged_at: "2026-08-05T08:00:00.000Z",
+                    idempotency_key: "s4-log-provenance",
+                };
+                const logged = await call("log_meal", args);
+                expect(logged.isError).not.toBe(true);
+                const parsed = z
+                    .object(MEAL_PROGRESS_OUTPUT_SCHEMA)
+                    .parse(logged.structuredContent);
+                expect(parsed.provenance_status).toBe("compatibility");
+                expect(parsed.event_version).toBe(1);
+                expect(parsed.has_calculation_bundle).toBe(false);
+                expect(parsed.provenance_note.length).toBeGreaterThan(0);
+
+                // An idempotent retry returns the same event and must not
+                // invent a different provenance story.
+                const retry = await call("log_meal", args);
+                expect(retry.isError).not.toBe(true);
+                expect(retry.content[0]!.text).toContain("idempotent retry");
+                const retryParsed = z
+                    .object(MEAL_PROGRESS_OUTPUT_SCHEMA)
+                    .parse(retry.structuredContent);
+                expect(retryParsed.provenance_status).toBe("compatibility");
+                expect(retryParsed.event_version).toBe(1);
+                expect(retryParsed.has_calculation_bundle).toBe(false);
+            });
+        },
+    );
+
+    test.serial(
+        "update_meal discloses compatibility provenance on the new version",
+        async () => {
+            let mealId = "";
+            await callTools(async (call) => {
+                const logged = await call("log_meal", {
+                    description: "provenance soup",
+                    meal_type: "lunch",
+                    calories: 300,
+                    logged_at: "2026-08-05T12:00:00.000Z",
+                    idempotency_key: "s4-update-provenance",
+                });
+                expect(logged.isError).not.toBe(true);
+                const rows = await pool.query(
+                    "SELECT id FROM meal_events WHERE user_id = $1",
+                    ["u1"],
+                );
+                mealId = rows.rows[0]!.id as string;
+
+                const updateArgs = {
+                    id: mealId,
+                    calories: 350,
+                };
+                const updated = await call("update_meal", updateArgs);
+                expect(updated.isError).not.toBe(true);
+                const parsed = z
+                    .object(MEAL_PROGRESS_OUTPUT_SCHEMA)
+                    .parse(updated.structuredContent);
+                expect(parsed.action).toBe("updated");
+                expect(parsed.provenance_status).toBe("compatibility");
+                expect(parsed.event_version).toBe(2);
+                expect(parsed.has_calculation_bundle).toBe(false);
+                expect(parsed.provenance_note.length).toBeGreaterThan(0);
+
+                // Identical retry deduplicates the correction: no third
+                // version, and the disclosed status stays the truth.
+                const retry = await call("update_meal", updateArgs);
+                expect(retry.isError).not.toBe(true);
+                const retryParsed = z
+                    .object(MEAL_PROGRESS_OUTPUT_SCHEMA)
+                    .parse(retry.structuredContent);
+                expect(retryParsed.provenance_status).toBe("compatibility");
+                expect(retryParsed.event_version).toBe(2);
+                expect(retryParsed.has_calculation_bundle).toBe(false);
+            });
+            const versions = await pool.query(
+                `SELECT count(*)::int AS count FROM meal_event_versions
+                  WHERE event_id = $1`,
+                [mealId],
+            );
+            expect(versions.rows[0]!.count).toBe(2);
+        },
+    );
+
+    test.serial(
+        "a committed calculation bundle completes a legacy write's disclosed provenance",
+        async () => {
+            let eventId = "";
+            const logArgs = {
+                description: "provenance risotto",
+                meal_type: "dinner",
+                calories: 500,
+                logged_at: "2026-08-05T19:00:00.000Z",
+                idempotency_key: "s4-complete-provenance",
+            };
+            await callTools(async (call) => {
+                const logged = await call("log_meal", logArgs);
+                expect(logged.isError).not.toBe(true);
+                const before = z
+                    .object(MEAL_PROGRESS_OUTPUT_SCHEMA)
+                    .parse(logged.structuredContent);
+                expect(before.provenance_status).toBe("compatibility");
+                expect(before.has_calculation_bundle).toBe(false);
+            });
+            const rows = await pool.query(
+                "SELECT id FROM meal_events WHERE user_id = $1",
+                ["u1"],
+            );
+            eventId = rows.rows[0]!.id as string;
+
+            // Complete the event through the public calculation path: the
+            // correction appends version 2 with a full-evidence bundle.
+            await callTools(async (call) => {
+                const corrected = await call("commit_calculation_correction", {
+                    bundle: completeBundle(eventId, 2),
+                    correction_idempotency_key: "s4-complete-correction",
+                    correction_reason: "full provider evidence arrived",
+                    correction_author: "hermes",
+                    source_timestamp: "2026-08-05T20:00:00.000Z",
+                    confirmed: true,
+                    external_write_authorized: false,
+                });
+                expect(corrected.isError).not.toBe(true);
+
+                // Cross-check through the public provenance readback: the
+                // bundle evidence really is complete.
+                const provenance = await call("get_calculation_provenance", {
+                    event_id: eventId,
+                });
+                expect(provenance.isError).not.toBe(true);
+                expect(
+                    CALCULATION_PROVENANCE_OUTPUT_SCHEMA.parse(
+                        provenance.structuredContent,
+                    ),
+                ).toMatchObject({
+                    version: 2,
+                    current_version: 2,
+                    provenance_status: "ready",
+                    compatibility: false,
+                });
+
+                // The legacy write path now reads the same truth back: an
+                // idempotent retry must NOT keep claiming "compatibility".
+                const retry = await call("log_meal", logArgs);
+                expect(retry.isError).not.toBe(true);
+                expect(retry.content[0]!.text).toContain("idempotent retry");
+                const parsed = z
+                    .object(MEAL_PROGRESS_OUTPUT_SCHEMA)
+                    .parse(retry.structuredContent);
+                expect(parsed.provenance_status).toBe("complete");
+                expect(parsed.event_version).toBe(2);
+                expect(parsed.has_calculation_bundle).toBe(true);
+            });
+        },
+    );
+
+    test.serial(
+        "bulk_import_meals reports per-row provenance and nulls for unwritten rows",
+        async () => {
+            const rows = [
+                {
+                    source_line: 1,
+                    description: "bulk provenance oats",
+                    meal_type: "breakfast",
+                    logged_at: "2026-08-05T07:00:00.000Z",
+                    calories: 300,
+                },
+                {
+                    source_line: 2,
+                    description: "bulk provenance salad",
+                    meal_type: "lunch",
+                    logged_at: "2026-08-05T13:00:00.000Z",
+                    calories: 450,
+                },
+            ];
+            await callTools(async (call) => {
+                // Dry run writes nothing, so there is no provenance to
+                // disclose: every per-row provenance field is null.
+                const dryRun = await call("bulk_import_meals", {
+                    meals: rows,
+                    expected_row_count: 2,
+                    expected_total_kcal: 750,
+                    dry_run: true,
+                });
+                expect(dryRun.isError).not.toBe(true);
+                const dryParsed = z
+                    .object(BULK_IMPORT_OUTPUT_SCHEMA)
+                    .parse(dryRun.structuredContent);
+                for (const row of dryParsed.results) {
+                    expect(row.status).toBe("would_create");
+                    expect(row.provenance_status).toBeNull();
+                    expect(row.event_version).toBeNull();
+                    expect(row.has_calculation_bundle).toBeNull();
+                    expect(row.provenance_note).toBeNull();
+                }
+
+                const imported = await call("bulk_import_meals", {
+                    meals: rows,
+                    expected_row_count: 2,
+                    expected_total_kcal: 750,
+                    dry_run: false,
+                });
+                expect(imported.isError).not.toBe(true);
+                const parsed = z
+                    .object(BULK_IMPORT_OUTPUT_SCHEMA)
+                    .parse(imported.structuredContent);
+                for (const row of parsed.results) {
+                    expect(row.status).toBe("created");
+                    expect(row.provenance_status).toBe("compatibility");
+                    expect(row.event_version).toBe(1);
+                    expect(row.has_calculation_bundle).toBe(false);
+                    expect(row.provenance_note!.length).toBeGreaterThan(0);
+                }
+
+                // Re-import deduplicates; the returned rows still point at the
+                // real events, so the disclosed status must stay truthful.
+                const retry = await call("bulk_import_meals", {
+                    meals: rows,
+                    expected_row_count: 2,
+                    expected_total_kcal: 750,
+                    dry_run: false,
+                });
+                expect(retry.isError).not.toBe(true);
+                const retryParsed = z
+                    .object(BULK_IMPORT_OUTPUT_SCHEMA)
+                    .parse(retry.structuredContent);
+                for (const row of retryParsed.results) {
+                    expect(row.status).toBe("deduplicated");
+                    expect(row.provenance_status).toBe("compatibility");
+                    expect(row.event_version).toBe(1);
+                    expect(row.has_calculation_bundle).toBe(false);
+                }
+
+                // A row that failed validation was never written: null
+                // provenance, never a fabricated status.
+                const withBadRow = await call("bulk_import_meals", {
+                    meals: [
+                        ...rows,
+                        {
+                            source_line: 3,
+                            description: "bad row",
+                            logged_at: "2026-08-05T15:00:00.000Z",
+                            calories: -5,
+                        },
+                    ],
+                    expected_row_count: 3,
+                    dry_run: false,
+                });
+                expect(withBadRow.isError).not.toBe(true);
+                const badParsed = z
+                    .object(BULK_IMPORT_OUTPUT_SCHEMA)
+                    .parse(withBadRow.structuredContent);
+                const failedRow = badParsed.results.find(
+                    (r) => r.status === "failed",
+                )!;
+                expect(failedRow.provenance_status).toBeNull();
+                expect(failedRow.event_version).toBeNull();
+                expect(failedRow.has_calculation_bundle).toBeNull();
+                expect(failedRow.provenance_note).toBeNull();
+            });
+        },
+    );
 });
 
 function publicBundle(
@@ -1770,6 +2041,43 @@ function publicBundle(
                 error_code: "provider_unavailable",
                 error_message: "not configured",
             },
+        ],
+        canonical_proposal: { calories: 9999 },
+    } satisfies Omit<CalculationBundleInput, "fingerprint">;
+    return { ...input, fingerprint: stableBundleFingerprint(input) };
+}
+
+// A bundle whose three providers all succeeded with complete evidence
+// (source_id, request_fingerprint, algorithm_version, raw_payload, provenance,
+// basis, units), so the public provenance readback reaches "ready".
+function completeBundle(
+    eventId: string,
+    version: number,
+): CalculationBundleInput {
+    const providerResult = (
+        provider: "nutrition-local" | "own" | "myfitnesspal",
+    ) => ({
+        provider,
+        status: "succeeded" as const,
+        scope: { ordinal: null },
+        source_id: `${provider}-source`,
+        request_fingerprint: `${provider}-request-complete`,
+        algorithm_version: "v1",
+        basis: "per_meal" as const,
+        units: "g_and_kcal" as const,
+        nutrients: { calories: 500 },
+        raw_payload: { provider, calories: 500 },
+        provenance: { source: provider },
+    });
+    const input = {
+        event_id: eventId,
+        version,
+        capture_id: "complete-bundle",
+        resolved_input: { items: [], inputs: [] },
+        results: [
+            providerResult("nutrition-local"),
+            providerResult("own"),
+            providerResult("myfitnesspal"),
         ],
         canonical_proposal: { calories: 9999 },
     } satisfies Omit<CalculationBundleInput, "fingerprint">;

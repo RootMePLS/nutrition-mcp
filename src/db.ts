@@ -14,7 +14,12 @@ import {
     searchMealProjections,
     type MealEventProjection,
 } from "./meal-event-projection.js";
-import { createMealEvent, correctMealEvent } from "./meal-events.js";
+import {
+    createMealEvent,
+    correctMealEvent,
+    writeProvenanceFields,
+    type WriteProvenanceFields,
+} from "./meal-events.js";
 import type {
     CreateMealEventCommand,
     CorrectMealEventCommand,
@@ -112,6 +117,15 @@ export interface MealInput {
 export interface MealInsertResult {
     meal: Meal;
     deduplicated: boolean;
+    /** Disclosure fields for the tool output: derived from the persisted
+     *  write readback, so an idempotent retry of an event that later gained
+     *  a calculation bundle reports "complete", not a stale "compatibility". */
+    provenance: WriteProvenanceFields;
+}
+
+export interface MealUpdateResult {
+    meal: Meal;
+    provenance: WriteProvenanceFields;
 }
 
 // ============================================================================
@@ -240,7 +254,11 @@ export async function insertMeal(
     );
     const meal = await getMealProjection(pool, userId, result.event_id);
     if (!meal) throw new Error("Failed to read created meal event");
-    return { meal: projectionAsMeal(meal), deduplicated: result.deduplicated };
+    return {
+        meal: projectionAsMeal(meal),
+        deduplicated: result.deduplicated,
+        provenance: writeProvenanceFields(result),
+    };
 }
 
 export async function getMealsByDate(
@@ -317,7 +335,7 @@ export async function updateMeal(
     userId: string,
     id: string,
     fields: Partial<MealInput>,
-): Promise<Meal> {
+): Promise<MealUpdateResult> {
     const current = await getMealProjection(pool, userId, id);
     if (!current) throw new Error("Meal not found");
     const merged: MealInput = {
@@ -350,10 +368,13 @@ export async function updateMeal(
         consumed_at: merged.logged_at,
         meal_type: merged.meal_type,
     };
-    await correctMealEvent(pool, correction);
+    const corrected = await correctMealEvent(pool, correction);
     const updated = await getMealProjection(pool, userId, id);
     if (!updated) throw new Error("Meal not found");
-    return projectionAsMeal(updated);
+    return {
+        meal: projectionAsMeal(updated),
+        provenance: writeProvenanceFields(corrected),
+    };
 }
 
 // ============================================================================

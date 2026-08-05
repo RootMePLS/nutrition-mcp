@@ -22,6 +22,7 @@
 
 import { z } from "zod";
 import type { MealInput, MealInsertResult } from "./db.js";
+import type { WriteProvenanceFields } from "./meal-events.js";
 import { dateInTz, zonedHourUtc, zonedWallClockToUtc } from "./tz.js";
 import { decodeEscapeSequences } from "./normalize.js";
 import { toStoredInteger } from "./units.js";
@@ -153,6 +154,14 @@ export interface ImportResultRow {
     description_synthesized: boolean;
     logged_at_from_bare_date: boolean;
     error: RowError | null;
+    /** Provenance disclosure for the event this row wrote (or deduplicated
+     *  to). All four are null when the row never reached the database —
+     *  dry run, validation failure, or not attempted — because there is no
+     *  event whose provenance could truthfully be reported. */
+    provenance_status: WriteProvenanceFields["provenance_status"] | null;
+    event_version: number | null;
+    has_calculation_bundle: boolean | null;
+    provenance_note: string | null;
 }
 
 export interface ImportSummary {
@@ -230,6 +239,14 @@ export const BULK_IMPORT_OUTPUT_SCHEMA = {
             description_synthesized: z.boolean(),
             logged_at_from_bare_date: z.boolean(),
             error: IMPORT_ERROR_SCHEMA,
+            // Per-row write provenance (S4). Nullable rather than optional:
+            // null means "no event was written for this row".
+            provenance_status: z
+                .enum(["pending", "compatibility", "complete"])
+                .nullable(),
+            event_version: z.number().int().min(1).nullable(),
+            has_calculation_bundle: z.boolean().nullable(),
+            provenance_note: z.string().nullable(),
         }),
     ),
 };
@@ -260,6 +277,10 @@ export function serializeImportResult(result: ImportResult) {
             meal_type_inferred: r.meal_type_inferred,
             description_synthesized: r.description_synthesized,
             logged_at_from_bare_date: r.logged_at_from_bare_date,
+            provenance_status: r.provenance_status,
+            event_version: r.event_version,
+            has_calculation_bundle: r.has_calculation_bundle,
+            provenance_note: r.provenance_note,
             error: r.error
                 ? {
                       code: r.error.code,
@@ -1023,6 +1044,7 @@ function resultRow(
     v: RowValidation,
     status: RowStatus,
     mealId: string | null,
+    provenance: WriteProvenanceFields | null = null,
 ): ImportResultRow {
     const base = {
         index: v.index,
@@ -1030,6 +1052,10 @@ function resultRow(
         client_row_id: v.client_row_id,
         status,
         meal_id: mealId,
+        provenance_status: provenance?.provenance_status ?? null,
+        event_version: provenance?.event_version ?? null,
+        has_calculation_bundle: provenance?.has_calculation_bundle ?? null,
+        provenance_note: provenance?.provenance_note ?? null,
     };
     if (v.ok) {
         return {
@@ -1216,7 +1242,7 @@ export async function runImport(
                 continue;
             }
             try {
-                const { meal, deduplicated } = await deps.insert(
+                const { meal, deduplicated, provenance } = await deps.insert(
                     v.resolved.input,
                 );
                 if (deduplicated) summary.deduplicated++;
@@ -1227,6 +1253,7 @@ export async function runImport(
                         v,
                         deduplicated ? "deduplicated" : "created",
                         meal.id,
+                        provenance,
                     ),
                 );
             } catch (e) {

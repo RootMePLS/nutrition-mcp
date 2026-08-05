@@ -53,9 +53,68 @@ export interface CreateMealEventResult {
     provenance_status: ProvenanceStatus;
     fingerprint: string | null;
     canonical: ReturnType<typeof computeConsensus> | null;
+    /** True when the version carries no calculation bundle fingerprint, i.e.
+     *  the write is legacy compatibility data rather than a bundle-backed
+     *  calculation. Always populated by readPersistedWriteStatus. */
+    compatibility: boolean;
 }
 
 export type ProvenanceStatus = "ready" | "pending" | "unavailable" | "missing";
+
+/** The public vocabulary legacy write tools use to disclose provenance. */
+export type WriteProvenanceStatus = "pending" | "compatibility" | "complete";
+
+export interface WriteProvenanceFields {
+    provenance_status: WriteProvenanceStatus;
+    event_version: number;
+    has_calculation_bundle: boolean;
+    provenance_note: string;
+}
+
+/**
+ * Map a persisted write readback (readPersistedWriteStatus, spread into every
+ * create/correct result) onto the disclosure fields the legacy write tools
+ * (log_meal, update_meal, bulk_import_meals) report. Shared by all three so
+ * the tools can never drift apart:
+ *
+ * - a compatibility write (no bundle fingerprint) discloses "compatibility"
+ *   and has_calculation_bundle: false — caller-supplied values, no bundle;
+ * - a bundle-backed version whose evidence readback is "ready" reports
+ *   "complete";
+ * - a bundle-backed version whose evidence is anything less reports
+ *   "pending" — the bundle exists, so has_calculation_bundle stays true.
+ */
+export function writeProvenanceFields(write: {
+    version: number;
+    provenance_status: ProvenanceStatus;
+    compatibility: boolean;
+}): WriteProvenanceFields {
+    if (write.compatibility) {
+        return {
+            provenance_status: "compatibility",
+            event_version: write.version,
+            has_calculation_bundle: false,
+            provenance_note:
+                "Compatibility write: values were stored as given, without a multi-provider calculation bundle for this version. Commit one via commit_calculation_bundle or commit_calculation_correction for full provider provenance.",
+        };
+    }
+    if (write.provenance_status === "ready") {
+        return {
+            provenance_status: "complete",
+            event_version: write.version,
+            has_calculation_bundle: true,
+            provenance_note:
+                "A calculation bundle is committed for this version and its provider evidence and consensus are complete.",
+        };
+    }
+    return {
+        provenance_status: "pending",
+        event_version: write.version,
+        has_calculation_bundle: true,
+        provenance_note:
+            "A calculation bundle is committed for this version but provider evidence is incomplete or still pending; see get_calculation_provenance for detail.",
+    };
+}
 
 /** Read the just-persisted aggregate while the write transaction still owns its locks. */
 export async function readPersistedWriteStatus(

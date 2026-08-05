@@ -8,6 +8,7 @@ import {
     getMealEvent,
     getMealEventProvenance,
     type MealEventAggregate,
+    type WriteProvenanceFields,
 } from "./meal-events.js";
 
 import {
@@ -698,8 +699,9 @@ const DRINK_UNIT_FIELD = z.enum(["us", "uk"]).nullable();
 // log_meal and update_meal share the same MCP Apps widget
 // (public/widgets/meal-logged.html). Both declare this identical output shape
 // and both build their payload via buildMealProgress() below, so the widget can
-// render either result; `action` only changes the header wording.
-const MEAL_PROGRESS_OUTPUT_SCHEMA = {
+// render either result; `action` only changes the header wording. Exported so
+// tests can parse real tool payloads against the declared contract.
+export const MEAL_PROGRESS_OUTPUT_SCHEMA = {
     action: z.enum(["logged", "updated"]),
     date: z.string(),
     drink_unit: DRINK_UNIT_FIELD,
@@ -718,6 +720,14 @@ const MEAL_PROGRESS_OUTPUT_SCHEMA = {
     goals: GOALS_ITEM.nullable(),
     totals: TOTALS_ITEM,
     meals: z.array(MEAL_BREAKDOWN_ITEM),
+    // S4 provenance disclosure: a legacy write is compatibility data, not a
+    // calculation bundle. `compatibility` = no bundle committed for the
+    // version; `complete` = bundle committed and evidence readback ready;
+    // `pending` = bundle committed but evidence incomplete.
+    provenance_status: z.enum(["pending", "compatibility", "complete"]),
+    event_version: z.number().int().min(1),
+    has_calculation_bundle: z.boolean(),
+    provenance_note: z.string(),
 };
 
 // log_meal_event (append-only food tracking) structured payload. Nullable
@@ -1025,6 +1035,7 @@ async function buildMealProgress(
     meal: Meal,
     action: "logged" | "updated",
     alcohol: AlcoholDisplay,
+    provenance: WriteProvenanceFields,
 ) {
     const tz = await getUserTimezone(userId);
     const mealDate = dateInTz(meal.logged_at, tz);
@@ -1060,6 +1071,7 @@ async function buildMealProgress(
         totals: totalsPayloadOf(totals, alcohol),
         // Single day → label rows by meal type in the widget, not by date.
         meals: mealBreakdown(meals, null, alcohol),
+        ...provenance,
     };
 
     return { progressSection, structuredContent };
@@ -1493,7 +1505,7 @@ export function registerTools(
             return withAnalytics(
                 "log_meal",
                 async () => {
-                    const { meal, deduplicated } = await insertMeal(
+                    const { meal, deduplicated, provenance } = await insertMeal(
                         userId,
                         args,
                     );
@@ -1507,6 +1519,7 @@ export function registerTools(
                             meal,
                             "logged",
                             alcohol,
+                            provenance,
                         );
 
                     return {
@@ -2868,13 +2881,18 @@ export function registerTools(
             return withAnalytics(
                 "update_meal",
                 async () => {
-                    const meal = await updateMeal(userId, id, fields);
+                    const { meal, provenance } = await updateMeal(
+                        userId,
+                        id,
+                        fields,
+                    );
                     const { progressSection, structuredContent } =
                         await buildMealProgress(
                             userId,
                             meal,
                             "updated",
                             alcohol,
+                            provenance,
                         );
                     return {
                         content: [

@@ -109,6 +109,20 @@ missing until a real bundle is committed. `null` means unavailable evidence,
 while an explicitly stored numeric zero remains zero. Deleted and cross-user
 events are hidden as not found.
 
+The legacy write tools disclose the same truth on their own outputs. `log_meal`
+and `update_meal` payloads and every written `bulk_import_meals` result row
+carry `provenance_status` (`compatibility` | `pending` | `complete`),
+`event_version`, `has_calculation_bundle`, and a one-line `provenance_note`. A
+compatibility write always discloses `compatibility` with
+`has_calculation_bundle: false`; only a version with a committed calculation
+bundle whose evidence readback is `ready` reports `complete`, and a committed
+bundle with incomplete evidence reports `pending`. Import rows that never
+reached the database (dry run, failed validation, not attempted) report all
+four fields as explicit `null`s — never a fabricated status. All three tools
+build the fields from one shared `writeProvenanceFields` mapping over the
+persisted write readback, so a deduplicated retry reports the event's current
+truth (e.g. `complete` after a bundle lands), never a stale `compatibility`.
+
 ## Totals presence contract (NULL vs zero)
 
 The public aggregates (`get_nutrition_summary`, `get_goal_progress`,

@@ -455,6 +455,12 @@ test("a parsed export feeds straight into runImport", async () => {
                 return {
                     meal: { id: `m${inserted.length}`, ...input } as never,
                     deduplicated: false,
+                    provenance: {
+                        provenance_status: "compatibility" as const,
+                        event_version: 1,
+                        has_calculation_bundle: false,
+                        provenance_note: "test fixture",
+                    },
                 };
             },
             async existingKeys() {
