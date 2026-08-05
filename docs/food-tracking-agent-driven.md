@@ -87,9 +87,17 @@ The bundle fingerprint is recomputed from the resolved inputs/evidence and
 provider results (with stable provider ordering); a mismatch is rejected. The
 backend, not the agent proposal, recomputes canonical nutrition using the
 existing `computeConsensus` policy, recorded as `consensus-10pct-v1`. Canonical
-rows retain eligible and outlier provider IDs, source result IDs, threshold and
-policy metadata, plus correction audit evidence. A proposal is audit input, not
-authority. `nutrition-mcp` makes no provider network calls.
+rows are materialized per scope: consensus is computed independently for the
+event scope and for each item ordinal, one canonical row is persisted per scope
+(`scope_key` `event`, `item:0`, ...), and each row's `source_result_ids` reference
+only succeeded provider rows of the same scope — an item-scoped value can never
+move the event canonical. The `commit_calculation_bundle`,
+`commit_calculation_correction`, and `get_calculation_provenance` outputs expose
+the event canonical as `canonical` (unchanged) plus one entry per item ordinal in
+`item_canonicals`. Canonical rows retain eligible and outlier provider IDs,
+source result IDs, threshold and policy metadata, plus correction audit
+evidence. A proposal is audit input, not authority. `nutrition-mcp` makes no
+provider network calls.
 
 The public `get_calculation_provenance` tool is user-scoped and reads the current
 version by default; passing `version` reads immutable history. It returns all
