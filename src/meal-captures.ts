@@ -1,4 +1,8 @@
-import { withTransaction } from "./db.js";
+import {
+    UnknownCommitOutcomeError,
+    withTransaction,
+    withTransactionCommitPhases,
+} from "./db.js";
 import { createMealEvent, type CreateMealEventResult } from "./meal-events.js";
 import {
     generateCaptureStorageKey,
@@ -243,6 +247,15 @@ export async function saveCaptureAnswer(
 //   file and, only if it went missing or corrupt, safely heal it with the
 //   identical content-addressed bytes (healing can only restore, never
 //   destroy).
+// - COMMIT-outcome phase awareness (S5 second remediation): a failure AFTER
+//   COMMIT was sent is an UNKNOWN outcome, not proof of rollback. No
+//   immediate deletion happens; the uncertain client is discarded and the
+//   outcome is reconciled on a fresh connection under a fresh capture-row
+//   lock. The staged file is deleted only when the locked reconciliation
+//   DEFINITIVELY proves no committed row references it; if the row exists or
+//   reconciliation is unavailable/ambiguous, the file is retained (a bounded,
+//   deterministic-key possible orphan is always preferred over deleting
+//   potentially referenced bytes).
 // ---------------------------------------------------------------------------
 
 export const CAPTURE_MEDIA_MAX_BYTES = 8 * 1024 * 1024;
@@ -282,6 +295,101 @@ export interface AttachCaptureMediaResult {
     metadata: Record<string, unknown>;
     capture_state: CaptureState;
     deduplicated: boolean;
+}
+
+// Reconcile an invocation-owned staged file after an UNKNOWN commit outcome.
+// Runs on a FRESH connection (the uncertain one was discarded by
+// withTransactionCommitPhases) under a FRESH capture-row lock, which
+// serializes against every cooperating attach/confirm of this capture.
+//
+// Deletion rule — delete the staged key ONLY when this locked snapshot
+// definitively proves no committed row references it:
+// - (capture_id, sha256) row exists and references exactly this key
+//   -> commit landed; RETAIN the referenced bytes.
+// - Row exists with a different storage_key, or no row exists -> delete the
+//   staged key only if NEITHER meal_capture_media NOR meal_event_media
+//   references that exact key anywhere.
+// - Anything unavailable or ambiguous (connection failure, query failure,
+//   missing capture row, commit failure of the reconciliation transaction
+//   BEFORE the delete decision) -> RETAIN the possible orphan. This function
+//   never throws: retention is always the safe failure mode.
+//
+// Deleting happens while the capture lock is still held (before COMMIT), so
+// no racing cooperating attach can interleave a new reference between the
+// absence proof and the delete.
+async function reconcileStagedKeyAfterUnknownCommit(args: {
+    pool: Pool;
+    mediaStore: MediaStore;
+    captureId: string;
+    sha256: string;
+    stagedKey: string;
+}): Promise<void> {
+    const { pool, mediaStore, captureId, sha256, stagedKey } = args;
+    try {
+        const client = await pool.connect();
+        let destroyClient = false;
+        try {
+            await client.query("BEGIN");
+            const capture = await client.query(
+                `SELECT id FROM meal_captures WHERE id=$1 FOR UPDATE`,
+                [captureId],
+            );
+            if (!capture.rows.length) {
+                // The capture row itself is unreadable here — ambiguous.
+                // Retain.
+                await client.query("ROLLBACK");
+                return;
+            }
+            const media = await client.query(
+                `SELECT storage_key FROM meal_capture_media WHERE capture_id=$1 AND sha256=$2`,
+                [captureId, sha256],
+            );
+            const referencedKey = media.rows.length
+                ? (media.rows[0]!.storage_key as string)
+                : null;
+            if (referencedKey === stagedKey) {
+                // Commit landed: the durable row references these exact
+                // bytes. Retain.
+                await client.query("COMMIT");
+                return;
+            }
+            // Row absent or referencing a DIFFERENT key: the staged key is
+            // redundant garbage UNLESS some other committed row references
+            // it. Prove non-reference under the held capture lock.
+            const references = await client.query(
+                `SELECT
+                    (SELECT count(*) FROM meal_capture_media WHERE storage_key=$1) AS capture_refs,
+                    (SELECT count(*) FROM meal_event_media WHERE storage_key=$1) AS event_refs`,
+                [stagedKey],
+            );
+            const refCount =
+                Number(references.rows[0]!.capture_refs) +
+                Number(references.rows[0]!.event_refs);
+            if (refCount === 0) {
+                // Definitively unreferenced and invocation-owned: delete
+                // while the capture lock is still held.
+                await mediaStore.delete(stagedKey);
+            }
+            await client.query("COMMIT");
+        } catch {
+            destroyClient = true;
+            // Reconciliation itself is unavailable/ambiguous: retain the
+            // possible orphan rather than risk referenced data.
+            try {
+                await client.query("ROLLBACK");
+            } catch {
+                // Connection is dead; destruction below finishes cleanup.
+            }
+        } finally {
+            client.release(
+                destroyClient
+                    ? new Error("discarding failed reconciliation client")
+                    : undefined,
+            );
+        }
+    } catch {
+        // No fresh connection available: retain the possible orphan.
+    }
 }
 
 export async function attachCaptureMediaBytes(
@@ -364,103 +472,141 @@ export async function attachCaptureMediaBytes(
     // the file is (or becomes) referenced by a committed row. Never derived
     // from the deterministic storage_key.
     let stagedByThisInvocation: string | null = null;
+    // Conflict branch with a DIFFERENT referenced key: the staged file is
+    // provably unreferenced (capture lock held) and invocation-owned, so it
+    // is redundant — but it is deleted only AFTER a safe, acknowledged commit
+    // (or by reconciliation after an unknown outcome).
+    let redundantUnreferencedStagedKey: string | null = null;
     try {
-        const identity = await withTransaction(pool, async (client) => {
-            // Lock the capture row and validate ownership/state FIRST — before
-            // any filesystem I/O — so rejected requests never touch disk.
-            const { rows } = await client.query(
-                `SELECT state FROM meal_captures WHERE id=$1 AND user_id=$2 FOR UPDATE`,
-                [captureId, userId],
-            );
-            if (!rows.length) return notFound();
-            const state = rows[0]!.state as CaptureState;
-            if (!["receiving", "ready_to_confirm"].includes(state))
-                throw new MealCaptureValidationError([
-                    "capture is no longer editable",
-                ]);
-            // Establish existing (capture_id, sha256) identity under the same
-            // lock, before staging anything. Concurrent same-capture attaches
-            // block on the FOR UPDATE above and therefore always observe the
-            // committed row here.
-            const existing = await client.query(
-                `SELECT id, storage_key FROM meal_capture_media WHERE capture_id=$1 AND sha256=$2`,
-                [captureId, sha256],
-            );
-            if (existing.rows.length) {
-                const row = existing.rows[0]!;
-                // The row is committed and references the file: this
-                // invocation owns NOTHING for cleanup. Verify the referenced
-                // bytes; heal only when missing or corrupt, rewriting the
-                // identical content-addressed bytes (restore, never destroy).
-                try {
-                    await mediaStore.read(row.storage_key as string, sha256);
-                } catch {
-                    await mediaStore.restore({
+        const identity = await withTransactionCommitPhases(
+            pool,
+            async (client) => {
+                // Lock the capture row and validate ownership/state FIRST — before
+                // any filesystem I/O — so rejected requests never touch disk.
+                const { rows } = await client.query(
+                    `SELECT state FROM meal_captures WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+                    [captureId, userId],
+                );
+                if (!rows.length) return notFound();
+                const state = rows[0]!.state as CaptureState;
+                if (!["receiving", "ready_to_confirm"].includes(state))
+                    throw new MealCaptureValidationError([
+                        "capture is no longer editable",
+                    ]);
+                // Establish existing (capture_id, sha256) identity under the same
+                // lock, before staging anything. Concurrent same-capture attaches
+                // block on the FOR UPDATE above and therefore always observe the
+                // committed row here.
+                const existing = await client.query(
+                    `SELECT id, storage_key FROM meal_capture_media WHERE capture_id=$1 AND sha256=$2`,
+                    [captureId, sha256],
+                );
+                if (existing.rows.length) {
+                    const row = existing.rows[0]!;
+                    // The row is committed and references the file: this
+                    // invocation owns NOTHING for cleanup. Verify the referenced
+                    // bytes; heal only when missing or corrupt, rewriting the
+                    // identical content-addressed bytes (restore, never destroy).
+                    try {
+                        await mediaStore.read(
+                            row.storage_key as string,
+                            sha256,
+                        );
+                    } catch {
+                        await mediaStore.restore({
+                            storage_key: row.storage_key as string,
+                            bytes: bytes!,
+                            mime_type: candidate.mime_type,
+                        });
+                    }
+                    return {
+                        media_id: row.id as string,
                         storage_key: row.storage_key as string,
-                        bytes: bytes!,
-                        mime_type: candidate.mime_type,
-                    });
+                        capture_state: state,
+                        deduplicated: true,
+                    };
                 }
+                // Genuinely new content for this capture: stage bytes while
+                // holding the capture lock, then insert the row. Only this staged
+                // file — created by this invocation for a row that has not
+                // committed yet — is eligible for rollback cleanup.
+                const staged = await mediaStore.putCapture({
+                    capture_id: captureId,
+                    kind: candidate.kind,
+                    bytes: bytes!,
+                    mime_type: candidate.mime_type,
+                });
+                stagedByThisInvocation = staged.storage_key;
+                const inserted = await client.query(
+                    `INSERT INTO meal_capture_media (capture_id,kind,storage_key,mime_type,byte_size,sha256,duration_ms,width,height,metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (capture_id,sha256) DO NOTHING RETURNING id`,
+                    [
+                        captureId,
+                        candidate.kind,
+                        staged.storage_key,
+                        staged.mime_type,
+                        staged.byte_size,
+                        staged.sha256,
+                        candidate.duration_ms,
+                        candidate.width,
+                        candidate.height,
+                        JSON.stringify(candidate.metadata),
+                    ],
+                );
+                if (inserted.rows.length)
+                    return {
+                        media_id: inserted.rows[0]!.id as string,
+                        storage_key: staged.storage_key,
+                        capture_state: state,
+                        deduplicated: false,
+                    };
+                // Defense-in-depth: unreachable under the capture lock (every
+                // cooperating writer of this identity holds it), but if a
+                // conflicting row ever appears (non-cooperating writer), resolve
+                // it by EXACT key comparison rather than assuming the staged key
+                // is the referenced one.
+                const raced = await client.query(
+                    `SELECT id, storage_key FROM meal_capture_media WHERE capture_id=$1 AND sha256=$2`,
+                    [captureId, sha256],
+                );
+                const row = raced.rows[0]!;
+                if (row.storage_key !== staged.storage_key) {
+                    // The conflicting row references a DIFFERENT key. This
+                    // invocation's staged file is newly created and provably
+                    // unreferenced (the capture lock is held, excluding any
+                    // racing cooperating attach): mark it for deletion after
+                    // a safe commit / reconciliation instead of retaining an
+                    // unbounded orphan.
+                    redundantUnreferencedStagedKey = staged.storage_key;
+                    stagedByThisInvocation = null;
+                }
+                // Same key: the staged file coincides with the now-referenced
+                // key — ownership transfers to the committed row on commit;
+                // it is never deleted on any outcome (the unknown-outcome
+                // reconciliation below retains referenced keys).
                 return {
                     media_id: row.id as string,
                     storage_key: row.storage_key as string,
                     capture_state: state,
                     deduplicated: true,
                 };
-            }
-            // Genuinely new content for this capture: stage bytes while
-            // holding the capture lock, then insert the row. Only this staged
-            // file — created by this invocation for a row that has not
-            // committed yet — is eligible for rollback cleanup.
-            const staged = await mediaStore.putCapture({
-                capture_id: captureId,
-                kind: candidate.kind,
-                bytes: bytes!,
-                mime_type: candidate.mime_type,
-            });
-            stagedByThisInvocation = staged.storage_key;
-            const inserted = await client.query(
-                `INSERT INTO meal_capture_media (capture_id,kind,storage_key,mime_type,byte_size,sha256,duration_ms,width,height,metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (capture_id,sha256) DO NOTHING RETURNING id`,
-                [
-                    captureId,
-                    candidate.kind,
-                    staged.storage_key,
-                    staged.mime_type,
-                    staged.byte_size,
-                    staged.sha256,
-                    candidate.duration_ms,
-                    candidate.width,
-                    candidate.height,
-                    JSON.stringify(candidate.metadata),
-                ],
-            );
-            if (inserted.rows.length)
-                return {
-                    media_id: inserted.rows[0]!.id as string,
-                    storage_key: staged.storage_key,
-                    capture_state: state,
-                    deduplicated: false,
-                };
-            // Defense-in-depth: unreachable under the capture lock (every
-            // writer of this identity holds it), but if a conflicting row ever
-            // appears, the staged file coincides with the now-referenced key —
-            // release cleanup ownership instead of deleting referenced bytes.
-            stagedByThisInvocation = null;
-            const raced = await client.query(
-                `SELECT id, storage_key FROM meal_capture_media WHERE capture_id=$1 AND sha256=$2`,
-                [captureId, sha256],
-            );
-            const row = raced.rows[0]!;
-            return {
-                media_id: row.id as string,
-                storage_key: row.storage_key as string,
-                capture_state: state,
-                deduplicated: true,
-            };
-        });
-        // Committed: the file is now referenced by a durable row, so this
-        // invocation no longer owns it for cleanup under any outcome.
+            },
+        );
+        // Committed AND acknowledged: the media row is durable. A redundant
+        // different-key staged file stays unreferenced (the unique
+        // (capture_id, sha256) row points at the other key and every
+        // cooperating retry resolves through that row), so removing it cannot
+        // destroy referenced data. Retention on delete failure is bounded
+        // (one deterministic key per capture/sha256).
+        const redundant = redundantUnreferencedStagedKey;
         stagedByThisInvocation = null;
+        redundantUnreferencedStagedKey = null;
+        if (redundant) {
+            try {
+                await mediaStore.delete(redundant);
+            } catch {
+                // Bounded orphan retained; never fail a committed attach.
+            }
+        }
         return {
             capture_id: captureId,
             kind: candidate.kind,
@@ -474,10 +620,27 @@ export async function attachCaptureMediaBytes(
             ...identity,
         };
     } catch (error) {
-        // Rollback cleanup is limited to a file proven to have been newly
-        // created by THIS invocation and never referenced by a committed row.
-        if (stagedByThisInvocation)
-            await mediaStore.delete(stagedByThisInvocation);
+        const staged = stagedByThisInvocation ?? redundantUnreferencedStagedKey;
+        if (staged) {
+            if (error instanceof UnknownCommitOutcomeError) {
+                // UNKNOWN outcome: the COMMIT may have landed. Never delete
+                // immediately — reconcile on a fresh connection under a fresh
+                // capture-row lock; delete only on definitive proof of
+                // non-reference, otherwise retain the possible orphan.
+                await reconcileStagedKeyAfterUnknownCommit({
+                    pool,
+                    mediaStore,
+                    captureId,
+                    sha256,
+                    stagedKey: staged,
+                });
+            } else {
+                // Definitively pre-COMMIT failure: ordinary rollback cleanup
+                // of a file proven newly created by THIS invocation and never
+                // referenced by a committed row.
+                await mediaStore.delete(staged);
+            }
+        }
         throw error;
     }
 }

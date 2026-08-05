@@ -823,3 +823,343 @@ describeDb(
         });
     },
 );
+
+// ---------------------------------------------------------------------------
+// S5 second remediation: COMMIT-outcome phase awareness + ON CONFLICT
+// different-key orphan removal. A COMMIT error is an UNKNOWN outcome, not
+// proof of rollback: the server may have durably committed while the
+// acknowledgement was lost. The attach must reconcile on a fresh connection
+// under a fresh capture-row lock and must NEVER delete a file whose row may
+// have committed. Pool proxies below inject real PostgreSQL COMMIT outcomes
+// without touching production code.
+// ---------------------------------------------------------------------------
+
+// Runs the real COMMIT on the server, then rejects ONLY the acknowledgement
+// returned to the caller: the transaction is durably committed but the client
+// observes an error. One-shot: the first COMMIT through the proxy loses its
+// acknowledgement, later COMMITs (e.g. reconciliation) pass through.
+function poolLosingCommitAcknowledgement(pool: Pool): Pool {
+    let armed = true;
+    const proxy = Object.create(pool) as Pool;
+    proxy.connect = async () => {
+        const client = await pool.connect();
+        const realQuery = client.query.bind(client);
+        return new Proxy(client, {
+            get(target, prop, receiver) {
+                if (prop === "query") {
+                    return (text: unknown, ...rest: unknown[]) => {
+                        if (
+                            armed &&
+                            typeof text === "string" &&
+                            text.trim() === "COMMIT"
+                        ) {
+                            armed = false;
+                            return (realQuery as any)(text, ...rest).then(
+                                () => {
+                                    throw new Error(
+                                        "injected lost COMMIT acknowledgement after server commit",
+                                    );
+                                },
+                            );
+                        }
+                        return (realQuery as any)(text, ...rest);
+                    };
+                }
+                return Reflect.get(target, prop, receiver);
+            },
+        });
+    };
+    return proxy;
+}
+
+// Rejects COMMIT WITHOUT sending it to the server: the transaction is
+// definitively never committed. One-shot so a later reconciliation COMMIT
+// passes through.
+function poolRejectingCommitBeforeSend(pool: Pool): Pool {
+    let armed = true;
+    const proxy = Object.create(pool) as Pool;
+    proxy.connect = async () => {
+        const client = await pool.connect();
+        const realQuery = client.query.bind(client);
+        return new Proxy(client, {
+            get(target, prop, receiver) {
+                if (prop === "query") {
+                    return (text: unknown, ...rest: unknown[]) => {
+                        if (
+                            armed &&
+                            typeof text === "string" &&
+                            text.trim() === "COMMIT"
+                        ) {
+                            armed = false;
+                            return Promise.reject(
+                                new Error(
+                                    "injected COMMIT rejected before being sent",
+                                ),
+                            );
+                        }
+                        return (realQuery as any)(text, ...rest);
+                    };
+                }
+                return Reflect.get(target, prop, receiver);
+            },
+        });
+    };
+    return proxy;
+}
+
+// Runs the real COMMIT, loses its acknowledgement, AND refuses every later
+// connection: reconciliation is unavailable, so the staged file must be
+// retained as a possible orphan rather than risk referenced data.
+function poolLosingCommitAckAndFailingReconnect(pool: Pool): Pool {
+    let ackLost = false;
+    const proxy = Object.create(pool) as Pool;
+    proxy.connect = async () => {
+        if (ackLost)
+            throw new Error("injected reconciliation connection failure");
+        const client = await pool.connect();
+        const realQuery = client.query.bind(client);
+        return new Proxy(client, {
+            get(target, prop, receiver) {
+                if (prop === "query") {
+                    return (text: unknown, ...rest: unknown[]) => {
+                        if (
+                            !ackLost &&
+                            typeof text === "string" &&
+                            text.trim() === "COMMIT"
+                        ) {
+                            return (realQuery as any)(text, ...rest).then(
+                                () => {
+                                    ackLost = true;
+                                    throw new Error(
+                                        "injected lost COMMIT acknowledgement after server commit",
+                                    );
+                                },
+                            );
+                        }
+                        return (realQuery as any)(text, ...rest);
+                    };
+                }
+                return Reflect.get(target, prop, receiver);
+            },
+        });
+    };
+    return proxy;
+}
+
+// Hides the FIRST (capture_id, sha256) identity lookup from the attach
+// transaction — simulating a conflicting row committed by a non-cooperating
+// writer (no capture-row lock) in the window between the identity check and
+// the INSERT. The conflicting row itself is committed beforehand through the
+// real pool; only the first SELECT is masked, so the ON CONFLICT branch's own
+// re-read sees the real conflicting row.
+function poolHidingFirstMediaIdentityCheck(pool: Pool): Pool {
+    let armed = true;
+    const proxy = Object.create(pool) as Pool;
+    proxy.connect = async () => {
+        const client = await pool.connect();
+        const realQuery = client.query.bind(client);
+        return new Proxy(client, {
+            get(target, prop, receiver) {
+                if (prop === "query") {
+                    return (text: unknown, ...rest: unknown[]) => {
+                        if (
+                            armed &&
+                            typeof text === "string" &&
+                            text.includes(
+                                "FROM meal_capture_media WHERE capture_id=$1 AND sha256=$2",
+                            )
+                        ) {
+                            armed = false;
+                            return Promise.resolve({
+                                rows: [],
+                                rowCount: 0,
+                            });
+                        }
+                        return (realQuery as any)(text, ...rest);
+                    };
+                }
+                return Reflect.get(target, prop, receiver);
+            },
+        });
+    };
+    return proxy;
+}
+
+describeDb(
+    "capture media commit-outcome reconciliation (S5 remediation 2)",
+    () => {
+        let pool: Pool;
+        let mediaRoot: string;
+        let mediaStore: MediaStore;
+        beforeAll(async () => {
+            pool = new Pool({ connectionString: url, max: 8 });
+            const client = await pool.connect();
+            try {
+                await migrate(client);
+            } finally {
+                client.release();
+            }
+            mediaRoot = await mkdtemp(join(tmpdir(), "capture-media-f2-test-"));
+            mediaStore = createMediaStore(mediaRoot);
+        });
+        afterAll(async () => {
+            await pool.end();
+            await rm(mediaRoot, { recursive: true, force: true });
+        });
+
+        const OWNER = "commit-outcome-user";
+        const startCapture = (key: string) =>
+            startMealCapture(pool, {
+                user_id: OWNER,
+                conversation_key: key,
+                idempotency_key: key,
+            });
+        const attachPng = (
+            captureId: string,
+            userId: string,
+            targetPool: Pool = pool,
+        ) =>
+            attachCaptureMediaBytes(targetPool, mediaStore, captureId, userId, {
+                kind: "photo",
+                mime_type: "image/png",
+                bytes_base64: PNG_BASE64,
+            });
+        const stagedKeyOf = (captureId: string) =>
+            `capture/${captureId}/photo-${sha256HexOf(PNG_BYTES)}`;
+        const expectFileIntact = async (storageKey: string) => {
+            const path = join(mediaRoot, storageKey);
+            expect(await Bun.file(path).exists()).toBe(true);
+            const onDisk = new Uint8Array(await Bun.file(path).arrayBuffer());
+            expect(onDisk).toEqual(PNG_BYTES);
+            expect(sha256HexOf(onDisk)).toBe(sha256HexOf(PNG_BYTES));
+        };
+
+        test("real COMMIT succeeds then acknowledgement is lost: attach rejects but row and file survive, retry returns the original identity", async () => {
+            const capture = await startCapture("f2-ack-lost");
+            const storageKey = stagedKeyOf(capture.capture_id);
+            await expect(
+                attachPng(
+                    capture.capture_id,
+                    OWNER,
+                    poolLosingCommitAcknowledgement(pool),
+                ),
+            ).rejects.toThrow(
+                "injected lost COMMIT acknowledgement after server commit",
+            );
+            // The server durably committed: the row must survive ...
+            const { rows } = await pool.query(
+                `SELECT id, storage_key, sha256 FROM meal_capture_media WHERE capture_id=$1`,
+                [capture.capture_id],
+            );
+            expect(rows).toHaveLength(1);
+            expect(rows[0]).toMatchObject({
+                storage_key: storageKey,
+                sha256: sha256HexOf(PNG_BYTES),
+            });
+            // ... and so must the referenced bytes, with a recomputed SHA match.
+            await expectFileIntact(storageKey);
+            // A clean retry reconciles to the original committed identity.
+            const retry = await attachPng(capture.capture_id, OWNER);
+            expect(retry.deduplicated).toBe(true);
+            expect(retry.media_id).toBe(rows[0]!.id);
+            expect(retry.storage_key).toBe(storageKey);
+            expect(retry.sha256).toBe(sha256HexOf(PNG_BYTES));
+        });
+
+        test("real COMMIT succeeds then acknowledgement is lost AND reconciliation is unavailable: possible orphan is retained, never deleted", async () => {
+            const capture = await startCapture("f2-ack-lost-no-reconnect");
+            const storageKey = stagedKeyOf(capture.capture_id);
+            await expect(
+                attachPng(
+                    capture.capture_id,
+                    OWNER,
+                    poolLosingCommitAckAndFailingReconnect(pool),
+                ),
+            ).rejects.toThrow(
+                "injected lost COMMIT acknowledgement after server commit",
+            );
+            const { rows } = await pool.query(
+                `SELECT id, storage_key, sha256 FROM meal_capture_media WHERE capture_id=$1`,
+                [capture.capture_id],
+            );
+            expect(rows).toHaveLength(1);
+            expect(rows[0]).toMatchObject({
+                storage_key: storageKey,
+                sha256: sha256HexOf(PNG_BYTES),
+            });
+            // Reconciliation could not run: retain rather than risk referenced
+            // data — the committed file must still be there.
+            await expectFileIntact(storageKey);
+            const retry = await attachPng(capture.capture_id, OWNER);
+            expect(retry.deduplicated).toBe(true);
+            expect(retry.media_id).toBe(rows[0]!.id);
+            expect(retry.storage_key).toBe(storageKey);
+        });
+
+        test("COMMIT rejected before being sent: reconciliation proves no row and removes the staged file", async () => {
+            const capture = await startCapture("f2-commit-rejected");
+            const storageKey = stagedKeyOf(capture.capture_id);
+            await expect(
+                attachPng(
+                    capture.capture_id,
+                    OWNER,
+                    poolRejectingCommitBeforeSend(pool),
+                ),
+            ).rejects.toThrow("injected COMMIT rejected before being sent");
+            const { rows } = await pool.query(
+                `SELECT count(*) AS n FROM meal_capture_media WHERE capture_id=$1`,
+                [capture.capture_id],
+            );
+            expect(Number(rows[0]!.n)).toBe(0);
+            expect(await Bun.file(join(mediaRoot, storageKey)).exists()).toBe(
+                false,
+            );
+        });
+
+        test("non-cooperating conflicting row with a different key: conflict row and file survive, redundant staged key is removed", async () => {
+            const capture = await startCapture("f2-conflict-different-key");
+            const sha = sha256HexOf(PNG_BYTES);
+            const stagedKey = stagedKeyOf(capture.capture_id);
+            const foreignKey = `capture/${capture.capture_id}/photo-foreign-${sha}`;
+            // The non-cooperating writer's referenced bytes exist on disk.
+            await mediaStore.restore({
+                storage_key: foreignKey,
+                bytes: PNG_BYTES,
+                mime_type: "image/png",
+            });
+            // Non-cooperating writer: commits a conflicting (capture_id, sha256)
+            // row directly, WITHOUT the capture-row lock, with a DIFFERENT
+            // storage_key. The attach's masked identity check simulates the row
+            // arriving after the check; the INSERT then hits ON CONFLICT.
+            const conflict = await pool.query(
+                `INSERT INTO meal_capture_media (capture_id,kind,storage_key,mime_type,byte_size,sha256,metadata) VALUES ($1,'photo',$2,'image/png',$3,$4,'{}'::jsonb) RETURNING id`,
+                [capture.capture_id, foreignKey, PNG_BYTES.byteLength, sha],
+            );
+            const result = await attachPng(
+                capture.capture_id,
+                OWNER,
+                poolHidingFirstMediaIdentityCheck(pool),
+            );
+            expect(result.deduplicated).toBe(true);
+            expect(result.media_id).toBe(conflict.rows[0]!.id);
+            expect(result.storage_key).toBe(foreignKey);
+            // The conflicting row survives and keeps its own storage key.
+            const { rows } = await pool.query(
+                `SELECT id, storage_key, sha256 FROM meal_capture_media WHERE capture_id=$1`,
+                [capture.capture_id],
+            );
+            expect(rows).toHaveLength(1);
+            expect(rows[0]).toMatchObject({
+                id: result.media_id,
+                storage_key: foreignKey,
+                sha256: sha,
+            });
+            // The conflicting row's file survives byte-identically ...
+            await expectFileIntact(foreignKey);
+            // ... and the invocation-owned, unreferenced staged key is removed.
+            expect(await Bun.file(join(mediaRoot, stagedKey)).exists()).toBe(
+                false,
+            );
+        });
+    },
+);

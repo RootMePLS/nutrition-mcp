@@ -65,6 +65,79 @@ export async function withTransaction<T>(
     }
 }
 
+// Marks an ambiguous transaction outcome: the error was raised at or after
+// the COMMIT statement, so PostgreSQL may or may not have durably committed
+// (e.g. the acknowledgement was lost after a successful server commit). A
+// ROLLBACK issued now proves nothing — the already committed transaction
+// would survive it. Callers holding non-transactional side effects (staged
+// files) MUST reconcile on a fresh connection instead of assuming rollback.
+// The original error is preserved as `cause` and in the message.
+export class UnknownCommitOutcomeError extends Error {
+    constructor(cause: unknown) {
+        super(
+            `transaction commit outcome is unknown (possible lost COMMIT acknowledgement): ${(cause as Error)?.message ?? String(cause)}`,
+        );
+        this.name = "UnknownCommitOutcomeError";
+        this.cause = cause;
+    }
+}
+
+// Phase-aware variant of withTransaction for callers whose callback performs
+// non-transactional side effects (e.g. filesystem writes) that need different
+// cleanup depending on WHERE the failure happened:
+//
+// - Failure BEFORE COMMIT (BEGIN/callback): ordinary semantics. ROLLBACK is
+//   issued and the original error is rethrown; the transaction definitively
+//   did not commit.
+// - Failure AT/AFTER COMMIT: UNKNOWN outcome. No ROLLBACK is issued (it
+//   cannot prove anything about an already-committed transaction), the
+//   uncertain client is DISCARDED from the pool (released with an error so pg
+//   destroys the connection, which also rolls the server side back if the
+//   COMMIT truly never landed), and an UnknownCommitOutcomeError is thrown
+//   wrapping the original error.
+//
+// Semantics are exercised against real PostgreSQL by the "capture media
+// commit-outcome reconciliation" suites in src/meal-captures.integration.test.ts
+// (real COMMIT + lost acknowledgement; COMMIT rejected before being sent).
+export async function withTransactionCommitPhases<T>(
+    targetPool: Pool,
+    fn: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+    const client = await targetPool.connect();
+    let commitSent = false;
+    let destroyClient = false;
+    try {
+        await client.query("BEGIN");
+        const result = await fn(client);
+        commitSent = true;
+        await client.query("COMMIT");
+        return result;
+    } catch (err) {
+        if (commitSent) {
+            // Ambiguous: COMMIT may have been applied and acknowledged (or
+            // not). Discard the untrustworthy connection; never pretend a
+            // ROLLBACK can establish the outcome.
+            destroyClient = true;
+            throw new UnknownCommitOutcomeError(err);
+        }
+        // Definitively pre-COMMIT: ordinary rollback semantics apply.
+        try {
+            await client.query("ROLLBACK");
+        } catch {
+            // The connection died while rolling back; the server rolls the
+            // transaction back when the dead connection is destroyed.
+            destroyClient = true;
+        }
+        throw err;
+    } finally {
+        client.release(
+            destroyClient
+                ? new Error("discarding uncertain client")
+                : undefined,
+        );
+    }
+}
+
 // ============================================================================
 // IDEMPOTENCY
 // ============================================================================
