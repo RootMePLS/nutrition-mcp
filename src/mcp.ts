@@ -1459,9 +1459,9 @@ export const ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA = z
 // get_meal_capture returns a richer read, composing the shared state fields
 // with the read detail under a nullable `capture` wrapper so a missing
 // capture is an explicit null, not an absent payload. confirm_meal_capture
-// keeps its pre-existing contract, hoisted to an exported shape so transport
-// tests parse the exact declared keys. Exported so transport tests can parse
-// real structuredContent against the exact declared contract.
+// keeps its pre-existing contract, hoisted to an exported strict schema so
+// transport tests parse the exact declared keys. Exported so transport tests
+// can parse real structuredContent against the exact declared contract.
 // ---------------------------------------------------------------------------
 
 export const CAPTURE_STATE_OUTPUT_SCHEMA = z
@@ -1520,29 +1520,37 @@ function captureReadOutput(read: MealCaptureRead) {
 }
 
 // The pre-existing confirm_meal_capture contract, hoisted unchanged from the
-// registration so the nine-tool inventory and transport tests can parse the
-// exact declared keys.
-export const CONFIRM_MEAL_CAPTURE_OUTPUT_SCHEMA = {
-    capture_id: z.string(),
-    state: z.literal("confirmed"),
-    event_id: z.string(),
-    version: z.number(),
-    deduplicated: z.boolean(),
-    provenance_status: z.enum(["ready", "pending", "unavailable", "missing"]),
-    compatibility: z.boolean(),
-    bundle_fingerprint: z.string().nullable(),
-    canonical: z
-        .object({
-            calories: z.number().nullable(),
-            protein_g: z.number().nullable(),
-            carbs_g: z.number().nullable(),
-            fat_g: z.number().nullable(),
-            fiber_g: z.number().nullable(),
-            sugar_g: z.number().nullable(),
-            alcohol_g: z.number().nullable(),
-        })
-        .nullable(),
-};
+// registration as an exported strict Zod object so the nine-tool inventory
+// and transport tests parse the exact declared keys and the export rejects
+// extra keys under its own .strict() boundary.
+export const CONFIRM_MEAL_CAPTURE_OUTPUT_SCHEMA = z
+    .object({
+        capture_id: z.string(),
+        state: z.literal("confirmed"),
+        event_id: z.string(),
+        version: z.number(),
+        deduplicated: z.boolean(),
+        provenance_status: z.enum([
+            "ready",
+            "pending",
+            "unavailable",
+            "missing",
+        ]),
+        compatibility: z.boolean(),
+        bundle_fingerprint: z.string().nullable(),
+        canonical: z
+            .object({
+                calories: z.number().nullable(),
+                protein_g: z.number().nullable(),
+                carbs_g: z.number().nullable(),
+                fat_g: z.number().nullable(),
+                fiber_g: z.number().nullable(),
+                sugar_g: z.number().nullable(),
+                alcohol_g: z.number().nullable(),
+            })
+            .nullable(),
+    })
+    .strict();
 
 // ---------------------------------------------------------------------------
 // Structured-output contracts for the water, weight and widget-display tools

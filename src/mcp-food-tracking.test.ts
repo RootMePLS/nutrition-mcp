@@ -1027,13 +1027,12 @@ const CAPTURE_LIFECYCLE_TOOLS = [
 type CaptureLifecycleTool = (typeof CAPTURE_LIFECYCLE_TOOLS)[number];
 
 // The exact exported schema each tool's runtime structuredContent must
-// satisfy. The confirm contract is an exported raw shape (the pre-existing
-// registration style), wrapped here in a strict object exactly like the S6
-// legacy sweep tests do.
+// satisfy. Every contract — including confirm — is an exported strict Zod
+// object, returned directly with no test-synthesized wrapper.
 function captureSchemaFor(tool: CaptureLifecycleTool): z.ZodTypeAny {
     if (tool === "get_meal_capture") return GET_MEAL_CAPTURE_OUTPUT_SCHEMA;
     if (tool === "confirm_meal_capture")
-        return z.object(CONFIRM_MEAL_CAPTURE_OUTPUT_SCHEMA).strict();
+        return CONFIRM_MEAL_CAPTURE_OUTPUT_SCHEMA;
     if (tool === "attach_meal_capture_media")
         return ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA;
     return CAPTURE_STATE_OUTPUT_SCHEMA;
@@ -1059,6 +1058,57 @@ function parseCaptureStructured(
     ).toThrow();
     return parsed;
 }
+
+// The exported confirm contract must be directly parseable and strict with
+// no test-synthesized wrapper: S6 requires the exact exported schema to
+// parse runtime structuredContent and reject extra keys on its own.
+describe("confirm_meal_capture exported output schema (S6)", () => {
+    const validConfirmOutput = {
+        capture_id: "cap-1",
+        state: "confirmed",
+        event_id: "evt-1",
+        version: 1,
+        deduplicated: false,
+        provenance_status: "ready",
+        compatibility: true,
+        bundle_fingerprint: "fp-1",
+        canonical: {
+            calories: 500,
+            protein_g: 30,
+            carbs_g: 50,
+            fat_g: 20,
+            fiber_g: null,
+            sugar_g: null,
+            alcohol_g: null,
+        },
+    } as const;
+
+    test("parses a valid confirm payload through the exact export", () => {
+        expect(
+            CONFIRM_MEAL_CAPTURE_OUTPUT_SCHEMA.parse(validConfirmOutput),
+        ).toEqual(validConfirmOutput);
+        expect(
+            CONFIRM_MEAL_CAPTURE_OUTPUT_SCHEMA.parse({
+                ...validConfirmOutput,
+                bundle_fingerprint: null,
+                canonical: null,
+            }),
+        ).toEqual({
+            ...validConfirmOutput,
+            bundle_fingerprint: null,
+            canonical: null,
+        });
+    });
+
+    test("rejects extra keys under its own .strict() boundary", () => {
+        expect(() =>
+            CONFIRM_MEAL_CAPTURE_OUTPUT_SCHEMA.parse({
+                ...validConfirmOutput,
+                unexpected_extra_key: true,
+            }),
+        ).toThrow();
+    });
+});
 
 describeDb(
     "capture lifecycle structured output contracts (S6, requires DATABASE_URL_TEST)",
