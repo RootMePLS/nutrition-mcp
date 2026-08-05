@@ -32,6 +32,11 @@ import {
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import {
+    CAPTURE_STATE_OUTPUT_SCHEMA,
+    GET_MEAL_CAPTURE_OUTPUT_SCHEMA,
+    captureStateOutput,
+} from "./mcp.js";
 import * as actualSupabase from "./db.js";
 import { formatFoodResult, type FoodResult } from "./foods.js";
 import {
@@ -2064,5 +2069,100 @@ describe("calculation bundle output contracts", () => {
         });
         expect(parsed.item_canonicals).toHaveLength(1);
         expect(parsed.item_canonicals[0]!.ordinal).toBe(0);
+    });
+});
+
+// S6 capture lifecycle output contracts: the shared serializer normalizes
+// optional domain fields to explicit nulls, and every declared schema is
+// strict against extra keys.
+describe("capture lifecycle output contracts (S6)", () => {
+    test("captureStateOutput normalizes optional fields to explicit nulls", () => {
+        const fresh = captureStateOutput({
+            capture_id: "c1",
+            state: "receiving",
+        });
+        expect(fresh).toEqual({
+            capture_id: "c1",
+            state: "receiving",
+            event_id: null,
+            version: null,
+            deduplicated: false,
+        });
+        const parsed = CAPTURE_STATE_OUTPUT_SCHEMA.parse(fresh);
+        expect(parsed).toEqual(fresh);
+        const confirmed = captureStateOutput({
+            capture_id: "c1",
+            state: "confirmed",
+            event_id: "e1",
+            version: 3,
+            deduplicated: true,
+        });
+        expect(confirmed).toEqual({
+            capture_id: "c1",
+            state: "confirmed",
+            event_id: "e1",
+            version: 3,
+            deduplicated: true,
+        });
+    });
+
+    test("capture-state schema is strict and state-locked", () => {
+        const valid = {
+            capture_id: "c1",
+            state: "cancelled",
+            event_id: null,
+            version: null,
+            deduplicated: false,
+        };
+        expect(() => CAPTURE_STATE_OUTPUT_SCHEMA.parse(valid)).not.toThrow();
+        expect(() =>
+            CAPTURE_STATE_OUTPUT_SCHEMA.parse({
+                ...valid,
+                unexpected_extra_key: true,
+            }),
+        ).toThrow();
+        expect(() =>
+            CAPTURE_STATE_OUTPUT_SCHEMA.parse({ ...valid, state: "bogus" }),
+        ).toThrow();
+        expect(() =>
+            CAPTURE_STATE_OUTPUT_SCHEMA.parse({
+                ...valid,
+                deduplicated: undefined,
+            }),
+        ).toThrow();
+    });
+
+    test("get_meal_capture output wraps a nullable capture read", () => {
+        expect(() =>
+            GET_MEAL_CAPTURE_OUTPUT_SCHEMA.parse({ capture: null }),
+        ).not.toThrow();
+        const full = {
+            capture: {
+                capture_id: "c1",
+                state: "ready_to_confirm",
+                event_id: null,
+                version: null,
+                deduplicated: false,
+                user_id: "u1",
+                conversation_key: "conv",
+                expires_at: null,
+                prepared_draft: { items: [] },
+                messages: [{ external_message_id: "m1" }],
+                answers: [],
+                media: [],
+            },
+        };
+        expect(() => GET_MEAL_CAPTURE_OUTPUT_SCHEMA.parse(full)).not.toThrow();
+        expect(() =>
+            GET_MEAL_CAPTURE_OUTPUT_SCHEMA.parse({
+                ...full,
+                unexpected_extra_key: true,
+            }),
+        ).toThrow();
+        expect(() =>
+            GET_MEAL_CAPTURE_OUTPUT_SCHEMA.parse({
+                capture: { ...full.capture, unexpected_extra_key: true },
+            }),
+        ).toThrow();
     });
 });

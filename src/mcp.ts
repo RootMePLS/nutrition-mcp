@@ -21,10 +21,12 @@ import {
     saveCaptureAnswer,
     savePreparedDraft,
     startMealCapture,
+    type MealCaptureRead,
 } from "./meal-captures.js";
 import { createMediaStore, type MediaStore } from "./media-store.js";
 import type {
     CaptureMessageInput,
+    CaptureResult,
     ClarificationAnswer,
     PreparedMealDraft,
 } from "./meal-capture-types.js";
@@ -1419,6 +1421,101 @@ export const ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA = z
         deduplicated: z.boolean(),
     })
     .strict();
+
+// ---------------------------------------------------------------------------
+// Structured output contracts for the capture lifecycle tools (S6). One
+// shared strict capture-state schema covers every tool whose result is a
+// capture state view (start/append/answer/draft/cancel/expire), and the
+// single captureStateOutput serializer is the only place those literals are
+// built: optional domain fields are normalized to explicit nulls so an
+// omitted key is a validation error rather than a silent undefined.
+// get_meal_capture returns a richer read, composing the shared state fields
+// with the read detail under a nullable `capture` wrapper so a missing
+// capture is an explicit null, not an absent payload. confirm_meal_capture
+// keeps its pre-existing contract, hoisted to an exported shape so transport
+// tests parse the exact declared keys. Exported so transport tests can parse
+// real structuredContent against the exact declared contract.
+// ---------------------------------------------------------------------------
+
+export const CAPTURE_STATE_OUTPUT_SCHEMA = z
+    .object({
+        capture_id: z.string(),
+        state: z.enum([
+            "receiving",
+            "ready_to_confirm",
+            "confirmed",
+            "cancelled",
+            "expired",
+        ]),
+        event_id: z.string().nullable(),
+        version: z.number().int().nullable(),
+        deduplicated: z.boolean(),
+    })
+    .strict();
+
+export function captureStateOutput(capture: CaptureResult) {
+    return CAPTURE_STATE_OUTPUT_SCHEMA.parse({
+        capture_id: capture.capture_id,
+        state: capture.state,
+        event_id: capture.event_id ?? null,
+        version: capture.version ?? null,
+        deduplicated: capture.deduplicated ?? false,
+    });
+}
+
+export const CAPTURE_READ_OUTPUT_SCHEMA = CAPTURE_STATE_OUTPUT_SCHEMA.extend({
+    user_id: z.string(),
+    conversation_key: z.string(),
+    expires_at: z.string().nullable(),
+    prepared_draft: z.record(z.string(), z.unknown()).nullable(),
+    messages: z.array(z.record(z.string(), z.unknown())),
+    answers: z.array(z.record(z.string(), z.unknown())),
+    media: z.array(z.record(z.string(), z.unknown())),
+}).strict();
+
+export const GET_MEAL_CAPTURE_OUTPUT_SCHEMA = z
+    .object({
+        capture: CAPTURE_READ_OUTPUT_SCHEMA.nullable(),
+    })
+    .strict();
+
+function captureReadOutput(read: MealCaptureRead) {
+    return CAPTURE_READ_OUTPUT_SCHEMA.parse({
+        ...captureStateOutput(read),
+        user_id: read.user_id,
+        conversation_key: read.conversation_key,
+        expires_at: read.expires_at,
+        prepared_draft: read.prepared_draft,
+        messages: read.messages,
+        answers: read.answers,
+        media: read.media,
+    });
+}
+
+// The pre-existing confirm_meal_capture contract, hoisted unchanged from the
+// registration so the nine-tool inventory and transport tests can parse the
+// exact declared keys.
+export const CONFIRM_MEAL_CAPTURE_OUTPUT_SCHEMA = {
+    capture_id: z.string(),
+    state: z.literal("confirmed"),
+    event_id: z.string(),
+    version: z.number(),
+    deduplicated: z.boolean(),
+    provenance_status: z.enum(["ready", "pending", "unavailable", "missing"]),
+    compatibility: z.boolean(),
+    bundle_fingerprint: z.string().nullable(),
+    canonical: z
+        .object({
+            calories: z.number().nullable(),
+            protein_g: z.number().nullable(),
+            carbs_g: z.number().nullable(),
+            fat_g: z.number().nullable(),
+            fiber_g: z.number().nullable(),
+            sugar_g: z.number().nullable(),
+            alcohol_g: z.number().nullable(),
+        })
+        .nullable(),
+};
 
 // ---------------------------------------------------------------------------
 // Structured-output contracts for the water, weight and widget-display tools
@@ -4908,20 +5005,23 @@ export function registerTools(
                 idempotency_key: z.string().min(1),
                 expires_at: z.string().optional(),
             },
+            outputSchema: CAPTURE_STATE_OUTPUT_SCHEMA,
         },
-        async (args) => ({
-            content: [
-                {
-                    type: "text",
-                    text: JSON.stringify(
-                        await startMealCapture(mealEventsPool, {
-                            user_id: userId,
-                            ...args,
-                        }),
-                    ),
-                },
-            ],
-        }),
+        async (args) => {
+            const capture = await startMealCapture(mealEventsPool, {
+                user_id: userId,
+                ...args,
+            });
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify(capture),
+                    },
+                ],
+                structuredContent: captureStateOutput(capture),
+            };
+        },
     );
 
     server.registerTool(
@@ -4934,6 +5034,7 @@ export function registerTools(
                 capture_id: z.string().min(1),
                 message: z.record(z.string(), z.unknown()),
             },
+            outputSchema: CAPTURE_STATE_OUTPUT_SCHEMA,
         },
         async (args) => {
             await appendCaptureMessage(
@@ -4942,8 +5043,15 @@ export function registerTools(
                 userId,
                 args.message as unknown as CaptureMessageInput,
             );
+            const readback = await getMealCapture(
+                mealEventsPool,
+                args.capture_id,
+                userId,
+            );
+            if (!readback) throw new Error("capture readback missing");
             return {
                 content: [{ type: "text", text: "Capture message retained." }],
+                structuredContent: captureStateOutput(readback),
             };
         },
     );
@@ -4958,6 +5066,7 @@ export function registerTools(
                 capture_id: z.string().min(1),
                 draft: z.record(z.string(), z.unknown()),
             },
+            outputSchema: CAPTURE_STATE_OUTPUT_SCHEMA,
         },
         async (args) => {
             await savePreparedDraft(
@@ -4966,6 +5075,12 @@ export function registerTools(
                 userId,
                 args.draft as unknown as PreparedMealDraft,
             );
+            const readback = await getMealCapture(
+                mealEventsPool,
+                args.capture_id,
+                userId,
+            );
+            if (!readback) throw new Error("capture readback missing");
             return {
                 content: [
                     {
@@ -4973,6 +5088,7 @@ export function registerTools(
                         text: "Meal draft ready for explicit confirmation.",
                     },
                 ],
+                structuredContent: captureStateOutput(readback),
             };
         },
     );
@@ -4983,21 +5099,26 @@ export function registerTools(
             title: "Get Meal Capture",
             description: "Read one durable meal capture.",
             inputSchema: { capture_id: z.string().min(1) },
+            outputSchema: GET_MEAL_CAPTURE_OUTPUT_SCHEMA,
         },
-        async ({ capture_id }) => ({
-            content: [
-                {
-                    type: "text",
-                    text: JSON.stringify(
-                        await getMealCapture(
-                            mealEventsPool,
-                            capture_id,
-                            userId,
-                        ),
-                    ),
+        async ({ capture_id }) => {
+            const capture = await getMealCapture(
+                mealEventsPool,
+                capture_id,
+                userId,
+            );
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify(capture),
+                    },
+                ],
+                structuredContent: {
+                    capture: capture ? captureReadOutput(capture) : null,
                 },
-            ],
-        }),
+            };
+        },
     );
     server.registerTool(
         "cancel_meal_capture",
@@ -5005,21 +5126,24 @@ export function registerTools(
             title: "Cancel Meal Capture",
             description: "Cancel an editable meal capture.",
             inputSchema: { capture_id: z.string().min(1) },
+            outputSchema: CAPTURE_STATE_OUTPUT_SCHEMA,
         },
-        async ({ capture_id }) => ({
-            content: [
-                {
-                    type: "text",
-                    text: JSON.stringify(
-                        await cancelMealCapture(
-                            mealEventsPool,
-                            capture_id,
-                            userId,
-                        ),
-                    ),
-                },
-            ],
-        }),
+        async ({ capture_id }) => {
+            const capture = await cancelMealCapture(
+                mealEventsPool,
+                capture_id,
+                userId,
+            );
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify(capture),
+                    },
+                ],
+                structuredContent: captureStateOutput(capture),
+            };
+        },
     );
     server.registerTool(
         "expire_meal_capture",
@@ -5027,21 +5151,24 @@ export function registerTools(
             title: "Expire Meal Capture",
             description: "Expire an overdue meal capture.",
             inputSchema: { capture_id: z.string().min(1) },
+            outputSchema: CAPTURE_STATE_OUTPUT_SCHEMA,
         },
-        async ({ capture_id }) => ({
-            content: [
-                {
-                    type: "text",
-                    text: JSON.stringify(
-                        await expireMealCapture(
-                            mealEventsPool,
-                            capture_id,
-                            userId,
-                        ),
-                    ),
-                },
-            ],
-        }),
+        async ({ capture_id }) => {
+            const capture = await expireMealCapture(
+                mealEventsPool,
+                capture_id,
+                userId,
+            );
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify(capture),
+                    },
+                ],
+                structuredContent: captureStateOutput(capture),
+            };
+        },
     );
 
     server.registerTool(
@@ -5054,6 +5181,7 @@ export function registerTools(
                 capture_id: z.string().min(1),
                 answer: z.record(z.string(), z.unknown()),
             },
+            outputSchema: CAPTURE_STATE_OUTPUT_SCHEMA,
         },
         async (args) => {
             await saveCaptureAnswer(
@@ -5062,8 +5190,15 @@ export function registerTools(
                 userId,
                 args.answer as unknown as ClarificationAnswer,
             );
+            const readback = await getMealCapture(
+                mealEventsPool,
+                args.capture_id,
+                userId,
+            );
+            if (!readback) throw new Error("capture readback missing");
             return {
                 content: [{ type: "text", text: "Capture answer retained." }],
+                structuredContent: captureStateOutput(readback),
             };
         },
     );
@@ -5144,32 +5279,7 @@ export function registerTools(
                 confirmation: z.string().min(1),
                 event_idempotency_key: z.string().optional(),
             },
-            outputSchema: {
-                capture_id: z.string(),
-                state: z.literal("confirmed"),
-                event_id: z.string(),
-                version: z.number(),
-                deduplicated: z.boolean(),
-                provenance_status: z.enum([
-                    "ready",
-                    "pending",
-                    "unavailable",
-                    "missing",
-                ]),
-                compatibility: z.boolean(),
-                bundle_fingerprint: z.string().nullable(),
-                canonical: z
-                    .object({
-                        calories: z.number().nullable(),
-                        protein_g: z.number().nullable(),
-                        carbs_g: z.number().nullable(),
-                        fat_g: z.number().nullable(),
-                        fiber_g: z.number().nullable(),
-                        sugar_g: z.number().nullable(),
-                        alcohol_g: z.number().nullable(),
-                    })
-                    .nullable(),
-            },
+            outputSchema: CONFIRM_MEAL_CAPTURE_OUTPUT_SCHEMA,
         },
         async (args) => {
             const result = await confirmMealCapture(

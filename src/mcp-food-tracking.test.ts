@@ -14,9 +14,13 @@ import { Pool } from "pg";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { z } from "zod";
 import {
     registerTools,
     ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA,
+    CAPTURE_STATE_OUTPUT_SCHEMA,
+    CONFIRM_MEAL_CAPTURE_OUTPUT_SCHEMA,
+    GET_MEAL_CAPTURE_OUTPUT_SCHEMA,
 } from "./mcp.js";
 import { startMealCapture } from "./meal-captures.js";
 import { createMediaStore, type MediaStore } from "./media-store.js";
@@ -1000,3 +1004,341 @@ describeDb("attach_meal_capture_media MCP tool", () => {
         );
     });
 });
+
+// ---------------------------------------------------------------------------
+// S6 capture lifecycle structured-output contracts. Every one of the nine
+// lifecycle tools must (a) advertise a declared outputSchema over listTools
+// and (b) return runtime structuredContent on success that parses through the
+// exact exported schema and rejects extra keys under .strict().
+// ---------------------------------------------------------------------------
+
+const CAPTURE_LIFECYCLE_TOOLS = [
+    "start_meal_capture",
+    "append_meal_capture_message",
+    "answer_meal_capture",
+    "save_meal_capture_draft",
+    "get_meal_capture",
+    "cancel_meal_capture",
+    "expire_meal_capture",
+    "confirm_meal_capture",
+    "attach_meal_capture_media",
+] as const;
+
+type CaptureLifecycleTool = (typeof CAPTURE_LIFECYCLE_TOOLS)[number];
+
+// The exact exported schema each tool's runtime structuredContent must
+// satisfy. The confirm contract is an exported raw shape (the pre-existing
+// registration style), wrapped here in a strict object exactly like the S6
+// legacy sweep tests do.
+function captureSchemaFor(tool: CaptureLifecycleTool): z.ZodTypeAny {
+    if (tool === "get_meal_capture") return GET_MEAL_CAPTURE_OUTPUT_SCHEMA;
+    if (tool === "confirm_meal_capture")
+        return z.object(CONFIRM_MEAL_CAPTURE_OUTPUT_SCHEMA).strict();
+    if (tool === "attach_meal_capture_media")
+        return ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA;
+    return CAPTURE_STATE_OUTPUT_SCHEMA;
+}
+
+function parseCaptureStructured(
+    tool: CaptureLifecycleTool,
+    result: ToolResult,
+): Record<string, unknown> {
+    expect(result.isError, `${tool} returned an MCP error`).not.toBe(true);
+    expect(
+        result.structuredContent,
+        `${tool} returned no structuredContent`,
+    ).toBeDefined();
+    const schema = captureSchemaFor(tool);
+    const parsed = schema.parse(result.structuredContent) as Record<
+        string,
+        unknown
+    >;
+    // Strict extra-key rejection on the exact runtime payload shape.
+    expect(() =>
+        schema.parse({ ...parsed, unexpected_extra_key: true }),
+    ).toThrow();
+    return parsed;
+}
+
+describeDb(
+    "capture lifecycle structured output contracts (S6, requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+        let mediaRoot: string;
+        let mediaStore: MediaStore;
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+        afterAll(async () => {
+            await pool.end();
+        });
+        afterEach(async () => {
+            await flushAnalytics();
+            await rm(mediaRoot, { recursive: true, force: true });
+        });
+        beforeEach(async () => {
+            await resetSchemaWithMigrations(pool, [
+                "001_initial_schema.sql",
+                "002_food_tracking.sql",
+                "003_meal_captures.sql",
+                "004_calculation_bundles.sql",
+                "005_calculation_corrections.sql",
+            ]);
+            mediaRoot = await mkdtemp(join(tmpdir(), "mcp-capture-s6-test-"));
+            mediaStore = createMediaStore(mediaRoot);
+        });
+
+        test("inventory: all nine capture lifecycle tools advertise a declared outputSchema", async () => {
+            expect(CAPTURE_LIFECYCLE_TOOLS).toHaveLength(9);
+            await withTools(pool, async (_call, client) => {
+                const { tools } = await client!.listTools();
+                const byName = new Map(tools.map((tool) => [tool.name, tool]));
+                for (const name of CAPTURE_LIFECYCLE_TOOLS) {
+                    const tool = byName.get(name);
+                    expect(tool, `${name} is not registered`).toBeDefined();
+                    expect(
+                        tool!.outputSchema,
+                        `${name} advertises no outputSchema`,
+                    ).toBeDefined();
+                }
+            });
+        });
+
+        test("start -> append -> answer -> draft -> get -> cancel returns schema-exact structuredContent", async () => {
+            await withTools(pool, async (call) => {
+                const startArgs = {
+                    conversation_key: "s6-flow",
+                    idempotency_key: "mcp-s6-flow",
+                };
+                const startedResult = await call(
+                    "start_meal_capture",
+                    startArgs,
+                );
+                const started = parseCaptureStructured(
+                    "start_meal_capture",
+                    startedResult,
+                );
+                expect(started.state).toBe("receiving");
+                expect(started.deduplicated).toBe(false);
+                expect(started.event_id).toBeNull();
+                expect(started.version).toBeNull();
+                const captureId = started.capture_id as string;
+                // Text compatibility: the human-readable JSON payload stays.
+                expect(
+                    JSON.parse(startedResult.content[0]!.text!).capture_id,
+                ).toBe(captureId);
+
+                const replayed = parseCaptureStructured(
+                    "start_meal_capture",
+                    await call("start_meal_capture", startArgs),
+                );
+                expect(replayed.deduplicated).toBe(true);
+                expect(replayed.capture_id).toBe(captureId);
+
+                const appendedResult = await call(
+                    "append_meal_capture_message",
+                    {
+                        capture_id: captureId,
+                        message: {
+                            external_message_id: "msg-1",
+                            kind: "text",
+                            text: "oatmeal 80g",
+                        },
+                    },
+                );
+                const appended = parseCaptureStructured(
+                    "append_meal_capture_message",
+                    appendedResult,
+                );
+                expect(appended.capture_id).toBe(captureId);
+                expect(appended.state).toBe("receiving");
+                // Text compatibility: the acknowledgement string stays.
+                expect(appendedResult.content[0]!.text).toBe(
+                    "Capture message retained.",
+                );
+
+                const answeredResult = await call("answer_meal_capture", {
+                    capture_id: captureId,
+                    answer: { question: "portion size?", answer: "80g" },
+                });
+                const answered = parseCaptureStructured(
+                    "answer_meal_capture",
+                    answeredResult,
+                );
+                expect(answered.capture_id).toBe(captureId);
+                expect(answered.state).toBe("receiving");
+                expect(answeredResult.content[0]!.text).toBe(
+                    "Capture answer retained.",
+                );
+
+                const draftedResult = await call("save_meal_capture_draft", {
+                    capture_id: captureId,
+                    draft: {
+                        reported_at: "2026-08-05T12:00:00Z",
+                        items: [{ ordinal: 0, raw_item_text: "oatmeal" }],
+                        inputs: [
+                            {
+                                source_kind: "user_text",
+                                content: "oatmeal 80g",
+                            },
+                        ],
+                        media: [],
+                        parser_policy_version: "hermes.v1",
+                        created_by: "hermes",
+                    },
+                });
+                const drafted = parseCaptureStructured(
+                    "save_meal_capture_draft",
+                    draftedResult,
+                );
+                expect(drafted.state).toBe("ready_to_confirm");
+                expect(draftedResult.content[0]!.text).toBe(
+                    "Meal draft ready for explicit confirmation.",
+                );
+
+                const read = parseCaptureStructured(
+                    "get_meal_capture",
+                    await call("get_meal_capture", { capture_id: captureId }),
+                );
+                const capture = read.capture as Record<string, unknown>;
+                expect(capture.capture_id).toBe(captureId);
+                expect(capture.state).toBe("ready_to_confirm");
+                expect(capture.user_id).toBe("u1");
+                expect(capture.conversation_key).toBe("s6-flow");
+                expect(capture.messages).toHaveLength(1);
+                expect(capture.answers).toHaveLength(1);
+                expect(capture.prepared_draft).not.toBeNull();
+
+                // A missing capture is an explicit null, not an error.
+                const missing = parseCaptureStructured(
+                    "get_meal_capture",
+                    await call("get_meal_capture", {
+                        capture_id: "00000000-0000-4000-8000-000000000999",
+                    }),
+                );
+                expect(missing.capture).toBeNull();
+
+                const cancelled = parseCaptureStructured(
+                    "cancel_meal_capture",
+                    await call("cancel_meal_capture", {
+                        capture_id: captureId,
+                    }),
+                );
+                expect(cancelled.state).toBe("cancelled");
+                expect(cancelled.deduplicated).toBe(false);
+                const cancelReplay = parseCaptureStructured(
+                    "cancel_meal_capture",
+                    await call("cancel_meal_capture", {
+                        capture_id: captureId,
+                    }),
+                );
+                expect(cancelReplay.state).toBe("cancelled");
+                expect(cancelReplay.deduplicated).toBe(true);
+            });
+        });
+
+        test("expire_meal_capture returns schema-exact structuredContent for overdue captures", async () => {
+            await withTools(pool, async (call) => {
+                const started = parseCaptureStructured(
+                    "start_meal_capture",
+                    await call("start_meal_capture", {
+                        conversation_key: "s6-expire",
+                        idempotency_key: "mcp-s6-expire",
+                        expires_at: "2026-08-01T00:00:00.000Z",
+                    }),
+                );
+                const captureId = started.capture_id as string;
+                const expiredResult = await call("expire_meal_capture", {
+                    capture_id: captureId,
+                });
+                const expired = parseCaptureStructured(
+                    "expire_meal_capture",
+                    expiredResult,
+                );
+                expect(expired.state).toBe("expired");
+                expect(expired.deduplicated).toBe(false);
+                expect(JSON.parse(expiredResult.content[0]!.text!).state).toBe(
+                    "expired",
+                );
+                const replay = parseCaptureStructured(
+                    "expire_meal_capture",
+                    await call("expire_meal_capture", {
+                        capture_id: captureId,
+                    }),
+                );
+                expect(replay.state).toBe("expired");
+                expect(replay.deduplicated).toBe(true);
+            });
+        });
+
+        test("confirm and attach parse through their exact exported contracts", async () => {
+            await withTools(
+                pool,
+                async (call) => {
+                    const started = parseCaptureStructured(
+                        "start_meal_capture",
+                        await call("start_meal_capture", {
+                            conversation_key: "s6-confirm",
+                            idempotency_key: "mcp-s6-confirm",
+                        }),
+                    );
+                    const captureId = started.capture_id as string;
+
+                    const attached = parseCaptureStructured(
+                        "attach_meal_capture_media",
+                        await call("attach_meal_capture_media", {
+                            capture_id: captureId,
+                            kind: "photo",
+                            mime_type: "image/png",
+                            bytes_base64: MCP_PNG_BASE64,
+                            idempotency_key: "mcp-s6-confirm-attach",
+                        }),
+                    );
+                    expect(attached.capture_id).toBe(captureId);
+                    expect(attached.capture_state).toBe("receiving");
+
+                    const drafted = await call("save_meal_capture_draft", {
+                        capture_id: captureId,
+                        draft: {
+                            reported_at: "2026-08-05T12:00:00Z",
+                            items: [{ ordinal: 0, raw_item_text: "oatmeal" }],
+                            inputs: [
+                                {
+                                    source_kind: "user_text",
+                                    content: "oatmeal with a photo",
+                                },
+                            ],
+                            media: [
+                                {
+                                    kind: attached.kind,
+                                    storage_key: attached.storage_key,
+                                    mime_type: attached.mime_type,
+                                    byte_size: attached.byte_size,
+                                    sha256: attached.sha256,
+                                    metadata: attached.metadata,
+                                },
+                            ],
+                            parser_policy_version: "hermes.v1",
+                            created_by: "hermes",
+                        },
+                    });
+                    expect(drafted.isError).not.toBe(true);
+
+                    const confirmedResult = await call("confirm_meal_capture", {
+                        capture_id: captureId,
+                        confirmation: "add",
+                    });
+                    const confirmed = parseCaptureStructured(
+                        "confirm_meal_capture",
+                        confirmedResult,
+                    );
+                    expect(confirmed.capture_id).toBe(captureId);
+                    expect(confirmed.state).toBe("confirmed");
+                    expect(typeof confirmed.event_id).toBe("string");
+                    expect(confirmed.version).toBe(1);
+                },
+                { mediaStore },
+            );
+        });
+    },
+);

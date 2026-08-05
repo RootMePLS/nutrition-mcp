@@ -162,6 +162,8 @@ The append-only meal-event path is also exposed as a transport-neutral, durable 
 
 Use `start_meal_capture`, `append_meal_capture_message`, `answer_meal_capture`, `attach_meal_capture_media`, and `save_meal_capture_draft` for restart-safe multi-turn storage. `confirm_meal_capture` is the explicit authorization gate: only the user's unambiguous add command (including `добавь`) commits one prepared capture to one `meal_event`; MyFitnessPal authorization remains a pending journal row, never a claim of successful sync. `validate_calculation_bundle` accepts and validates Hermes-supplied `nutrition-local`, `own`, and `myfitnesspal` result metadata. Canonical nutrition is recomputed by the existing `consensus-10pct-v1` policy; missing, failed, and unavailable values are not treated as zero.
 
+All nine capture lifecycle tools — `start_meal_capture`, `append_meal_capture_message`, `answer_meal_capture`, `save_meal_capture_draft`, `get_meal_capture`, `cancel_meal_capture`, `expire_meal_capture`, `confirm_meal_capture`, and `attach_meal_capture_media` — declare an `outputSchema` and return machine-checkable `structuredContent` alongside their human-readable text, so clients can consume typed capture state without parsing the text payload.
+
 Migration order for a new or test database is `001_initial_schema.sql`, `002_food_tracking.sql`, then `003_meal_captures.sql`.
 
 ```bash
