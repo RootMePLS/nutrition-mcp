@@ -134,7 +134,11 @@ function macroBits(m, vals, goal, wording) {
     // floor case only (trends passes { under: "under" } for its averages).
     const underWord = ceiling ? "under" : (wording && wording.under) || "left";
     const overWord = (wording && wording.over) || "over";
-    const val = vals?.[m.key] ?? 0;
+    const raw = vals?.[m.key];
+    // null is the presence signal (no calculated value in the selection), not
+    // a zero intake: the tile renders its no-data state — never a 0% ring.
+    const noData = raw == null;
+    const val = noData ? 0 : raw;
     const target = goal?.[m.key] ?? null;
 
     let pct = null;
@@ -155,7 +159,10 @@ function macroBits(m, vals, goal, wording) {
     const pctColor = over ? "var(--over)" : m.color;
 
     let goalLine, center2;
-    if (pct == null) {
+    if (noData) {
+        goalLine = "no data yet";
+        center2 = `<div class="ru">${m.unit}</div>`;
+    } else if (pct == null) {
         goalLine = "no goal set";
         center2 = `<div class="ru">${m.unit}</div>`;
     } else {
@@ -173,7 +180,7 @@ function macroBits(m, vals, goal, wording) {
         goalLine = `${ceiling ? "limit" : "of"} ${fmt(target, m.decimals)} ${m.unit} · ${deltaStr}`;
         center2 = `<div class="rp" style="color:${pctColor}">${Math.round(pct)}%</div>`;
     }
-    return { val, target, pct, over, frac, goalLine, center2 };
+    return { val, target, pct, over, frac, goalLine, center2, noData };
 }
 
 // The conic-gradient ring gauge markup (size comes from the CSS context). Its
@@ -183,13 +190,19 @@ function macroBits(m, vals, goal, wording) {
 function ringMarkup(m, b) {
     const cap =
         b.pct != null && b.frac > 0.005 ? `<div class="ring-cap"></div>` : "";
+    // No-data renders an em dash, on screen and in the accessible name — a
+    // formatted "0" would claim a zero intake the data does not support.
+    const valueText = b.noData ? "—" : fmt(b.val, m.decimals);
+    const aria = b.noData
+        ? `${esc(m.label)} no data yet`
+        : `${esc(m.label)} ${valueText} ${m.unit}`;
     return `
-      <div class="ring" style="--c:${m.color};--p:${b.frac.toFixed(4)}" role="img" aria-label="${esc(m.label)} ${fmt(b.val, m.decimals)} ${m.unit}">
+      <div class="ring" style="--c:${m.color};--p:${b.frac.toFixed(4)}" role="img" aria-label="${aria}">
         <div class="ring-track"></div>
         <div class="ring-arc"></div>
         ${cap}
         <div class="ring-center">
-          <div class="rv">${fmt(b.val, m.decimals)}</div>
+          <div class="rv">${valueText}</div>
           ${b.center2}
         </div>
       </div>`;
@@ -254,6 +267,9 @@ function detailLabel(m, ctx) {
 // thing a finger aims at), so the button would either be smaller than what
 // responds to a tap or would nest a second target inside the first.
 function tileLabel(m, b, ctx) {
+    if (b.noData) {
+        return `${m.label} no data yet. ${detailLabel(m, ctx)}`;
+    }
     // "·" separates value from goal visually; screen readers either skip it or
     // announce "middle dot", so the spoken name uses a comma.
     const state = b.goalLine.replace(" · ", ", ");

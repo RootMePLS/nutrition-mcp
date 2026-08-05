@@ -202,7 +202,7 @@
             };
 
             function fmt(n, decimals) {
-                if (n == null || isNaN(n)) return "0";
+                if (n == null || isNaN(n)) return "—";
                 const r = decimals ? n.toFixed(decimals) : Math.round(n);
                 return Number(r).toLocaleString();
             }

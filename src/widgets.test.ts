@@ -66,6 +66,24 @@ test("trends widget preserves null and explicit zero averages", async () => {
     expect(html).not.toContain("sum += d[key] || 0;");
 });
 
+// S3 presence contract: a null core macro total is "no data", never a zero.
+// The four totals-rendering widgets must (1) never fmt() a null into "0" and
+// (2) give the macro panel a no-data branch so a pending day shows "—" /
+// "no data yet" instead of a 0% ring, while an explicit 0 still renders as 0.
+test.each(["trends", "goal-progress", "nutrition-summary", "meal-logged"])(
+    "%s renders no-data rather than zero for null core macros",
+    async (key) => {
+        const html = await getWidgetHtml(key);
+        // fmt must not launder null/NaN into a fabricated "0".
+        expect(html).not.toContain('if (n == null || isNaN(n)) return "0";');
+        expect(html).toContain('if (n == null || isNaN(n)) return "—";');
+        // The shared macro panel has an explicit no-data branch...
+        expect(html).toContain('goalLine = "no data yet";');
+        // ...and the ring centre shows an em dash for it, not a formatted 0.
+        expect(html).toContain('b.noData ? "—" : fmt(b.val, m.decimals)');
+    },
+);
+
 test("unknown widget key throws", async () => {
     expect(getWidgetHtml("nope")).rejects.toThrow(/unknown widget/);
 });

@@ -652,9 +652,10 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                 expect(byDate.content[0]!.text).not.toContain("Calories:");
                 expect(byDate.content[0]!.text).not.toContain("Protein:");
 
-                // Approved aggregation contract: a pending event still counts as a
-                // logged meal but adds nothing to the nutrient sums, while the
-                // ready event on the other day keeps its values.
+                // Presence contract (campaign decision D4): a pending event
+                // still counts as a logged meal (meals_total), but its core
+                // macros are NULL — never a fabricated 0 — and
+                // meals_calculated discloses that the sum covers nothing.
                 const summary = await call("get_nutrition_summary", {
                     start_date: "2026-08-05",
                     end_date: "2026-08-06",
@@ -663,24 +664,91 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                 const days = summary.structuredContent?.days as {
                     date: string;
                     meal_count: number;
-                    calories: number;
-                    protein_g: number;
+                    calories: number | null;
+                    protein_g: number | null;
+                    meals_total: number;
+                    meals_calculated: number;
                 }[];
                 expect(days.find((d) => d.date === "2026-08-05")).toMatchObject(
                     {
                         meal_count: 1,
                         calories: 250,
                         protein_g: 20,
+                        meals_total: 1,
+                        meals_calculated: 1,
                     },
                 );
                 expect(days.find((d) => d.date === "2026-08-06")).toMatchObject(
                     {
                         meal_count: 1,
-                        calories: 0,
-                        protein_g: 0,
+                        calories: null,
+                        protein_g: null,
+                        meals_total: 1,
+                        meals_calculated: 0,
                     },
                 );
+                // The range average keeps the historical denominator (every
+                // logged day) but cannot invent a figure for the pending day:
+                // 250 over 2 logged days, with the counts exposing coverage.
+                const averages = summary.structuredContent?.averages as {
+                    calories: number | null;
+                    meals_total: number;
+                    meals_calculated: number;
+                };
+                expect(averages.calories).toBe(125);
+                expect(averages.meals_total).toBe(2);
+                expect(averages.meals_calculated).toBe(1);
                 expect(summary.content[0]!.text).not.toContain("NaN");
+                expect(summary.content[0]!.text).toContain("no data yet");
+
+                // Goal progress over the pending day: null totals, "no data
+                // yet" in the text — never "Calories: 0", "0%" of goal, NaN.
+                const progress = await call("get_goal_progress", {
+                    date: "2026-08-06",
+                });
+                expect(progress.isError).not.toBe(true);
+                expect(progress.structuredContent?.totals).toMatchObject({
+                    calories: null,
+                    protein_g: null,
+                    carbs_g: null,
+                    fat_g: null,
+                    meals_total: 1,
+                    meals_calculated: 0,
+                });
+                expect(progress.content[0]!.text).toContain("no data yet");
+                expect(progress.content[0]!.text).not.toContain("Calories: 0");
+                expect(progress.content[0]!.text).not.toContain("NaN");
+
+                // Trends per-day series: the pending day is null-with-counts,
+                // the ready day keeps its values.
+                const trends = await call("get_trends", {
+                    days: 2,
+                    end_date: "2026-08-06",
+                });
+                expect(trends.isError).not.toBe(true);
+                const trendDays = trends.structuredContent?.days as {
+                    date: string;
+                    calories: number | null;
+                    protein_g: number | null;
+                    meals_total: number;
+                    meals_calculated: number;
+                }[];
+                expect(
+                    trendDays.find((d) => d.date === "2026-08-06"),
+                ).toMatchObject({
+                    calories: null,
+                    protein_g: null,
+                    meals_total: 1,
+                    meals_calculated: 0,
+                });
+                expect(
+                    trendDays.find((d) => d.date === "2026-08-05"),
+                ).toMatchObject({
+                    calories: 250,
+                    protein_g: 20,
+                    meals_total: 1,
+                    meals_calculated: 1,
+                });
 
                 // Export keeps empty fields for the pending event, never zeros.
                 const exported = await call("export_meals");
@@ -692,6 +760,177 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                     .find((line) => line.includes("pending oats"))!;
                 // id, logged_at, timezone, meal_type, description, then the eight
                 // nutrient/notes fields — all empty for a pending event.
+                expect(pendingLine.split(",").slice(5)).toEqual([
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ]);
+            });
+        },
+    );
+
+    test.serial(
+        "mixed and explicit-zero days keep partial sums and real zeros distinct",
+        async () => {
+            // A day whose selection is only partially calculated: the sum
+            // covers the calculated meal alone, and the counts say so.
+            await seedProjectionEvent(pool, {
+                userId: "u1",
+                idempotencyKey: "mixed-pending",
+                consumedAt: "2026-08-07T12:00:00.000Z",
+                currentVersion: 1,
+                description: "pending soup",
+                calories: null,
+                protein_g: null,
+                carbs_g: null,
+                fat_g: null,
+                canonicalStatus: "pending",
+                consensusStatus: "insufficient_data",
+            });
+            await seedProjectionEvent(pool, {
+                userId: "u1",
+                idempotencyKey: "mixed-ready",
+                consumedAt: "2026-08-07T13:00:00.000Z",
+                currentVersion: 1,
+                description: "ready rice",
+                calories: 300,
+                protein_g: 12,
+            });
+            // A stored explicit zero is data, not absence: it must survive
+            // every public aggregate as a real 0.
+            await seedProjectionEvent(pool, {
+                userId: "u1",
+                idempotencyKey: "explicit-zero",
+                consumedAt: "2026-08-08T12:00:00.000Z",
+                currentVersion: 1,
+                description: "zero snack",
+                calories: 0,
+                protein_g: 0,
+                carbs_g: 0,
+                fat_g: 0,
+            });
+
+            await callTools(async (call) => {
+                const summary = await call("get_nutrition_summary", {
+                    start_date: "2026-08-07",
+                    end_date: "2026-08-08",
+                });
+                expect(summary.isError).not.toBe(true);
+                const days = summary.structuredContent?.days as {
+                    date: string;
+                    meal_count: number;
+                    calories: number | null;
+                    protein_g: number | null;
+                    carbs_g: number | null;
+                    fat_g: number | null;
+                    meals_total: number;
+                    meals_calculated: number;
+                }[];
+                // Mixed day: partial sum, honest counts.
+                expect(days.find((d) => d.date === "2026-08-07")).toMatchObject(
+                    {
+                        meal_count: 2,
+                        calories: 300,
+                        protein_g: 12,
+                        meals_total: 2,
+                        meals_calculated: 1,
+                    },
+                );
+                // Explicit-zero day: real zeros, fully calculated.
+                expect(days.find((d) => d.date === "2026-08-08")).toMatchObject(
+                    {
+                        meal_count: 1,
+                        calories: 0,
+                        protein_g: 0,
+                        carbs_g: 0,
+                        fat_g: 0,
+                        meals_total: 1,
+                        meals_calculated: 1,
+                    },
+                );
+
+                const mixedProgress = await call("get_goal_progress", {
+                    date: "2026-08-07",
+                });
+                expect(mixedProgress.isError).not.toBe(true);
+                expect(mixedProgress.structuredContent?.totals).toMatchObject({
+                    calories: 300,
+                    meals_total: 2,
+                    meals_calculated: 1,
+                });
+                expect(mixedProgress.content[0]!.text).toContain(
+                    "Calories: 300",
+                );
+
+                const zeroProgress = await call("get_goal_progress", {
+                    date: "2026-08-08",
+                });
+                expect(zeroProgress.isError).not.toBe(true);
+                expect(zeroProgress.structuredContent?.totals).toMatchObject({
+                    calories: 0,
+                    protein_g: 0,
+                    meals_total: 1,
+                    meals_calculated: 1,
+                });
+                expect(zeroProgress.content[0]!.text).toContain(
+                    "Calories: 0 kcal",
+                );
+                expect(zeroProgress.content[0]!.text).not.toContain(
+                    "no data yet",
+                );
+
+                const trends = await call("get_trends", {
+                    days: 2,
+                    end_date: "2026-08-08",
+                });
+                expect(trends.isError).not.toBe(true);
+                const trendDays = trends.structuredContent?.days as {
+                    date: string;
+                    calories: number | null;
+                    meals_total: number;
+                    meals_calculated: number;
+                }[];
+                expect(
+                    trendDays.find((d) => d.date === "2026-08-07"),
+                ).toMatchObject({
+                    calories: 300,
+                    meals_total: 2,
+                    meals_calculated: 1,
+                });
+                expect(
+                    trendDays.find((d) => d.date === "2026-08-08"),
+                ).toMatchObject({
+                    calories: 0,
+                    meals_total: 1,
+                    meals_calculated: 1,
+                });
+
+                // CSV export: the explicit-zero meal keeps its 0s, the pending
+                // meal keeps empty cells — never one dressed as the other.
+                const exported = await call("export_meals");
+                expect(exported.isError).not.toBe(true);
+                const csv = await Bun.file("./exports/u1/meals.csv").text();
+                const zeroLine = csv
+                    .split("\n")
+                    .find((line) => line.includes("zero snack"))!;
+                expect(zeroLine.split(",").slice(5)).toEqual([
+                    "0",
+                    "0",
+                    "0",
+                    "0",
+                    "",
+                    "",
+                    "",
+                    "",
+                ]);
+                const pendingLine = csv
+                    .split("\n")
+                    .find((line) => line.includes("pending soup"))!;
                 expect(pendingLine.split(",").slice(5)).toEqual([
                     "",
                     "",

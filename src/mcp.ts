@@ -367,14 +367,21 @@ export { MAX_CALORIES, MAX_MACRO_G, MAX_ALCOHOL_G };
 export const MAX_GOAL_G = 9_999.99;
 
 interface DailyTotals {
-    calories: number;
-    protein_g: number;
-    carbs_g: number;
-    fat_g: number;
+    // The four core macros are presence-aware (campaign decision D4): null when
+    // NO meal in the selection carries a calculated value for the nutrient —
+    // never coalesced to 0. A stored explicit 0 stays a real 0.
+    calories: number | null;
+    protein_g: number | null;
+    carbs_g: number | null;
+    fat_g: number | null;
     fiber_g: number;
     sugar_g: number;
     alcohol_g: number;
     water_ml: number;
+    // How many meals the selection holds vs how many contributed at least one
+    // calculated core macro — so a partial sum is never read as a complete one.
+    meals_total: number;
+    meals_calculated: number;
 }
 
 interface DailyAverages extends Omit<
@@ -388,24 +395,52 @@ interface DailyAverages extends Omit<
 
 function emptyTotals(): DailyTotals {
     return {
-        calories: 0,
-        protein_g: 0,
-        carbs_g: 0,
-        fat_g: 0,
+        calories: null,
+        protein_g: null,
+        carbs_g: null,
+        fat_g: null,
         fiber_g: 0,
         sugar_g: 0,
         alcohol_g: 0,
         water_ml: 0,
+        meals_total: 0,
+        meals_calculated: 0,
     };
+}
+
+// The four core macros whose public totals are presence-aware (D4).
+const CORE_MACRO_KEYS = ["calories", "protein_g", "carbs_g", "fat_g"] as const;
+type CoreMacroKey = (typeof CORE_MACRO_KEYS)[number];
+
+// Sum one core macro over a selection of meals, presence-aware: null when NO
+// meal carries a calculated value for it — never a coalesced 0 — while an
+// explicit stored 0 sums as a real zero. Shared by sumMeals and
+// trendsDayPayloadOf so the null-vs-zero rule exists exactly once.
+export function presenceSum(meals: Meal[], key: CoreMacroKey): number | null {
+    let sum: number | null = null;
+    for (const m of meals) {
+        const value = m[key];
+        if (value == null) continue;
+        sum = (sum ?? 0) + value;
+    }
+    return sum;
+}
+
+// A meal counts as calculated when it carries at least one core macro value —
+// the unit behind meals_calculated.
+function hasCalculatedCore(m: Meal): boolean {
+    return CORE_MACRO_KEYS.some((key) => m[key] != null);
 }
 
 export function sumMeals(meals: Meal[]): DailyTotals {
     const totals = emptyTotals();
+    totals.meals_total = meals.length;
+    totals.calories = presenceSum(meals, "calories");
+    totals.protein_g = presenceSum(meals, "protein_g");
+    totals.carbs_g = presenceSum(meals, "carbs_g");
+    totals.fat_g = presenceSum(meals, "fat_g");
     for (const m of meals) {
-        totals.calories += m.calories ?? 0;
-        totals.protein_g += m.protein_g ?? 0;
-        totals.carbs_g += m.carbs_g ?? 0;
-        totals.fat_g += m.fat_g ?? 0;
+        if (hasCalculatedCore(m)) totals.meals_calculated += 1;
         // Summed regardless of the alcohol opt-in: the flag gates display, and
         // gating here would make the total depend on when it was computed.
         // The `?? 0` here is a SUM, which is fine — a missing value adds
@@ -448,35 +483,60 @@ export function nutrientPresence(meals: Meal[]): NutrientPresence {
 // for a nutrient is excluded from both its numerator and its denominator. A
 // nutrient nobody recorded reports 0 over 0 days, which callers must render as
 // "not recorded" rather than as a genuine zero.
+//
+// Since S3 the core macros are presence-aware too, but only at the edges: a
+// pending day (no calculated values) adds nothing to a core numerator while
+// still counting as a logged day in its denominator — and when NO day in the
+// range carries a calculated value, the average is null, never a fabricated 0.
+// The meals_total/meals_calculated counts (summed over the range) are what
+// disclose such partial coverage; the average itself stays on the historical
+// denominator so existing history does not shift.
 export function rangeAverages(
     perDay: Array<{ meals: Meal[]; totals: DailyTotals }>,
 ): {
     averages: DailyAverages;
     recordedDays: { fiber_g: number; sugar_g: number; alcohol_g: number };
 } {
-    const sum = emptyTotals();
+    const sums = { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 };
+    const covered = { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 };
+    let water = 0;
+    let mealsTotal = 0;
+    let mealsCalculated = 0;
     for (const { totals } of perDay) {
-        sum.calories += totals.calories;
-        sum.protein_g += totals.protein_g;
-        sum.carbs_g += totals.carbs_g;
-        sum.fat_g += totals.fat_g;
-        sum.water_ml += totals.water_ml;
+        for (const key of [
+            "calories",
+            "protein_g",
+            "carbs_g",
+            "fat_g",
+        ] as const) {
+            const value = totals[key];
+            if (value == null) continue;
+            sums[key] += value;
+            covered[key] += 1;
+        }
+        water += totals.water_ml;
+        mealsTotal += totals.meals_total;
+        mealsCalculated += totals.meals_calculated;
     }
     const mealsByDay = perDay.map((d) => d.meals);
     const fiber = coveredDailyAverage(mealsByDay, "fiber_g");
     const sugar = coveredDailyAverage(mealsByDay, "sugar_g");
     const alcohol = coveredDailyAverage(mealsByDay, "alcohol_g");
     const n = perDay.length || 1;
+    const coreAverage = (key: keyof typeof sums): number | null =>
+        perDay.length > 0 && covered[key] === 0 ? null : sums[key] / n;
     return {
         averages: {
-            calories: sum.calories / n,
-            protein_g: sum.protein_g / n,
-            carbs_g: sum.carbs_g / n,
-            fat_g: sum.fat_g / n,
+            calories: coreAverage("calories"),
+            protein_g: coreAverage("protein_g"),
+            carbs_g: coreAverage("carbs_g"),
+            fat_g: coreAverage("fat_g"),
             fiber_g: fiber.avg,
             sugar_g: sugar.avg,
             alcohol_g: alcohol.avg,
-            water_ml: Math.round(sum.water_ml / n),
+            water_ml: Math.round(water / n),
+            meals_total: mealsTotal,
+            meals_calculated: mealsCalculated,
         },
         recordedDays: {
             fiber_g: fiber.days,
@@ -561,15 +621,22 @@ export const GOALS_ITEM = z.object({
     water_ml: z.number().nullable(),
 });
 
+// Presence contract (campaign decision D4): the four core macros are nullable
+// — null means "no calculated value in the selection", never a coalesced 0,
+// while a stored explicit 0 round-trips as a real 0. meals_total /
+// meals_calculated are integer presence counts so a partial sum is never
+// mistaken for a complete one.
 export const TOTALS_ITEM = z.object({
-    calories: z.number(),
-    protein_g: z.number(),
-    carbs_g: z.number(),
-    fat_g: z.number(),
+    calories: z.number().nullable(),
+    protein_g: z.number().nullable(),
+    carbs_g: z.number().nullable(),
+    fat_g: z.number().nullable(),
     fiber_g: z.number().nullable(),
     sugar_g: z.number().nullable(),
     alcohol_g: z.number().nullable(),
     water_ml: z.number(),
+    meals_total: z.number().int(),
+    meals_calculated: z.number().int(),
 });
 
 // get_trends' per-day series shape: like TOTALS_ITEM, but fiber_g/sugar_g are
@@ -704,7 +771,7 @@ export function totalsPayloadOf(
     const round = (value: number | null, digits: number) =>
         value == null ? null : Math.round(value * 10 ** digits) / 10 ** digits;
     return {
-        calories: Math.round(totals.calories),
+        calories: round(totals.calories, 0),
         protein_g: round(totals.protein_g, 1),
         carbs_g: round(totals.carbs_g, 1),
         fat_g: round(totals.fat_g, 1),
@@ -712,6 +779,8 @@ export function totalsPayloadOf(
         sugar_g: round(totals.sugar_g, 1),
         alcohol_g: alcohol ? round(totals.alcohol_g, 1) : null,
         water_ml: totals.water_ml,
+        meals_total: totals.meals_total,
+        meals_calculated: totals.meals_calculated,
     };
 }
 
@@ -738,12 +807,29 @@ export function trendsDayPayloadOf(
             sugar_g: bucket.sugar_g,
             alcohol_g: bucket.alcohol_g,
             water_ml: bucket.waterMl,
+            meals_total: bucket.meals.length,
+            meals_calculated: bucket.meals.filter(hasCalculatedCore).length,
         },
         alcohol,
     );
+    // The core macros get the same missing-vs-zero treatment as fiber/sugar,
+    // via the shared presenceSum rule: a day whose meals have no calculated
+    // values (pending, or no meals at all) reports null, never a fabricated
+    // 0 — the widget's client-side average skips it instead of counting it as
+    // a real zero-intake day. Rounding matches totalsPayloadOf.
+    const carried = (key: CoreMacroKey, digits: number) => {
+        const sum = presenceSum(bucket.meals, key);
+        return sum == null
+            ? null
+            : Math.round(sum * 10 ** digits) / 10 ** digits;
+    };
     return {
         date: bucket.date,
         ...totals,
+        calories: carried("calories", 0),
+        protein_g: carried("protein_g", 1),
+        carbs_g: carried("carbs_g", 1),
+        fat_g: carried("fat_g", 1),
         fiber_g: dayCarries(bucket.meals, "fiber_g") ? totals.fiber_g : null,
         sugar_g: dayCarries(bucket.meals, "sugar_g") ? totals.sugar_g : null,
         alcohol_g:
@@ -1041,6 +1127,24 @@ const ALL_RECORDED: NutrientPresence = {
 // "0g". Only fiber and sugar consult it: alcohol has its own explicit opt-in,
 // and for a user who turned it ON a zero is the meaningful reading — that is
 // exactly the "0 g against a 0 g limit" a recovery user set the limit to see.
+// A null core-macro total is a pending calculation, not a zero intake: say
+// there is no data — citing the target when one is set, mirroring
+// recordedGoalLine's "not recorded / 30g target" — instead of reporting
+// "0 / 2000 kcal (0%)", and never divide a null into NaN.
+function coreGoalLine(
+    label: string,
+    unit: string,
+    actual: number | null,
+    target: number | null,
+): string {
+    if (actual == null) {
+        return hasActiveTarget(target, "floor")
+            ? `${label}: no data yet / ${target}${unit} target`
+            : `${label}: no data yet`;
+    }
+    return formatGoalLine(label, unit, actual, target);
+}
+
 export function formatProgress(
     totals: DailyTotals,
     goals: NutritionGoals | null,
@@ -1048,25 +1152,25 @@ export function formatProgress(
     present: NutrientPresence = ALL_RECORDED,
 ): string {
     const lines: Array<string | null> = [
-        formatGoalLine(
+        coreGoalLine(
             "Calories",
             " kcal",
             totals.calories,
             goals?.daily_calories ?? null,
         ),
-        formatGoalLine(
+        coreGoalLine(
             "Protein",
             "g",
             totals.protein_g,
             goals?.daily_protein_g ?? null,
         ),
-        formatGoalLine(
+        coreGoalLine(
             "Carbs",
             "g",
             totals.carbs_g,
             goals?.daily_carbs_g ?? null,
         ),
-        formatGoalLine("Fat", "g", totals.fat_g, goals?.daily_fat_g ?? null),
+        coreGoalLine("Fat", "g", totals.fat_g, goals?.daily_fat_g ?? null),
         recordedGoalLine(
             "Fiber",
             "g",
