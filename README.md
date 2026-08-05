@@ -140,13 +140,13 @@ backfill and there is no rollback for the legacy meal reset.
 
 ### 2. Environment variables
 
-| Variable            | Description                                                                                                                 |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`      | PostgreSQL connection string for the runtime database (default example: `postgres://localhost:5432/nutrition_mcp`)          |
-| `DATABASE_URL_TEST` | Isolated PostgreSQL database used by integration tests (default example: `postgres://localhost:5432/nutrition_mcp_test`)    |
-| `MEDIA_ROOT`        | Local directory for event media bytes (default example: `./data/media`); PostgreSQL stores metadata and keys, not the bytes |
-| `OFF_USER_AGENT`    | Open Food Facts User-Agent for barcode lookups, in the form `AppName (email)`                                               |
-| `PORT`              | Server port (default: `8080`)                                                                                               |
+| Variable            | Description                                                                                                                                              |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`      | PostgreSQL connection string for the runtime database (default example: `postgres://localhost:5432/nutrition_mcp`)                                       |
+| `DATABASE_URL_TEST` | Isolated PostgreSQL database used by integration tests (default example: `postgres://localhost:5432/nutrition_mcp_test`)                                 |
+| `MEDIA_ROOT`        | Local directory for event and capture media bytes (default: `var/media`); PostgreSQL stores metadata and generated content-addressed keys, not the bytes |
+| `OFF_USER_AGENT`    | Open Food Facts User-Agent for barcode lookups, in the form `AppName (email)`                                                                            |
+| `PORT`              | Server port (default: `8080`)                                                                                                                            |
 
 > **Making it yours:** The public site includes the maintainer's personal bits — Google Analytics, Patreon/GitHub/contact links, and the `nutrition-mcp.com` domain. Run `bun run depersonalize` to strip them all in one pass (analytics + CSP, the Support/Contact sections, social links, and the domain → a `your-domain.com` placeholder). Use `bun run depersonalize --dry` to preview without writing. Afterwards, swap in your own `public/og.png`, `favicon.ico`, and `apple-touch-icon.png`, and replace the domain placeholder with your real domain.
 
@@ -154,9 +154,13 @@ backfill and there is no rollback for the legacy meal reset.
 
 The complete boundary, lifecycle, provenance, migration, rollback, and retry contract is documented in [docs/food-tracking-agent-driven.md](docs/food-tracking-agent-driven.md).
 
+### Capture media byte lifecycle
+
+`attach_meal_capture_media` is the public byte path: the agent sends raw media as base64 (`bytes_base64`) with a `kind` (`photo`/`audio`) and `mime_type`. The server — never the caller — owns identity and verification: it decodes the bytes (8 MiB decoded cap), enforces the MIME allow-list (`image/jpeg`, `image/png`, `image/webp`, `audio/ogg`, `audio/mpeg`, `audio/mp4`), computes SHA-256 server-side (an optional caller `sha256` must match or the call fails), generates the capture-scoped content-addressed storage key `capture/<capture_id>/<kind>-<sha256>`, stages the file under `MEDIA_ROOT`, and only then inserts the `meal_capture_media` row inside a transaction. If the transaction rolls back, the staged file is deleted; re-attaching identical bytes returns the existing media identity (`deduplicated: true`) without duplicating row or file. Attaches are user-scoped and rejected once a capture leaves `receiving`/`ready_to_confirm`. The structured output (`capture_id`, `media_id`, `storage_key`, `sha256`, `byte_size`, `capture_state`, `deduplicated`) is exactly what a draft's `media` entries must echo for `confirm_meal_capture` to accept them. The caller can never set `storage_key` directly, and no STT/OCR/vision runs in this server.
+
 The append-only meal-event path is also exposed as a transport-neutral, durable capture flow for an agent host. Hermes supplies raw message/evidence/media metadata, clarification answers, prepared drafts, and provider result bundles; this server does not receive Telegram updates, download media, run STT/OCR/vision, or call external MCP servers.
 
-Use `start_meal_capture`, `append_meal_capture_message`, `answer_meal_capture`, and `save_meal_capture_draft` for restart-safe multi-turn storage. `confirm_meal_capture` is the explicit authorization gate: only the user's unambiguous add command (including `добавь`) commits one prepared capture to one `meal_event`; MyFitnessPal authorization remains a pending journal row, never a claim of successful sync. `validate_calculation_bundle` accepts and validates Hermes-supplied `nutrition-local`, `own`, and `myfitnesspal` result metadata. Canonical nutrition is recomputed by the existing `consensus-10pct-v1` policy; missing, failed, and unavailable values are not treated as zero.
+Use `start_meal_capture`, `append_meal_capture_message`, `answer_meal_capture`, `attach_meal_capture_media`, and `save_meal_capture_draft` for restart-safe multi-turn storage. `confirm_meal_capture` is the explicit authorization gate: only the user's unambiguous add command (including `добавь`) commits one prepared capture to one `meal_event`; MyFitnessPal authorization remains a pending journal row, never a claim of successful sync. `validate_calculation_bundle` accepts and validates Hermes-supplied `nutrition-local`, `own`, and `myfitnesspal` result metadata. Canonical nutrition is recomputed by the existing `consensus-10pct-v1` policy; missing, failed, and unavailable values are not treated as zero.
 
 Migration order for a new or test database is `001_initial_schema.sql`, `002_food_tracking.sql`, then `003_meal_captures.sql`.
 

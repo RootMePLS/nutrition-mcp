@@ -38,6 +38,7 @@ A host can use the additive MCP tools:
 - `start_meal_capture`
 - `append_meal_capture_message`
 - `answer_meal_capture`
+- `attach_meal_capture_media`
 - `save_meal_capture_draft`
 - `get_meal_capture`
 - `cancel_meal_capture`
@@ -67,10 +68,26 @@ stored, not silently discarded, with precedence:
 The server does not produce those transcripts or interpretations. Capture media
 stores metadata only in PostgreSQL (`kind`, generated `storage_key`, MIME,
 byte size, SHA-256, optional duration/dimensions, and caller metadata). Bytes
-remain under `MEDIA_ROOT`; staging, hash verification, safe generated identity,
-and cleanup on a failed database transaction are caller/media-store
-responsibilities. No media bytes are placed in JSONB and no stored metadata is
-proof that OCR/STT/vision ran.
+remain under `MEDIA_ROOT`. No media bytes are placed in JSONB and no stored
+metadata is proof that OCR/STT/vision ran.
+
+`attach_meal_capture_media` is how bytes arrive: Hermes sends base64
+(`bytes_base64`, 8 MiB decoded cap) plus `kind` and `mime_type`; the backend
+owns everything else. It enforces the exact MIME allow-list
+(`image/jpeg`, `image/png`, `image/webp`, `audio/ogg`, `audio/mpeg`,
+`audio/mp4`), computes SHA-256 server-side from the decoded bytes (an optional
+caller-supplied `sha256` must match the server hash or the call fails),
+generates the capture-scoped content-addressed key
+`capture/<capture_id>/<kind>-<sha256>` — the caller can never set
+`storage_key` — stages the file through the process-wide `MediaStore`
+(`MEDIA_ROOT`, default `var/media`), then inserts the row in a transaction.
+On any transactional rollback the staged file is deleted, so a failed attach
+leaves neither row nor file; re-attaching identical bytes is idempotent and
+returns the existing identity with `deduplicated: true`. Attaches are
+user-scoped and only allowed while the capture is editable
+(`receiving`/`ready_to_confirm`). A prepared draft's `media` entries must echo
+the returned identity fields exactly, or `confirm_meal_capture` rejects the
+draft for media provenance mismatch.
 
 ## Calculation bundles and uncertainty
 
