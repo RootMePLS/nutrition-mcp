@@ -210,6 +210,7 @@ function compatibilityCommand(
                 status: "succeeded",
                 request_fingerprint: `legacy:${idempotencyKey}`,
                 algorithm_version: "legacy-compat",
+                source_id: `legacy:${idempotencyKey}`,
                 nutrients: {
                     calories:
                         input.calories == null

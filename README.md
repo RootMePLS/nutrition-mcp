@@ -105,6 +105,10 @@ idempotent, but it is not an MFP writer or a cloud backup system.
 | ---------------------------- | --------------------------------------------------------------------------------- |
 | `nutrition://weekly-summary` | Rolling 7-day digest (averages vs targets, best/roughest day) for proactive pulls |
 
+## Calculation provenance readback
+
+The public `get_calculation_provenance` tool reads the authenticated user's event version (current by default, or an immutable historical `version`) and returns provider status, source IDs, raw payloads, provenance, nullable nutrients, and backend canonical audit fields. `provenance_status` is explicit: `ready`, `pending`, `unavailable`, or `missing`. Legacy `log_meal`, bulk import, and legacy updates remain `pending`/`compatibility`; missing values are JSON `null`, never fabricated zeroes (an explicitly stored zero remains zero). `commit_calculation_bundle` and `commit_calculation_correction` accept Hermes-prepared evidence, recompute consensus server-side, preserve immutable history, enforce user scope/idempotency, and create only pending sync-journal intent when explicitly authorized. Hermes owns provider calls; this server does not run Telegram, STT/OCR/vision, or provider workers.
+
 ## Self-hosting
 
 This section describes the current local PostgreSQL/Bun runtime. Older

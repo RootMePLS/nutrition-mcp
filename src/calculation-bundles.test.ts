@@ -11,6 +11,7 @@ import {
 import { commitCalculationBundle } from "./calculation-bundles.js";
 import {
     validateCalculationCorrection,
+    CALCULATION_CORRECTION_OUTPUT_SCHEMA,
     type CalculationCorrectionMetadata,
 } from "./calculation-bundles.js";
 import { registerTools } from "./mcp.js";
@@ -24,6 +25,7 @@ describe("calculation bundle commit seam", () => {
             source_timestamp: "2026-08-05T12:00:00.000Z",
             confirmed: false,
             external_write_authorized: false,
+            user_id: "u1",
         };
         expect(validateCalculationCorrection(base)).toContain(
             "explicit confirmation is required",
@@ -41,6 +43,51 @@ describe("calculation bundle commit seam", () => {
                 confirmed: true,
             }),
         ).toEqual([]);
+        expect(
+            validateCalculationCorrection({
+                ...base,
+                confirmed: true,
+                user_id: undefined,
+            }),
+        ).toContain("user id is required");
+    });
+
+    test("correction output contract is strict and exposes durable result fields", () => {
+        expect(CALCULATION_CORRECTION_OUTPUT_SCHEMA).toBeDefined();
+        expect(
+            CALCULATION_CORRECTION_OUTPUT_SCHEMA.parse({
+                event_id: "00000000-0000-4000-8000-000000000001",
+                version: 2,
+                fingerprint: "fp",
+                deduplicated: false,
+                provenance_status: "ready",
+                compatibility: false,
+                is_current: true,
+                canonical: {
+                    status: "ready",
+                    consensus_status: "all_agree",
+                    nutrients: {
+                        calories: 1,
+                        protein_g: null,
+                        carbs_g: null,
+                        fat_g: null,
+                        fiber_g: null,
+                        sugar_g: null,
+                        alcohol_g: null,
+                    },
+                    eligible_providers: [],
+                    outlier_providers: [],
+                    threshold_percent: 10,
+                    policy_version: "p",
+                    source_result_ids: ["source-1"],
+                    audit_evidence: { fingerprint: "fp" },
+                    algorithm_version: "p",
+                },
+                provider_results: [],
+                external_sync: "not_authorized",
+            }),
+        ).toMatchObject({ version: 2 });
+        expect(() => CALCULATION_CORRECTION_OUTPUT_SCHEMA.parse({})).toThrow();
     });
     test("discovers additive commit tool and rejects malformed bundles", async () => {
         const server = new McpServer(
@@ -73,6 +120,39 @@ describe("calculation bundle commit seam", () => {
         }
     });
 
+    test("discovers provenance readback and correction tools", async () => {
+        const server = new McpServer(
+            { name: "test", version: "0.0.0" },
+            { capabilities: { tools: {}, resources: {} } },
+        );
+        registerTools(server, "u1", false, null, {
+            mealEventsPool: { connect: async () => ({}) } as never,
+        });
+        const [clientTransport, serverTransport] =
+            InMemoryTransport.createLinkedPair();
+        const client = new Client({ name: "test", version: "0.0.0" });
+        await Promise.all([
+            server.connect(serverTransport),
+            client.connect(clientTransport),
+        ]);
+        try {
+            const listed = await client.listTools();
+            expect(listed.tools.map((tool) => tool.name)).toEqual(
+                expect.arrayContaining([
+                    "get_calculation_provenance",
+                    "commit_calculation_correction",
+                ]),
+            );
+            const invalid = await client.callTool({
+                name: "get_calculation_provenance",
+                arguments: { event_id: "not-a-uuid" },
+            });
+            expect(invalid.isError).toBe(true);
+        } finally {
+            await client.close();
+            await server.close();
+        }
+    });
     test("rejects calculation bundle scopes with unknown keys through MCP", async () => {
         const bundle = makeBundle();
         bundle.event_id = "00000000-0000-4000-8000-000000000001";
@@ -109,7 +189,7 @@ describe("calculation bundle commit seam", () => {
         }
     });
 
-    test("calls the commit tool through MCP and returns idempotent retries", async () => {
+    test("fails closed through MCP when scoped durable readback is absent", async () => {
         const bundle = makeBundle();
         bundle.event_id = "00000000-0000-4000-8000-000000000001";
         bundle.fingerprint = stableBundleFingerprint(bundle);
@@ -175,12 +255,8 @@ describe("calculation bundle commit seam", () => {
                 name: "commit_calculation_bundle",
                 arguments: { bundle },
             });
-            expect(first.isError).not.toBe(true);
-            expect(second.isError).not.toBe(true);
-            const firstText = (first.content as { text: string }[])[0]!.text;
-            const secondText = (second.content as { text: string }[])[0]!.text;
-            expect(JSON.parse(firstText).deduplicated).toBe(false);
-            expect(JSON.parse(secondText).deduplicated).toBe(true);
+            expect(first.isError).toBe(true);
+            expect(second.isError).toBe(true);
         } finally {
             await client.close();
             await server.close();
@@ -225,11 +301,23 @@ describe("calculation bundle commit seam", () => {
 
     test("recomputes canonical and persists source IDs and raw provenance atomically", async () => {
         const calls: string[] = [];
+        let persistedFingerprint: string | null = null;
         const client = {
-            query: async (sql: string) => {
+            query: async (sql: string, params: unknown[] = []) => {
                 calls.push(sql);
+                if (sql.includes("UPDATE meal_event_versions")) {
+                    persistedFingerprint = String(params[2]);
+                    return { rows: [] };
+                }
                 if (sql.includes("SELECT calculation_bundle_fingerprint"))
-                    return { rows: [{ calculation_bundle_fingerprint: null }] };
+                    return {
+                        rows: [
+                            {
+                                calculation_bundle_fingerprint:
+                                    persistedFingerprint,
+                            },
+                        ],
+                    };
                 if (sql.includes("SELECT id FROM meal_event_nutrition_results"))
                     return { rows: [] };
                 if (sql.includes("SELECT status, consensus_status"))
@@ -265,11 +353,23 @@ describe("calculation bundle commit seam", () => {
 
     test("rejects tampered content before persistence", async () => {
         const calls: string[] = [];
+        let persistedFingerprint: string | null = null;
         const client = {
-            query: async (sql: string) => {
+            query: async (sql: string, params: unknown[] = []) => {
                 calls.push(sql);
+                if (sql.includes("UPDATE meal_event_versions")) {
+                    persistedFingerprint = String(params[2]);
+                    return { rows: [] };
+                }
                 if (sql.includes("SELECT calculation_bundle_fingerprint"))
-                    return { rows: [{ calculation_bundle_fingerprint: null }] };
+                    return {
+                        rows: [
+                            {
+                                calculation_bundle_fingerprint:
+                                    persistedFingerprint,
+                            },
+                        ],
+                    };
                 if (sql.includes("SELECT id FROM meal_event_nutrition_results"))
                     return { rows: [] };
                 if (sql.includes("SELECT status, consensus_status"))

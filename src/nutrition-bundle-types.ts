@@ -22,6 +22,8 @@ export interface ProviderCalculationResult {
     units: "g_and_kcal";
     nutrients: Partial<Nutrients>;
     raw_payload: Record<string, unknown>;
+    /** Complete caller evidence. The server stores this object byte-for-byte. */
+    provenance?: Record<string, unknown>;
     error_code?: string | null;
     error_message?: string | null;
 }
@@ -118,6 +120,11 @@ export function validateCalculationBundle(bundle: CalculationBundle): string[] {
         if (!result.source_id) errors.push("provider source_id is required");
         if (!isPlainJsonObject(result.raw_payload))
             errors.push("raw_payload must be an object");
+        if (
+            result.provenance !== undefined &&
+            !isPlainJsonObject(result.provenance)
+        )
+            errors.push("provenance must be an object");
         if (
             result.status === "succeeded" &&
             (result.error_code || result.error_message)

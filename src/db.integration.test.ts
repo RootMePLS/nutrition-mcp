@@ -191,7 +191,12 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
             "SELECT source_id FROM meal_event_nutrition_results WHERE event_id = $1",
             [event.event_id],
         );
-        expect(rows[0].source_id).toBe("own:normal-fp");
+        expect(rows[0].source_id).toBe("compatibility:legacy");
+        const provenance = await client.query(
+            "SELECT provenance FROM meal_event_nutrition_results WHERE event_id = $1",
+            [event.event_id],
+        );
+        expect(provenance.rows[0].provenance).toEqual({ compatibility: true });
     });
     test("migration: public_landing_stats counts meal_events current versions", async () => {
         await resetSchema(client);

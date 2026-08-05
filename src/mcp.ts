@@ -3,7 +3,13 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { z } from "zod";
 import type { Context } from "hono";
 import type { Pool } from "pg";
-import { createMealEvent, getMealEvent } from "./meal-events.js";
+import {
+    createMealEvent,
+    getMealEvent,
+    getMealEventProvenance,
+    type MealEventAggregate,
+} from "./meal-events.js";
+
 import {
     appendCaptureMessage,
     cancelMealCapture,
@@ -26,7 +32,14 @@ import {
     type CalculationBundle,
     type CalculationBundleInput,
 } from "./nutrition-bundle-types.js";
-import { commitCalculationBundle } from "./calculation-bundles.js";
+import {
+    commitCalculationBundle,
+    commitCalculationCorrection,
+    CALCULATION_BUNDLE_OUTPUT_SCHEMA,
+    CALCULATION_CORRECTION_OUTPUT_SCHEMA,
+    CALCULATION_PROVENANCE_OUTPUT_SCHEMA,
+    type CalculationBundleOutput,
+} from "./calculation-bundles.js";
 
 const CALCULATION_BUNDLE_INPUT_SCHEMA = z.object({
     event_id: z.string().uuid(),
@@ -60,6 +73,7 @@ const CALCULATION_BUNDLE_INPUT_SCHEMA = z.object({
                 })
                 .optional(),
             raw_payload: z.record(z.string(), z.unknown()),
+            provenance: z.record(z.string(), z.unknown()).optional(),
             error_code: z.string().nullable().optional(),
             error_message: z.string().nullable().optional(),
         }),
@@ -101,6 +115,75 @@ export function canonicalNutrients(bundle: CalculationBundle) {
         ]),
     );
 }
+function canonicalOutput(canonical: MealEventAggregate["canonical"]) {
+    if (!canonical) return null;
+    return {
+        status: canonical.status as "pending" | "ready" | "low_confidence",
+        consensus_status: canonical.consensus_status as
+            | "two_agree_one_outlier"
+            | "all_agree"
+            | "no_consensus"
+            | "insufficient_data",
+        nutrients: Object.fromEntries(
+            NUTRIENT_FIELDS.map((field) => [field, canonical[field]]),
+        ) as Record<string, number | null>,
+        eligible_providers: canonical.eligible_providers,
+        outlier_providers: canonical.outlier_providers,
+        threshold_percent: canonical.threshold_percent,
+        policy_version: canonical.policy_version,
+        source_result_ids: canonical.source_result_ids,
+        audit_evidence: canonical.audit_evidence,
+        algorithm_version: canonical.algorithm_version,
+    };
+}
+
+export function buildCalculationBundleOutput(
+    result: Awaited<ReturnType<typeof commitCalculationBundle>>,
+    readback: {
+        aggregate: MealEventAggregate;
+        provenance_status: "ready" | "pending" | "unavailable" | "missing";
+        compatibility: boolean;
+        is_current: boolean;
+    },
+    external_sync: "not_authorized" | "pending" = "not_authorized",
+): CalculationBundleOutput {
+    const aggregate = readback.aggregate;
+    const canonical = canonicalOutput(aggregate.canonical);
+    return CALCULATION_BUNDLE_OUTPUT_SCHEMA.parse({
+        event_id: aggregate.event.id,
+        version: aggregate.version.version,
+        fingerprint: aggregate.version.calculation_bundle_fingerprint,
+        deduplicated: result.deduplicated,
+        provenance_status: readback.provenance_status,
+        compatibility: readback.compatibility,
+        is_current: readback.is_current,
+        provider_results: aggregate.provider_results.map((r) => ({
+            id: r.id,
+            ordinal: r.ordinal,
+            provider: r.provider as "nutrition-local" | "own" | "myfitnesspal",
+            status: r.status as "succeeded" | "failed" | "unavailable",
+            source_id: r.source_id,
+            request_fingerprint: r.request_fingerprint,
+            algorithm_version: r.algorithm_version,
+            raw_payload: r.raw_payload,
+            provenance: r.provenance,
+            basis: r.basis as
+                "per_item" | "per_meal" | "per_100g" | "serving" | null,
+            units: r.units as "g_and_kcal" | null,
+            nutrients: Object.fromEntries(
+                NUTRIENT_FIELDS.map((field) => [
+                    field,
+                    r.nutrients[field] ?? null,
+                ]),
+            ),
+            error_code: r.error_code,
+            error_message: r.error_message,
+        })),
+        canonical,
+        external_sync,
+    });
+}
+
 import type {
     CreateMealEventCommand,
     MealEventItemInput,
@@ -286,6 +369,15 @@ interface DailyTotals {
     water_ml: number;
 }
 
+interface DailyAverages extends Omit<
+    DailyTotals,
+    "fiber_g" | "sugar_g" | "alcohol_g"
+> {
+    fiber_g: number | null;
+    sugar_g: number | null;
+    alcohol_g: number | null;
+}
+
 function emptyTotals(): DailyTotals {
     return {
         calories: 0,
@@ -351,7 +443,7 @@ export function nutrientPresence(meals: Meal[]): NutrientPresence {
 export function rangeAverages(
     perDay: Array<{ meals: Meal[]; totals: DailyTotals }>,
 ): {
-    averages: DailyTotals;
+    averages: DailyAverages;
     recordedDays: { fiber_g: number; sugar_g: number; alcohol_g: number };
 } {
     const sum = emptyTotals();
@@ -373,9 +465,9 @@ export function rangeAverages(
             protein_g: sum.protein_g / n,
             carbs_g: sum.carbs_g / n,
             fat_g: sum.fat_g / n,
-            fiber_g: fiber.avg ?? 0,
-            sugar_g: sugar.avg ?? 0,
-            alcohol_g: alcohol.avg ?? 0,
+            fiber_g: fiber.avg,
+            sugar_g: sugar.avg,
+            alcohol_g: alcohol.avg,
             water_ml: Math.round(sum.water_ml / n),
         },
         recordedDays: {
@@ -414,13 +506,12 @@ export const MEAL_BREAKDOWN_ITEM = z.object({
     description: z.string(),
     meal_type: z.string().nullable(),
     date: z.string().nullable(),
-    calories: z.number(),
-    protein_g: z.number(),
-    carbs_g: z.number(),
-    fat_g: z.number(),
-    fiber_g: z.number(),
-    sugar_g: z.number(),
-    // Nullable where the other macros are not: null is how every structured
+    calories: z.number().nullable(),
+    protein_g: z.number().nullable(),
+    carbs_g: z.number().nullable(),
+    fat_g: z.number().nullable(),
+    fiber_g: z.number().nullable(),
+    sugar_g: z.number().nullable(),
     // payload says "this user does not track alcohol", which a 0 could not
     // distinguish from a genuinely alcohol-free day.
     alcohol_g: z.number().nullable(),
@@ -431,17 +522,19 @@ export function mealBreakdown(
     dateTz: string | null,
     alcohol: AlcoholDisplay,
 ) {
+    const roundNullable = (value: number | null | undefined, digits: number) =>
+        value == null ? null : Math.round(value * 10 ** digits) / 10 ** digits;
     return meals.map((m) => ({
         description: m.description,
         meal_type: m.meal_type ?? null,
         date: dateTz ? dateInTz(m.logged_at, dateTz) : null,
-        calories: Math.round(m.calories ?? 0),
-        protein_g: Math.round((m.protein_g ?? 0) * 10) / 10,
-        carbs_g: Math.round((m.carbs_g ?? 0) * 10) / 10,
-        fat_g: Math.round((m.fat_g ?? 0) * 10) / 10,
-        fiber_g: Math.round((m.fiber_g ?? 0) * 10) / 10,
-        sugar_g: Math.round((m.sugar_g ?? 0) * 10) / 10,
-        alcohol_g: alcohol ? Math.round((m.alcohol_g ?? 0) * 10) / 10 : null,
+        calories: roundNullable(m.calories, 0),
+        protein_g: roundNullable(m.protein_g, 1),
+        carbs_g: roundNullable(m.carbs_g, 1),
+        fat_g: roundNullable(m.fat_g, 1),
+        fiber_g: roundNullable(m.fiber_g, 1),
+        sugar_g: roundNullable(m.sugar_g, 1),
+        alcohol_g: alcohol ? roundNullable(m.alcohol_g, 1) : null,
     }));
 }
 
@@ -465,8 +558,8 @@ export const TOTALS_ITEM = z.object({
     protein_g: z.number(),
     carbs_g: z.number(),
     fat_g: z.number(),
-    fiber_g: z.number(),
-    sugar_g: z.number(),
+    fiber_g: z.number().nullable(),
+    sugar_g: z.number().nullable(),
     alcohol_g: z.number().nullable(),
     water_ml: z.number(),
 });
@@ -569,6 +662,9 @@ export const LOG_MEAL_EVENT_OUTPUT_SCHEMA = {
         }),
     ),
     external_sync: z.enum(["not_authorized", "pending"]),
+    provenance_status: z.enum(["ready", "pending", "unavailable", "missing"]),
+    compatibility: z.boolean(),
+    bundle_fingerprint: z.string().nullable(),
 };
 
 // Both payloads carry alcohol as a nullable number for the same reason
@@ -593,15 +689,20 @@ export function goalsPayloadOf(
     };
 }
 
-export function totalsPayloadOf(totals: DailyTotals, alcohol: AlcoholDisplay) {
+export function totalsPayloadOf(
+    totals: DailyTotals | DailyAverages,
+    alcohol: AlcoholDisplay,
+) {
+    const round = (value: number | null, digits: number) =>
+        value == null ? null : Math.round(value * 10 ** digits) / 10 ** digits;
     return {
         calories: Math.round(totals.calories),
-        protein_g: Math.round(totals.protein_g * 10) / 10,
-        carbs_g: Math.round(totals.carbs_g * 10) / 10,
-        fat_g: Math.round(totals.fat_g * 10) / 10,
-        fiber_g: Math.round(totals.fiber_g * 10) / 10,
-        sugar_g: Math.round(totals.sugar_g * 10) / 10,
-        alcohol_g: alcohol ? Math.round(totals.alcohol_g * 10) / 10 : null,
+        protein_g: round(totals.protein_g, 1),
+        carbs_g: round(totals.carbs_g, 1),
+        fat_g: round(totals.fat_g, 1),
+        fiber_g: round(totals.fiber_g, 1),
+        sugar_g: round(totals.sugar_g, 1),
+        alcohol_g: alcohol ? round(totals.alcohol_g, 1) : null,
         water_ml: totals.water_ml,
     };
 }
@@ -4248,6 +4349,12 @@ export function registerTools(
 
                     const authorized =
                         aggregate.event.external_write_authorized;
+                    const provenance = await getMealEventProvenance(
+                        mealEventsPool,
+                        userId,
+                        aggregate.event.id,
+                        result.version,
+                    );
                     const structuredContent = {
                         event_id: aggregate.event.id,
                         version: result.version,
@@ -4280,6 +4387,11 @@ export function registerTools(
                         external_sync: authorized
                             ? ("pending" as const)
                             : ("not_authorized" as const),
+                        provenance_status:
+                            provenance?.provenance_status ?? "missing",
+                        compatibility: provenance?.compatibility ?? true,
+                        bundle_fingerprint:
+                            aggregate.version.calculation_bundle_fingerprint,
                     };
 
                     const header = result.deduplicated
@@ -4300,6 +4412,78 @@ export function registerTools(
                 },
                 { userId },
             );
+        },
+    );
+
+    server.registerTool(
+        "get_calculation_provenance",
+        {
+            title: "Get Calculation Provenance",
+            description:
+                "Read the user-scoped persisted provider evidence and backend-derived canonical calculation for the current or an immutable historical event version. Missing, pending, and unavailable evidence is returned explicitly; no nutrient zero is fabricated.",
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                event_id: z.string().uuid(),
+                version: z.number().int().min(1).optional(),
+            },
+            outputSchema: CALCULATION_PROVENANCE_OUTPUT_SCHEMA.shape,
+        },
+        async ({ event_id, version }) => {
+            const found = await getMealEventProvenance(
+                mealEventsPool,
+                userId,
+                event_id,
+                version,
+            );
+            if (!found) {
+                throw new Error("meal event not found");
+            }
+            const { aggregate } = found;
+            const payload = CALCULATION_PROVENANCE_OUTPUT_SCHEMA.parse({
+                event_id: aggregate.event.id,
+                version: aggregate.version.version,
+                current_version: aggregate.event.current_version,
+                is_current: found.is_current,
+                provenance_status: found.provenance_status,
+                compatibility: found.compatibility,
+                bundle_fingerprint:
+                    aggregate.version.calculation_bundle_fingerprint,
+                providers: aggregate.provider_results.map((r) => ({
+                    id: r.id,
+                    ordinal: r.ordinal,
+                    provider: r.provider,
+                    status: r.status,
+                    source_id: r.source_id,
+                    request_fingerprint: r.request_fingerprint,
+                    algorithm_version: r.algorithm_version,
+                    raw_payload: r.raw_payload,
+                    provenance: r.provenance,
+                    nutrients: r.nutrients,
+                    basis: r.basis,
+                    units: r.units,
+                    error_code: r.error_code,
+                    error_message: r.error_message,
+                })),
+                canonical: canonicalOutput(aggregate.canonical),
+            });
+            const pendingNote =
+                found.provenance_status === "ready"
+                    ? ""
+                    : "\nMissing/pending/unavailable — no provider result was fabricated.";
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `${JSON.stringify(payload, null, 2)}${pendingNote}`,
+                    },
+                ],
+                structuredContent: payload,
+            };
         },
     );
 
@@ -4497,24 +4681,73 @@ export function registerTools(
                 confirmation: z.string().min(1),
                 event_idempotency_key: z.string().optional(),
             },
+            outputSchema: {
+                capture_id: z.string(),
+                state: z.literal("confirmed"),
+                event_id: z.string(),
+                version: z.number(),
+                deduplicated: z.boolean(),
+                provenance_status: z.enum([
+                    "ready",
+                    "pending",
+                    "unavailable",
+                    "missing",
+                ]),
+                compatibility: z.boolean(),
+                bundle_fingerprint: z.string().nullable(),
+                canonical: z
+                    .object({
+                        calories: z.number().nullable(),
+                        protein_g: z.number().nullable(),
+                        carbs_g: z.number().nullable(),
+                        fat_g: z.number().nullable(),
+                        fiber_g: z.number().nullable(),
+                        sugar_g: z.number().nullable(),
+                        alcohol_g: z.number().nullable(),
+                    })
+                    .nullable(),
+            },
         },
-        async (args) => ({
-            content: [
+        async (args) => {
+            const result = await confirmMealCapture(
+                mealEventsPool,
                 {
-                    type: "text",
-                    text: JSON.stringify(
-                        await confirmMealCapture(
-                            mealEventsPool,
-                            {
-                                ...args,
-                                confirmation: args.confirmation as "добавь",
-                            },
-                            userId,
-                        ),
-                    ),
+                    ...args,
+                    confirmation: args.confirmation as "добавь",
                 },
-            ],
-        }),
+                userId,
+            );
+            const provenance = await getMealEventProvenance(
+                mealEventsPool,
+                userId,
+                result.event_id!,
+                result.version!,
+            );
+            if (!provenance) {
+                throw new Error("confirmed meal event readback missing");
+            }
+            const payload = {
+                ...result,
+                provenance_status: provenance.provenance_status,
+                compatibility: provenance.compatibility,
+                bundle_fingerprint:
+                    provenance.aggregate.version.calculation_bundle_fingerprint,
+                canonical: provenance.aggregate.canonical
+                    ? Object.fromEntries(
+                          NUTRIENT_FIELDS.map((field) => [
+                              field,
+                              provenance.aggregate.canonical?.[
+                                  field as keyof typeof provenance.aggregate.canonical
+                              ] ?? null,
+                          ]),
+                      )
+                    : null,
+            };
+            return {
+                content: [{ type: "text", text: JSON.stringify(payload) }],
+                structuredContent: payload,
+            };
+        },
     );
 
     server.registerTool(
@@ -4548,15 +4781,108 @@ export function registerTools(
             description:
                 "Persist an already-computed calculation bundle transactionally and return the canonical result. This tool calls no external providers.",
             inputSchema: { bundle: CALCULATION_BUNDLE_INPUT_SCHEMA },
+            outputSchema: CALCULATION_BUNDLE_OUTPUT_SCHEMA.shape,
         },
-        async ({ bundle }): Promise<any> => {
+        async ({ bundle }) => {
             const result = await commitCalculationBundle(
                 mealEventsPool,
                 bundle as CalculationBundleInput,
+                { user_id: userId },
+            );
+            const readback =
+                typeof (mealEventsPool as unknown as { query?: unknown })
+                    .query === "function"
+                    ? await getMealEventProvenance(
+                          mealEventsPool,
+                          userId,
+                          result.event_id,
+                          result.version,
+                      )
+                    : null;
+            if (!readback) {
+                throw new Error("committed calculation readback missing");
+            }
+            const structuredContent = buildCalculationBundleOutput(
+                result,
+                readback,
             );
             return {
-                content: [{ type: "text", text: JSON.stringify(result) }],
-                structuredContent: result,
+                content: [
+                    { type: "text", text: JSON.stringify(structuredContent) },
+                ],
+                structuredContent,
+            };
+        },
+    );
+    server.registerTool(
+        "commit_calculation_correction",
+        {
+            title: "Commit Calculation Correction",
+            description:
+                "Append a complete, validated calculation bundle as an immutable user-scoped correction. Canonical nutrients are recomputed by the backend; explicit external authorization creates only a pending sync intent.",
+            annotations: {
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                bundle: CALCULATION_BUNDLE_INPUT_SCHEMA,
+                correction_idempotency_key: z.string().min(1),
+                correction_reason: z.string().min(1),
+                correction_author: z.string().min(1),
+                source_timestamp: z
+                    .string()
+                    .refine((s) => !Number.isNaN(Date.parse(s))),
+                confirmed: z.literal(true),
+                external_write_authorized: z.boolean().optional(),
+            },
+            outputSchema: CALCULATION_CORRECTION_OUTPUT_SCHEMA.shape,
+        },
+        async ({
+            bundle,
+            correction_idempotency_key,
+            correction_reason,
+            correction_author,
+            source_timestamp,
+            confirmed,
+            external_write_authorized,
+        }) => {
+            const result = await commitCalculationCorrection(
+                mealEventsPool,
+                bundle as CalculationBundleInput,
+                {
+                    correction_idempotency_key,
+                    correction_reason,
+                    correction_author,
+                    source_timestamp,
+                    confirmed,
+                    external_write_authorized:
+                        external_write_authorized ?? false,
+                    user_id: userId,
+                },
+            );
+            const readback = await getMealEventProvenance(
+                mealEventsPool,
+                userId,
+                result.event_id,
+                result.version,
+            );
+            if (!readback) {
+                throw new Error(
+                    "committed calculation correction readback missing",
+                );
+            }
+            const structuredContent = buildCalculationBundleOutput(
+                result,
+                readback,
+                external_write_authorized ? "pending" : "not_authorized",
+            );
+            return {
+                content: [
+                    { type: "text", text: JSON.stringify(structuredContent) },
+                ],
+                structuredContent,
             };
         },
     );

@@ -50,6 +50,249 @@ export interface CreateMealEventResult {
     event_id: string;
     version: number;
     deduplicated: boolean;
+    provenance_status: ProvenanceStatus;
+    fingerprint: string | null;
+    canonical: ReturnType<typeof computeConsensus> | null;
+}
+
+export type ProvenanceStatus = "ready" | "pending" | "unavailable" | "missing";
+
+/** Read the just-persisted aggregate while the write transaction still owns its locks. */
+export async function readPersistedWriteStatus(
+    client: PoolClient,
+    eventId: string,
+    version: number,
+): Promise<{
+    provenance_status: ProvenanceStatus;
+    fingerprint: string | null;
+    canonical: ReturnType<typeof computeConsensus>;
+    compatibility: boolean;
+}> {
+    // PoolClient does not support concurrent queries. More importantly, this
+    // readback must happen on the transaction client in statement order so it
+    // observes the writes made by the current transaction before COMMIT.
+    const versionResult = await client.query(
+        `SELECT calculation_bundle_fingerprint FROM meal_event_versions
+     WHERE event_id = $1 AND version = $2`,
+        [eventId, version],
+    );
+    const providersResult = await client.query(
+        `SELECT provider, status, source_id, request_fingerprint,
+                algorithm_version, raw_payload, provenance, basis, units
+           FROM meal_event_nutrition_results
+          WHERE event_id = $1 AND version = $2 AND ordinal IS NULL`,
+        [eventId, version],
+    );
+    const canonicalResult = await client.query(
+        `SELECT status, consensus_status, ${NUTRIENT_FIELDS.join(", ")},
+                eligible_providers, outlier_providers, threshold_percent,
+                policy_version, source_result_ids, audit_evidence,
+                algorithm_version
+           FROM meal_event_canonical_results
+          WHERE event_id = $1 AND version = $2 AND ordinal IS NULL`,
+        [eventId, version],
+    );
+    const v = versionResult.rows[0];
+    const c = canonicalResult.rows[0];
+    if (!v || !c) throw new Error("persisted aggregate readback missing");
+    const canonical = {
+        status: c.status,
+        consensus_status: c.consensus_status,
+        nutrients: Object.fromEntries(
+            NUTRIENT_FIELDS.map((field) => [
+                field,
+                c[field] === null ? null : Number(c[field]),
+            ]),
+        ),
+        per_nutrient: {},
+        eligible_providers: c.eligible_providers,
+        outlier_providers: c.outlier_providers,
+        threshold_percent: Number(c.threshold_percent),
+        policy_version: c.policy_version,
+        source_result_ids: c.source_result_ids,
+        audit_evidence: c.audit_evidence,
+        algorithm_version: c.algorithm_version,
+    } as unknown as ReturnType<typeof computeConsensus>;
+    const providers = providersResult.rows;
+    const complete =
+        providers.length === 3 &&
+        new Set(providers.map((r) => r.provider)).size === 3 &&
+        providers.every(
+            (r) =>
+                r.status === "succeeded" &&
+                r.source_id &&
+                r.request_fingerprint &&
+                r.algorithm_version &&
+                r.raw_payload !== null &&
+                typeof r.raw_payload === "object" &&
+                Object.keys(r.raw_payload).length > 0 &&
+                r.provenance !== null &&
+                typeof r.provenance === "object" &&
+                Object.keys(r.provenance).length > 0 &&
+                r.provenance.compatibility !== true &&
+                r.basis &&
+                r.units,
+        );
+    const canonicalComplete =
+        c.status === "ready" &&
+        c.consensus_status !== "insufficient_data" &&
+        Boolean(c.algorithm_version) &&
+        Array.isArray(c.source_result_ids) &&
+        c.source_result_ids.length === providers.length &&
+        c.audit_evidence !== null &&
+        typeof c.audit_evidence === "object" &&
+        Object.keys(c.audit_evidence).length > 0 &&
+        c.audit_evidence.compatibility !== true;
+    return {
+        provenance_status: deriveProvenanceStatus({
+            bundleFingerprint: v.calculation_bundle_fingerprint ?? null,
+            providerCount: providers.length,
+            canonicalPresent: true,
+            canonicalConsensus: canonical.consensus_status,
+            providerEvidenceComplete: complete,
+            canonicalEvidenceComplete: canonicalComplete,
+            hasUnavailableProvider: providers.some(
+                (r) => r.status === "failed" || r.status === "unavailable",
+            ),
+        }),
+        fingerprint: v.calculation_bundle_fingerprint ?? null,
+        canonical,
+        compatibility: v.calculation_bundle_fingerprint == null,
+    };
+}
+
+export function deriveProvenanceStatus(args: {
+    bundleFingerprint: string | null;
+    providerCount: number;
+    canonicalPresent: boolean;
+    canonicalConsensus: string | null;
+    providerEvidenceComplete: boolean;
+    canonicalEvidenceComplete: boolean;
+    hasUnavailableProvider: boolean;
+}): ProvenanceStatus {
+    if (!args.providerCount && !args.canonicalPresent) return "missing";
+    if (args.hasUnavailableProvider) return "unavailable";
+    if (!args.bundleFingerprint) return "pending";
+    if (
+        !args.canonicalPresent ||
+        args.canonicalConsensus === "insufficient_data" ||
+        args.providerEvidenceComplete === false ||
+        args.canonicalEvidenceComplete === false
+    )
+        return args.canonicalConsensus === "insufficient_data"
+            ? "unavailable"
+            : "pending";
+    return "ready";
+}
+
+const EXPECTED_PROVIDERS = new Set(["nutrition-local", "own", "myfitnesspal"]);
+
+/** One readiness policy shared by repository writes and user-scoped readback. */
+export function deriveAggregateProvenance(aggregate: MealEventAggregate): {
+    provenance_status: ProvenanceStatus;
+    compatibility: boolean;
+} {
+    const eventResults = aggregate.provider_results.filter(
+        (r) => r.ordinal === null,
+    );
+    const providerNames = new Set(eventResults.map((r) => r.provider));
+    const providerEvidenceComplete =
+        eventResults.length === 3 &&
+        providerNames.size === 3 &&
+        [...EXPECTED_PROVIDERS].every((p) => providerNames.has(p)) &&
+        eventResults.every(
+            (r) =>
+                r.status === "succeeded" &&
+                Boolean(r.id) &&
+                Boolean(r.source_id) &&
+                Boolean(r.request_fingerprint) &&
+                Boolean(r.algorithm_version) &&
+                r.raw_payload !== null &&
+                typeof r.raw_payload === "object" &&
+                Object.keys(r.raw_payload).length > 0 &&
+                r.provenance !== null &&
+                typeof r.provenance === "object" &&
+                Object.keys(r.provenance).length > 0 &&
+                r.provenance.compatibility !== true &&
+                Boolean(r.basis) &&
+                Boolean(r.units),
+        );
+    const canonical = aggregate.canonical;
+    const canonicalEvidenceComplete =
+        canonical !== null &&
+        canonical.status === "ready" &&
+        canonical.consensus_status !== "insufficient_data" &&
+        Boolean(canonical.algorithm_version) &&
+        Array.isArray(canonical.source_result_ids) &&
+        canonical.source_result_ids.length === 3 &&
+        canonical.source_result_ids.every((id) =>
+            eventResults.some((r) => r.id === id),
+        ) &&
+        canonical.audit_evidence !== null &&
+        typeof canonical.audit_evidence === "object" &&
+        Object.keys(canonical.audit_evidence).length > 0 &&
+        canonical.audit_evidence.compatibility !== true &&
+        (canonical.audit_evidence.fingerprint ===
+            aggregate.version.calculation_bundle_fingerprint ||
+            aggregate.version.calculation_bundle_fingerprint === null);
+    return {
+        provenance_status: deriveProvenanceStatus({
+            bundleFingerprint: aggregate.version.calculation_bundle_fingerprint,
+            providerCount: eventResults.length,
+            canonicalPresent: canonical !== null,
+            canonicalConsensus: canonical?.consensus_status ?? null,
+            providerEvidenceComplete,
+            canonicalEvidenceComplete,
+            hasUnavailableProvider: eventResults.some(
+                (r) => r.status === "failed" || r.status === "unavailable",
+            ),
+        }),
+        compatibility:
+            aggregate.version.calculation_bundle_fingerprint === null,
+    };
+}
+
+export function deriveWriteProvenance(
+    providerResults: CreateMealEventCommand["provider_results"],
+    canonical: ReturnType<typeof computeConsensus>,
+    fingerprint: string | null,
+): {
+    provenance_status: ProvenanceStatus;
+    fingerprint: string | null;
+    canonical: ReturnType<typeof computeConsensus>;
+} {
+    const providerEvidenceComplete =
+        providerResults.length === 3 &&
+        new Set(providerResults.map((r) => r.provider)).size === 3 &&
+        providerResults.every(
+            (r) =>
+                r.status === "succeeded" &&
+                Boolean(r.request_fingerprint) &&
+                Boolean(r.request_fingerprint) &&
+                Boolean(r.algorithm_version) &&
+                Boolean(r.raw_payload) &&
+                Boolean(r.basis) &&
+                Boolean(r.units),
+        );
+    const canonicalEvidenceComplete =
+        providerEvidenceComplete &&
+        canonical.status === "ready" &&
+        canonical.consensus_status !== "insufficient_data";
+    return {
+        provenance_status: deriveProvenanceStatus({
+            bundleFingerprint: fingerprint,
+            providerCount: providerResults.length,
+            canonicalPresent: true,
+            canonicalConsensus: canonical.consensus_status,
+            providerEvidenceComplete,
+            canonicalEvidenceComplete,
+            hasUnavailableProvider: providerResults.some(
+                (r) => r.status === "failed" || r.status === "unavailable",
+            ),
+        }),
+        fingerprint,
+        canonical,
+    };
 }
 
 export interface MealEventAggregate {
@@ -76,6 +319,7 @@ export interface MealEventAggregate {
         parser_policy_version: string;
         created_by: string;
         created_at: string;
+        calculation_bundle_fingerprint: string | null;
     };
     items: {
         ordinal: number;
@@ -111,6 +355,11 @@ export interface MealEventAggregate {
         algorithm_version: string;
         error_code: string | null;
         error_message: string | null;
+        source_id: string | null;
+        raw_payload: Record<string, unknown>;
+        provenance: Record<string, unknown> | null;
+        basis: string | null;
+        units: string | null;
         nutrients: Partial<Nutrients>;
     }[];
     canonical: {
@@ -123,10 +372,13 @@ export interface MealEventAggregate {
         fiber_g: number | null;
         sugar_g: number | null;
         alcohol_g: number | null;
-        eligible_providers: string[];
-        outlier_providers: string[];
+        eligible_providers: string[] | null;
+        outlier_providers: string[] | null;
         threshold_percent: number;
         policy_version: string;
+        source_result_ids: string[] | null;
+        audit_evidence: Record<string, unknown> | null;
+        algorithm_version: string | null;
     } | null;
     journal: {
         id: string;
@@ -172,6 +424,12 @@ function sha256Hex(content: string): string {
 
 const NUTRIENT_COLUMNS = NUTRIENT_FIELDS.map((f) => `${f}`).join(", ");
 
+// The legacy adapter has no caller-owned provider source.  The column is
+// required by the durable schema, so this fixed identifier explicitly marks
+// the row as compatibility data instead of pretending the request fingerprint
+// was external evidence.
+const LEGACY_COMPATIBILITY_SOURCE_ID = "compatibility:legacy";
+
 function nutrientValues(
     nutrients: Partial<Nutrients> | undefined,
 ): (number | null)[] {
@@ -192,7 +450,7 @@ async function insertVersionChildren(
         media: CreateMealEventCommand["media"];
         providerResults: CreateMealEventCommand["provider_results"];
     },
-): Promise<void> {
+): Promise<ReturnType<typeof computeConsensus>> {
     const { eventId, version, items, inputs, media, providerResults } = args;
 
     for (const item of items) {
@@ -257,24 +515,35 @@ async function insertVersionChildren(
     const succeededIdsByScope = new Map<number | null, string[]>();
     for (const r of providerResults) {
         const scope = r.ordinal ?? null;
+        const compatibility = r.source_id == null;
+        const sourceId = r.source_id ?? LEGACY_COMPATIBILITY_SOURCE_ID;
         const { rows } = await client.query(
             `INSERT INTO meal_event_nutrition_results
                 (event_id, version, ordinal, provider, source_id, status,
-                 request_fingerprint, algorithm_version, raw_payload,
-                 ${NUTRIENT_COLUMNS}, error_code, error_message)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
-                     $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                 request_fingerprint, algorithm_version, raw_payload, provenance,
+                 basis, units, ${NUTRIENT_COLUMNS}, error_code, error_message)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                     $13, $14, $15, $16, $17, $18, $19, $20, $21)
              RETURNING id`,
             [
                 eventId,
                 version,
                 scope,
                 r.provider,
-                `${r.provider}:${r.request_fingerprint}`,
+                sourceId,
                 r.status,
                 r.request_fingerprint,
                 r.algorithm_version,
-                JSON.stringify(r.raw_payload ?? {}),
+                r.raw_payload == null
+                    ? JSON.stringify({ compatibility: true })
+                    : JSON.stringify(r.raw_payload),
+                compatibility
+                    ? JSON.stringify({ compatibility: true })
+                    : r.provenance == null
+                      ? JSON.stringify({ compatibility: true })
+                      : JSON.stringify(r.provenance),
+                r.basis ?? null,
+                r.units ?? null,
                 ...nutrientValues(r.nutrients),
                 r.error_code ?? null,
                 r.error_message ?? null,
@@ -299,6 +568,7 @@ async function insertVersionChildren(
     }
     if (!scopes.has(null)) scopes.set(null, []);
 
+    let eventCanonical: ReturnType<typeof computeConsensus> | null = null;
     for (const [scope, results] of scopes) {
         const consensus = computeConsensus(
             results.map((r) => ({
@@ -307,15 +577,16 @@ async function insertVersionChildren(
                 nutrients: r.nutrients,
             })),
         );
+        if (scope === null) eventCanonical = consensus;
         await client.query(
             `INSERT INTO meal_event_canonical_results
                 (event_id, version, ordinal, status, consensus_status,
                  ${NUTRIENT_COLUMNS},
                  eligible_providers, outlier_providers, threshold_percent,
-                 policy_version, source_result_ids)
+                 policy_version, source_result_ids, audit_evidence, algorithm_version)
              VALUES ($1, $2, $3, $4, $5,
                      $6, $7, $8, $9, $10, $11, $12,
-                     $13, $14, $15, $16, $17)`,
+                     $13, $14, $15, $16, $17, $18, $19)`,
             [
                 eventId,
                 version,
@@ -327,10 +598,31 @@ async function insertVersionChildren(
                 consensus.outlier_providers,
                 consensus.threshold_percent,
                 consensus.policy_version,
-                succeededIdsByScope.get(scope) ?? [],
+                compatibilityForScope(providerResults)
+                    ? []
+                    : succeededIdsByScope.get(scope),
+                compatibilityForScope(providerResults)
+                    ? JSON.stringify({ compatibility: true })
+                    : JSON.stringify({
+                          source_result_ids: succeededIdsByScope.get(scope),
+                          policy_version: consensus.policy_version,
+                      }),
+                compatibilityForScope(providerResults)
+                    ? null
+                    : consensus.policy_version,
             ],
         );
     }
+    return eventCanonical ?? computeConsensus([]);
+}
+
+function compatibilityForScope(
+    results: CreateMealEventCommand["provider_results"],
+): boolean {
+    return (
+        results.length === 0 ||
+        results.every((result) => result.source_id == null)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -404,10 +696,16 @@ export async function createMealEvent(
                         ],
                     );
                 }
+                const persisted = await readPersistedWriteStatus(
+                    client,
+                    existingEvent.id as string,
+                    existingEvent.current_version as number,
+                );
                 return {
                     event_id: existingEvent.id as string,
                     version: existingEvent.current_version as number,
                     deduplicated: true,
+                    ...persisted,
                 };
             }
 
@@ -434,7 +732,7 @@ export async function createMealEvent(
                  VALUES ($1, 1, $2, $3)`,
                 [eventId, command.parser_policy_version, command.created_by],
             );
-            await insertVersionChildren(client, {
+            const canonical = await insertVersionChildren(client, {
                 eventId,
                 version: 1,
                 items: command.items,
@@ -457,7 +755,17 @@ export async function createMealEvent(
                 );
             }
 
-            return { event_id: eventId, version: 1, deduplicated: false };
+            const persisted = await readPersistedWriteStatus(
+                client,
+                eventId,
+                1,
+            );
+            return {
+                event_id: eventId,
+                version: 1,
+                deduplicated: false,
+                ...persisted,
+            };
         };
         return await (transactionClient
             ? persist(transactionClient)
@@ -472,18 +780,21 @@ export async function createMealEvent(
                 [command.user_id, command.idempotency_key],
             );
             if (rows.length > 0) {
-                if (command.external_write_authorized === true) {
-                    await withTransaction(pool, async (client) => {
-                        const { rows: locked } = await client.query(
-                            `SELECT id, current_version FROM meal_events
-                             WHERE id = $1 FOR UPDATE`,
-                            [rows[0]!.id],
+                return await withTransaction(pool, async (client) => {
+                    const { rows: locked } = await client.query(
+                        `SELECT id, current_version FROM meal_events
+                         WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+                        [rows[0]!.id, command.user_id],
+                    );
+                    if (!locked[0])
+                        throw new Error(
+                            "concurrent create winner readback missing",
                         );
+                    if (command.external_write_authorized === true) {
                         await client.query(
-                            `UPDATE meal_events
-                             SET external_write_authorized = true, updated_at = now()
-                             WHERE id = $1`,
-                            [locked[0]!.id],
+                            `UPDATE meal_events SET external_write_authorized = true,
+                             updated_at = now() WHERE id = $1`,
+                            [locked[0].id],
                         );
                         await client.query(
                             `INSERT INTO meal_event_sync_journal
@@ -494,18 +805,24 @@ export async function createMealEvent(
                              ON CONFLICT (system, operation, request_fingerprint)
                              DO NOTHING`,
                             [
-                                locked[0]!.id,
-                                locked[0]!.current_version,
+                                locked[0].id,
+                                locked[0].current_version,
                                 deriveCreateFingerprint(command),
                             ],
                         );
-                    });
-                }
-                return {
-                    event_id: rows[0]!.id as string,
-                    version: rows[0]!.current_version as number,
-                    deduplicated: true,
-                };
+                    }
+                    const persisted = await readPersistedWriteStatus(
+                        client,
+                        locked[0].id as string,
+                        Number(locked[0].current_version),
+                    );
+                    return {
+                        event_id: locked[0].id as string,
+                        version: Number(locked[0].current_version),
+                        deduplicated: true,
+                        ...persisted,
+                    };
+                });
             }
         }
         throw err;
@@ -570,14 +887,20 @@ export async function correctMealEvent(
                      WHERE event_id = $1 AND correction_idempotency_key = $2`,
                     [command.event_id, command.correction_idempotency_key],
                 );
+                const persisted = await readPersistedWriteStatus(
+                    client,
+                    command.event_id,
+                    Number(existing.rows[0]!.version),
+                );
                 return {
                     event_id: command.event_id,
-                    version: existing.rows[0]!.version as number,
+                    version: Number(existing.rows[0]!.version),
                     deduplicated: true,
+                    ...persisted,
                 };
             }
 
-            await insertVersionChildren(client, {
+            const canonical = await insertVersionChildren(client, {
                 eventId: command.event_id,
                 version: nextVersion,
                 items: command.items,
@@ -604,10 +927,16 @@ export async function correctMealEvent(
                     command.user_id,
                 ],
             );
+            const persisted = await readPersistedWriteStatus(
+                client,
+                command.event_id,
+                nextVersion,
+            );
             return {
                 event_id: command.event_id,
                 version: nextVersion,
                 deduplicated: false,
+                ...persisted,
             };
         });
     } catch (err) {
@@ -618,11 +947,19 @@ export async function correctMealEvent(
                 [command.event_id, command.correction_idempotency_key],
             );
             if (rows.length > 0) {
-                return {
-                    event_id: command.event_id,
-                    version: rows[0]!.version as number,
-                    deduplicated: true,
-                };
+                return await withTransaction(pool, async (client) => {
+                    const persisted = await readPersistedWriteStatus(
+                        client,
+                        command.event_id,
+                        Number(rows[0]!.version),
+                    );
+                    return {
+                        event_id: command.event_id,
+                        version: Number(rows[0]!.version),
+                        deduplicated: true,
+                        ...persisted,
+                    };
+                });
             }
         }
         throw err;
@@ -715,6 +1052,8 @@ export async function getMealEvent(
             parser_policy_version: v.parser_policy_version as string,
             created_by: v.created_by as string,
             created_at: ts(v.created_at),
+            calculation_bundle_fingerprint:
+                (v.calculation_bundle_fingerprint as string | null) ?? null,
         },
         items: items.rows.map((r) => ({
             ordinal: r.ordinal as number,
@@ -750,6 +1089,11 @@ export async function getMealEvent(
             algorithm_version: r.algorithm_version as string,
             error_code: (r.error_code as string | null) ?? null,
             error_message: (r.error_message as string | null) ?? null,
+            source_id: (r.source_id as string | null) ?? null,
+            raw_payload: r.raw_payload as Record<string, unknown>,
+            provenance: r.provenance as Record<string, unknown> | null,
+            basis: (r.basis as string | null) ?? null,
+            units: (r.units as string | null) ?? null,
             nutrients: Object.fromEntries(
                 NUTRIENT_FIELDS.map((f) => [f, numOrNull(r[f])]),
             ) as Partial<Nutrients>,
@@ -765,12 +1109,20 @@ export async function getMealEvent(
                   fiber_g: numOrNull(canonicalRow.fiber_g),
                   sugar_g: numOrNull(canonicalRow.sugar_g),
                   alcohol_g: numOrNull(canonicalRow.alcohol_g),
-                  eligible_providers:
-                      (canonicalRow.eligible_providers as string[]) ?? [],
-                  outlier_providers:
-                      (canonicalRow.outlier_providers as string[]) ?? [],
+                  eligible_providers: canonicalRow.eligible_providers as
+                      string[] | null,
+                  outlier_providers: canonicalRow.outlier_providers as
+                      string[] | null,
                   threshold_percent: Number(canonicalRow.threshold_percent),
                   policy_version: canonicalRow.policy_version as string,
+                  source_result_ids: canonicalRow.source_result_ids as
+                      string[] | null,
+                  audit_evidence: canonicalRow.audit_evidence as Record<
+                      string,
+                      unknown
+                  > | null,
+                  algorithm_version:
+                      (canonicalRow.algorithm_version as string | null) ?? null,
               }
             : null,
         journal: journal.rows.map((r) => ({
@@ -784,6 +1136,36 @@ export async function getMealEvent(
             external_id: (r.external_id as string | null) ?? null,
             last_error: (r.last_error as string | null) ?? null,
         })),
+    };
+}
+
+/** User-scoped aggregate read used by the public provenance boundary. */
+export async function getMealEventProvenance(
+    pool: Pool,
+    userId: string,
+    eventId: string,
+    version?: number,
+): Promise<{
+    aggregate: MealEventAggregate;
+    provenance_status: ProvenanceStatus;
+    compatibility: boolean;
+    is_current: boolean;
+} | null> {
+    const { rows } = await pool.query(
+        `SELECT id, current_version, status FROM meal_events
+         WHERE id = $1 AND user_id = $2 AND status = 'active'`,
+        [eventId, userId],
+    );
+    if (!rows[0]) return null;
+    const selectedVersion = version ?? Number(rows[0].current_version);
+    const aggregate = await getMealEvent(pool, eventId, selectedVersion);
+    if (!aggregate) return null;
+    const derived = deriveAggregateProvenance(aggregate);
+    return {
+        aggregate,
+        provenance_status: derived.provenance_status,
+        compatibility: derived.compatibility,
+        is_current: selectedVersion === Number(rows[0].current_version),
     };
 }
 
@@ -806,6 +1188,8 @@ export async function getMealEventHistory(
         parser_policy_version: v.parser_policy_version as string,
         created_by: v.created_by as string,
         created_at: ts(v.created_at),
+        calculation_bundle_fingerprint:
+            (v.calculation_bundle_fingerprint as string | null) ?? null,
     }));
 }
 

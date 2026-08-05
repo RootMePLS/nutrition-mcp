@@ -32,6 +32,7 @@ import {
     recordJournalFailure,
     recordJournalSuccess,
     type ExternalWriter,
+    deriveProvenanceStatus,
 } from "./meal-events.js";
 
 // ---------------------------------------------------------------------------
@@ -62,6 +63,81 @@ function validCommand(
 }
 
 describe("meal event domain contracts", () => {
+    test("derives explicit provenance without converting missing values to zero", () => {
+        expect(
+            deriveProvenanceStatus({
+                bundleFingerprint: null,
+                providerCount: 0,
+                canonicalPresent: false,
+                canonicalConsensus: null,
+                providerEvidenceComplete: false,
+                canonicalEvidenceComplete: false,
+                hasUnavailableProvider: false,
+            }),
+        ).toBe("missing");
+        expect(
+            deriveProvenanceStatus({
+                bundleFingerprint: null,
+                providerCount: 1,
+                canonicalPresent: true,
+                canonicalConsensus: "insufficient_data",
+                providerEvidenceComplete: false,
+                canonicalEvidenceComplete: false,
+                hasUnavailableProvider: false,
+            }),
+        ).toBe("pending");
+        expect(
+            deriveProvenanceStatus({
+                bundleFingerprint: "bundle:1",
+                providerCount: 3,
+                canonicalPresent: true,
+                canonicalConsensus: "insufficient_data",
+                providerEvidenceComplete: false,
+                canonicalEvidenceComplete: false,
+                hasUnavailableProvider: false,
+            }),
+        ).toBe("unavailable");
+        expect(
+            deriveProvenanceStatus({
+                bundleFingerprint: "bundle:2",
+                providerCount: 3,
+                canonicalPresent: true,
+                canonicalConsensus: "all_agree",
+                providerEvidenceComplete: true,
+                canonicalEvidenceComplete: true,
+                hasUnavailableProvider: false,
+            }),
+        ).toBe("ready");
+    });
+
+    test("does not overclaim ready when persisted bundle evidence is incomplete", () => {
+        expect(
+            deriveProvenanceStatus({
+                bundleFingerprint: "bundle:complete-looking",
+                providerCount: 3,
+                canonicalPresent: true,
+                canonicalConsensus: "all_agree",
+                providerEvidenceComplete: false,
+                canonicalEvidenceComplete: true,
+                hasUnavailableProvider: false,
+            }),
+        ).toBe("pending");
+    });
+
+    test("marks failed or unavailable evidence as unavailable even with a fingerprint", () => {
+        expect(
+            deriveProvenanceStatus({
+                bundleFingerprint: "bundle:failed",
+                providerCount: 3,
+                canonicalPresent: true,
+                canonicalConsensus: "all_agree",
+                providerEvidenceComplete: true,
+                canonicalEvidenceComplete: true,
+                hasUnavailableProvider: true,
+            }),
+        ).toBe("unavailable");
+    });
+
     test("one event accepts multiple ordered positions", () => {
         const command = validCommand();
         expect(validateCreateMealEventCommand(command)).toEqual([]);
@@ -277,6 +353,9 @@ const describeDb = DATABASE_URL_TEST ? describe : describe.skip;
 
 const MIGRATION_001 = "db/migrations/001_initial_schema.sql";
 const MIGRATION_002 = "db/migrations/002_food_tracking.sql";
+const MIGRATION_003 = "db/migrations/003_meal_captures.sql";
+const MIGRATION_004 = "db/migrations/004_calculation_bundles.sql";
+const MIGRATION_005 = "db/migrations/005_calculation_corrections.sql";
 
 async function prepareFreshDb(pool: Pool): Promise<void> {
     const client = await pool.connect();
@@ -284,6 +363,9 @@ async function prepareFreshDb(pool: Pool): Promise<void> {
         await client.query("DROP SCHEMA public CASCADE; CREATE SCHEMA public;");
         await client.query(await Bun.file(MIGRATION_001).text());
         await client.query(await Bun.file(MIGRATION_002).text());
+        await client.query(await Bun.file(MIGRATION_003).text());
+        await client.query(await Bun.file(MIGRATION_004).text());
+        await client.query(await Bun.file(MIGRATION_005).text());
     } finally {
         client.release();
     }

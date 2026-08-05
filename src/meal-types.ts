@@ -141,11 +141,16 @@ export interface ProviderResultInput {
     status: ProviderResultStatus;
     request_fingerprint: string;
     algorithm_version: string;
+    source_id?: string | null;
     ordinal?: number | null;
     nutrients?: Partial<Nutrients>;
     error_code?: string | null;
     error_message?: string | null;
     raw_payload?: Record<string, unknown>;
+    /** Complete caller-supplied provenance; persisted without normalization. */
+    provenance?: Record<string, unknown>;
+    basis?: "per_item" | "per_meal" | "per_100g" | "serving" | null;
+    units?: "g_and_kcal" | null;
 }
 
 export interface CreateMealEventCommand {

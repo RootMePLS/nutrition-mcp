@@ -91,6 +91,23 @@ rows retain eligible and outlier provider IDs, source result IDs, threshold and
 policy metadata, plus correction audit evidence. A proposal is audit input, not
 authority. `nutrition-mcp` makes no provider network calls.
 
+The public `get_calculation_provenance` tool is user-scoped and reads the current
+version by default; passing `version` reads immutable history. It returns all
+stored provider audit fields (`source_id`, raw payload, provenance, basis, units,
+errors), the bundle fingerprint, and canonical audit fields. Its explicit status
+is `ready`, `pending`, `unavailable`, or `missing`: compatibility writes from
+`log_meal`, bulk import, legacy update, and capture confirmation are pending or
+missing until a real bundle is committed. `null` means unavailable evidence,
+while an explicitly stored numeric zero remains zero. Deleted and cross-user
+events are hidden as not found.
+
+`commit_calculation_correction` is the public immutable correction boundary. It
+requires a complete validated bundle, explicit confirmation, correction
+reason/author/timestamp, user ownership, and idempotency identity. It appends
+`current_version + 1`, recomputes canonical values in the backend, preserves
+prior rows, and creates only a pending sync journal intent when explicitly
+authorized.
+
 ## Corrections, retries, and rollback
 
 Corrections append a new event version; historical versions, raw evidence,

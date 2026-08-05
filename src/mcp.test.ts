@@ -304,15 +304,15 @@ describe("rangeAverages", () => {
         expect(averages.water_ml).toBe(500);
     });
 
-    test("a nutrient nobody recorded averages to 0 over 0 days", () => {
+    test("a nutrient nobody recorded stays unavailable", () => {
         const { averages, recordedDays } = rangeAverages([
             day(blank),
             day(blank),
         ]);
         expect(recordedDays.fiber_g).toBe(0);
-        expect(averages.fiber_g).toBe(0);
-        expect(Number.isFinite(averages.sugar_g)).toBe(true);
-        expect(Number.isNaN(averages.alcohol_g)).toBe(false);
+        expect(averages.fiber_g).toBeNull();
+        expect(averages.sugar_g).toBeNull();
+        expect(averages.alcohol_g).toBeNull();
     });
 
     test("an empty range divides nothing by zero", () => {
@@ -587,14 +587,18 @@ describe("summary and trends agree on the same window", () => {
 
     test("fiber: same number in both, over the recorded days only", () => {
         expect(summary.recordedDays.fiber_g).toBe(5);
-        expect(round1(summary.averages.fiber_g)).toBe(24);
-        expect(trendAvg("Fiber", "30d")).toBe(round1(summary.averages.fiber_g));
+        expect(round1(summary.averages.fiber_g!)).toBe(24);
+        expect(trendAvg("Fiber", "30d")).toBe(
+            round1(summary.averages.fiber_g!),
+        );
     });
 
     test("sugar: same number in both", () => {
         expect(summary.recordedDays.sugar_g).toBe(5);
-        expect(round1(summary.averages.sugar_g)).toBe(16);
-        expect(trendAvg("Sugar", "30d")).toBe(round1(summary.averages.sugar_g));
+        expect(round1(summary.averages.sugar_g!)).toBe(16);
+        expect(trendAvg("Sugar", "30d")).toBe(
+            round1(summary.averages.sugar_g!),
+        );
     });
 
     test("calories still divide by every day in both", () => {
