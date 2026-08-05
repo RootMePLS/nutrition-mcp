@@ -43,6 +43,23 @@ interface ToolResult {
     structuredContent?: Record<string, unknown>;
 }
 
+// Shared reset for DB-gated suites: drop the public schema and replay the
+// given migrations in order so each test starts from a clean database.
+async function resetSchemaWithMigrations(
+    pool: Pool,
+    migrations: string[],
+): Promise<void> {
+    const client = await pool.connect();
+    try {
+        await client.query("DROP SCHEMA public CASCADE; CREATE SCHEMA public;");
+        for (const path of migrations) {
+            await client.query(await Bun.file(`db/migrations/${path}`).text());
+        }
+    } finally {
+        client.release();
+    }
+}
+
 async function withTools(
     pool: Pool,
     run: (
@@ -133,33 +150,13 @@ describeDb("log_meal_event MCP tool (requires DATABASE_URL_TEST)", () => {
     });
 
     beforeEach(async () => {
-        const client = await pool.connect();
-        try {
-            await client.query(
-                "DROP SCHEMA public CASCADE; CREATE SCHEMA public;",
-            );
-            await client.query(
-                await Bun.file("db/migrations/001_initial_schema.sql").text(),
-            );
-            await client.query(
-                await Bun.file("db/migrations/002_food_tracking.sql").text(),
-            );
-            await client.query(
-                await Bun.file("db/migrations/003_meal_captures.sql").text(),
-            );
-            await client.query(
-                await Bun.file(
-                    "db/migrations/004_calculation_bundles.sql",
-                ).text(),
-            );
-            await client.query(
-                await Bun.file(
-                    "db/migrations/005_calculation_corrections.sql",
-                ).text(),
-            );
-        } finally {
-            client.release();
-        }
+        await resetSchemaWithMigrations(pool, [
+            "001_initial_schema.sql",
+            "002_food_tracking.sql",
+            "003_meal_captures.sql",
+            "004_calculation_bundles.sql",
+            "005_calculation_corrections.sql",
+        ]);
     });
 
     test("accepts a multi-item event and returns the full structured payload", async () => {
@@ -316,117 +313,152 @@ describeDb("log_meal_event MCP tool (requires DATABASE_URL_TEST)", () => {
             expect(Number(rows[0]!.n)).toBe(0);
         });
     });
-    test("commits an event+item bundle and reads item canonicals back through public provenance", async () => {
-        // Seed an owned event + version so the bundle commit has a target.
-        await pool.query(
-            `INSERT INTO meal_events (id, user_id, reported_at, consumed_at, idempotency_key)
-             VALUES ($1, 'u1', now(), now(), 'mcp-scoped-bundle-event')`,
-            ["00000000-0000-4000-8000-000000000101"],
-        );
-        await pool.query(
-            `INSERT INTO meal_event_versions (event_id, version, parser_policy_version, created_by)
-             VALUES ($1, 1, 'mcp-test', 'mcp-test')`,
-            ["00000000-0000-4000-8000-000000000101"],
-        );
-        const scopedResult = (
-            provider: "nutrition-local" | "own",
-            ordinal: number | null,
-            calories: number,
-        ) => ({
-            provider,
-            status: "succeeded" as const,
-            scope: { ordinal },
-            source_id: `${provider}-${ordinal ?? "event"}-source`,
-            request_fingerprint: `${provider}-request-${ordinal ?? "event"}`,
-            algorithm_version: "v1",
-            basis: "per_meal" as const,
-            units: "g_and_kcal" as const,
-            nutrients: { calories },
-            raw_payload: { provider, ordinal, calories },
-            provenance: { provider, retrieved_at: "2026-08-05T12:00:00Z" },
-        });
-        const bundleInput = {
-            event_id: "00000000-0000-4000-8000-000000000101",
-            version: 1,
-            resolved_input: {
-                items: [
-                    { ordinal: 0, raw_item_text: "oatmeal 80g" },
-                    { ordinal: 1, raw_item_text: "banana" },
-                ],
-                inputs: [],
-            },
-            results: [
-                scopedResult("nutrition-local", null, 500),
-                scopedResult("own", null, 510),
-                scopedResult("nutrition-local", 0, 300),
-                scopedResult("own", 0, 306),
-                scopedResult("nutrition-local", 1, 200),
-                scopedResult("own", 1, 202),
-            ],
-        };
-        const bundle = {
-            ...bundleInput,
-            fingerprint: stableBundleFingerprint(bundleInput),
-        };
-        await withTools(pool, async (call) => {
-            const committed = await call("commit_calculation_bundle", {
-                bundle,
-            });
-            expect(committed.isError).not.toBe(true);
-            const bundleOutput = CALCULATION_BUNDLE_OUTPUT_SCHEMA.parse(
-                committed.structuredContent,
-            );
-            expect(bundleOutput.canonical?.nutrients.calories).toBe(505);
-            expect(bundleOutput.item_canonicals.map((c) => c.ordinal)).toEqual([
-                0, 1,
-            ]);
-            expect(bundleOutput.item_canonicals[0]!.nutrients.calories).toBe(
-                303,
-            );
-            expect(bundleOutput.item_canonicals[1]!.nutrients.calories).toBe(
-                201,
-            );
-
-            const provenance = await call("get_calculation_provenance", {
-                event_id: bundle.event_id,
-            });
-            expect(provenance.isError).not.toBe(true);
-            const provenanceOutput = CALCULATION_PROVENANCE_OUTPUT_SCHEMA.parse(
-                provenance.structuredContent,
-            );
-            expect(provenanceOutput.canonical?.nutrients.calories).toBe(505);
-            expect(
-                provenanceOutput.item_canonicals.map((c) => c.ordinal),
-            ).toEqual([0, 1]);
-            expect(
-                provenanceOutput.item_canonicals.map(
-                    (c) => c.nutrients.calories,
-                ),
-            ).toEqual([303, 201]);
-            // Scope-local sources: each item canonical references only its
-            // own scope's provider rows.
-            for (const item of provenanceOutput.item_canonicals) {
-                const scoped = provenanceOutput.providers.filter(
-                    (p) => p.ordinal === item.ordinal,
-                );
-                expect(item.source_result_ids?.sort()).toEqual(
-                    scoped.map((p) => p.id).sort(),
-                );
-            }
-        });
-        // DB-level cross-check in the same test: three canonical rows.
-        const rows = await pool.query(
-            `SELECT scope_key FROM meal_event_canonical_results
-              WHERE event_id = $1 AND version = 1 ORDER BY scope_key`,
-            [bundle.event_id],
-        );
-        expect(rows.rows.map((r) => r.scope_key)).toEqual([
-            "event",
-            "item:0",
-            "item:1",
-        ]);
-    });
 });
+
+describeDb(
+    "calculation bundle MCP per-scope readback (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await pool.end();
+        });
+
+        // Drain fire-and-forget analytics writes before the next test drops
+        // the schema, so no write lands on a missing tool_analytics table.
+        afterEach(async () => {
+            await flushAnalytics();
+        });
+
+        beforeEach(async () => {
+            await resetSchemaWithMigrations(pool, [
+                "001_initial_schema.sql",
+                "002_food_tracking.sql",
+                "003_meal_captures.sql",
+                "004_calculation_bundles.sql",
+                "005_calculation_corrections.sql",
+            ]);
+        });
+
+        test("commits an event+item bundle and reads item canonicals back through public provenance", async () => {
+            // Seed an owned event + version so the bundle commit has a target.
+            await pool.query(
+                `INSERT INTO meal_events (id, user_id, reported_at, consumed_at, idempotency_key)
+                 VALUES ($1, 'u1', now(), now(), 'mcp-scoped-bundle-event')`,
+                ["00000000-0000-4000-8000-000000000101"],
+            );
+            await pool.query(
+                `INSERT INTO meal_event_versions (event_id, version, parser_policy_version, created_by)
+                 VALUES ($1, 1, 'mcp-test', 'mcp-test')`,
+                ["00000000-0000-4000-8000-000000000101"],
+            );
+            const scopedResult = (
+                provider: "nutrition-local" | "own",
+                ordinal: number | null,
+                calories: number,
+            ) => ({
+                provider,
+                status: "succeeded" as const,
+                scope: { ordinal },
+                source_id: `${provider}-${ordinal ?? "event"}-source`,
+                request_fingerprint: `${provider}-request-${ordinal ?? "event"}`,
+                algorithm_version: "v1",
+                basis: "per_meal" as const,
+                units: "g_and_kcal" as const,
+                nutrients: { calories },
+                raw_payload: { provider, ordinal, calories },
+                provenance: { provider, retrieved_at: "2026-08-05T12:00:00Z" },
+            });
+            const bundleInput = {
+                event_id: "00000000-0000-4000-8000-000000000101",
+                version: 1,
+                resolved_input: {
+                    items: [
+                        { ordinal: 0, raw_item_text: "oatmeal 80g" },
+                        { ordinal: 1, raw_item_text: "banana" },
+                    ],
+                    inputs: [],
+                },
+                results: [
+                    scopedResult("nutrition-local", null, 500),
+                    scopedResult("own", null, 510),
+                    scopedResult("nutrition-local", 0, 300),
+                    scopedResult("own", 0, 306),
+                    scopedResult("nutrition-local", 1, 200),
+                    scopedResult("own", 1, 202),
+                ],
+            };
+            const bundle = {
+                ...bundleInput,
+                fingerprint: stableBundleFingerprint(bundleInput),
+            };
+            await withTools(pool, async (call) => {
+                const committed = await call("commit_calculation_bundle", {
+                    bundle,
+                });
+                expect(committed.isError).not.toBe(true);
+                const bundleOutput = CALCULATION_BUNDLE_OUTPUT_SCHEMA.parse(
+                    committed.structuredContent,
+                );
+                expect(bundleOutput.canonical?.nutrients.calories).toBe(505);
+                expect(
+                    bundleOutput.item_canonicals.map((c) => c.ordinal),
+                ).toEqual([0, 1]);
+                expect(
+                    bundleOutput.item_canonicals[0]!.nutrients.calories,
+                ).toBe(303);
+                expect(
+                    bundleOutput.item_canonicals[1]!.nutrients.calories,
+                ).toBe(201);
+
+                const provenance = await call("get_calculation_provenance", {
+                    event_id: bundle.event_id,
+                });
+                expect(provenance.isError).not.toBe(true);
+                const provenanceOutput =
+                    CALCULATION_PROVENANCE_OUTPUT_SCHEMA.parse(
+                        provenance.structuredContent,
+                    );
+                expect(provenanceOutput.canonical?.nutrients.calories).toBe(
+                    505,
+                );
+                expect(
+                    provenanceOutput.item_canonicals.map((c) => c.ordinal),
+                ).toEqual([0, 1]);
+                expect(
+                    provenanceOutput.item_canonicals.map(
+                        (c) => c.nutrients.calories,
+                    ),
+                ).toEqual([303, 201]);
+                // Scope-local sources: each item canonical references only its
+                // own scope's provider rows.
+                for (const item of provenanceOutput.item_canonicals) {
+                    const scoped = provenanceOutput.providers.filter(
+                        (p) => p.ordinal === item.ordinal,
+                    );
+                    expect(item.source_result_ids?.sort()).toEqual(
+                        scoped.map((p) => p.id).sort(),
+                    );
+                }
+            });
+            // DB-level cross-check in the same test: three canonical rows.
+            const rows = await pool.query(
+                `SELECT scope_key FROM meal_event_canonical_results
+                  WHERE event_id = $1 AND version = 1 ORDER BY scope_key`,
+                [bundle.event_id],
+            );
+            expect(rows.rows.map((r) => r.scope_key)).toEqual([
+                "event",
+                "item:0",
+                "item:1",
+            ]);
+        });
+    },
+);
 
 describeDb("meal capture MCP lifecycle tools", () => {
     let pool: Pool;
@@ -438,22 +470,11 @@ describeDb("meal capture MCP lifecycle tools", () => {
         await flushAnalytics();
     });
     beforeEach(async () => {
-        const client = await pool.connect();
-        try {
-            await client.query(
-                "DROP SCHEMA public CASCADE; CREATE SCHEMA public;",
-            );
-            for (const path of [
-                "001_initial_schema.sql",
-                "002_food_tracking.sql",
-                "003_meal_captures.sql",
-            ])
-                await client.query(
-                    await Bun.file(`db/migrations/${path}`).text(),
-                );
-        } finally {
-            client.release();
-        }
+        await resetSchemaWithMigrations(pool, [
+            "001_initial_schema.sql",
+            "002_food_tracking.sql",
+            "003_meal_captures.sql",
+        ]);
     });
     test("rejects cross-user capture message, answer, and draft mutations", async () => {
         const other = await startMealCapture(pool, {
