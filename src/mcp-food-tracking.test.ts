@@ -139,6 +139,19 @@ describeDb("log_meal_event MCP tool (requires DATABASE_URL_TEST)", () => {
             await client.query(
                 await Bun.file("db/migrations/002_food_tracking.sql").text(),
             );
+            await client.query(
+                await Bun.file("db/migrations/003_meal_captures.sql").text(),
+            );
+            await client.query(
+                await Bun.file(
+                    "db/migrations/004_calculation_bundles.sql",
+                ).text(),
+            );
+            await client.query(
+                await Bun.file(
+                    "db/migrations/005_calculation_corrections.sql",
+                ).text(),
+            );
         } finally {
             client.release();
         }

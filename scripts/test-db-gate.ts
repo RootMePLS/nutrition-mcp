@@ -1,6 +1,7 @@
 import { rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
+import { Pool } from "pg";
 
 const databaseUrl = process.env.DATABASE_URL_TEST;
 if (!databaseUrl) {
@@ -35,6 +36,31 @@ const env = {
     RUN_LEGACY_MEAL_DB_TESTS: "1",
 };
 
+const migrations = [
+    "db/migrations/001_initial_schema.sql",
+    "db/migrations/002_food_tracking.sql",
+    "db/migrations/003_meal_captures.sql",
+    "db/migrations/004_calculation_bundles.sql",
+    "db/migrations/005_calculation_corrections.sql",
+];
+
+// Reset and materialize the complete schema before every child process. This
+// is intentionally outside Bun's test scheduler: each destructive suite gets
+// an isolated, deterministic database state and child processes never overlap.
+async function resetDatabase(): Promise<void> {
+    const pool = new Pool({ connectionString: databaseUrl, max: 1 });
+    const client = await pool.connect();
+    try {
+        await client.query("DROP SCHEMA public CASCADE; CREATE SCHEMA public;");
+        for (const migration of migrations) {
+            await client.query(await Bun.file(migration).text());
+        }
+    } finally {
+        client.release();
+        await pool.end();
+    }
+}
+
 // Export tests write ./exports/<user>/meals.csv; keep the tree disposable.
 const exportsDir = join(
     fileURLToPath(new URL("..", import.meta.url)),
@@ -57,6 +83,7 @@ const results: SuiteResult[] = [];
 cleanExports();
 try {
     for (const suite of suites) {
+        await resetDatabase();
         console.log(`=== ${suite} ===`);
         const child = Bun.spawn(
             ["bun", "test", suite, "--max-concurrency", "1"],

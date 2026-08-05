@@ -168,6 +168,15 @@ describeDb("ordinary delete tombstone (requires DATABASE_URL_TEST)", () => {
             await client.query(
                 await Bun.file("db/migrations/002_food_tracking.sql").text(),
             );
+            for (const migration of [
+                "003_meal_captures.sql",
+                "004_calculation_bundles.sql",
+                "005_calculation_corrections.sql",
+            ]) {
+                await client.query(
+                    await Bun.file(`db/migrations/${migration}`).text(),
+                );
+            }
         } finally {
             client.release();
         }

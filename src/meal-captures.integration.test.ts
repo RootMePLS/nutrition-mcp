@@ -19,6 +19,8 @@ const migrations = [
     "db/migrations/001_initial_schema.sql",
     "db/migrations/002_food_tracking.sql",
     "db/migrations/003_meal_captures.sql",
+    "db/migrations/004_calculation_bundles.sql",
+    "db/migrations/005_calculation_corrections.sql",
 ];
 
 async function migrate(client: PoolClient) {
