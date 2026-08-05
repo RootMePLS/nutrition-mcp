@@ -5,6 +5,20 @@ import { isWeightUnit, toStoredInteger, type WeightUnit } from "./units.js";
 import { isDrinkUnit, type DrinkUnit } from "./alcohol.js";
 import { escapeLikePattern, tokenizeQuery } from "./search.js";
 import { existsSync, unlinkSync } from "node:fs";
+import {
+    getMealProjectionsByRange,
+    getMealProjection,
+    countMealProjections,
+    getAllMealProjections,
+    existingMealIdempotencyKeys,
+    searchMealProjections,
+    type MealEventProjection,
+} from "./meal-event-projection.js";
+import { createMealEvent, correctMealEvent } from "./meal-events.js";
+import type {
+    CreateMealEventCommand,
+    CorrectMealEventCommand,
+} from "./meal-types.js";
 
 // ============================================================================
 // CONNECTION POOL & SINGLE USER
@@ -154,67 +168,78 @@ export function mealIdempotencyKey(
     ]);
 }
 
+function projectionAsMeal(row: MealEventProjection): Meal {
+    return { ...row };
+}
+
+function compatibilityCommand(
+    userId: string,
+    input: MealInput,
+): CreateMealEventCommand {
+    const loggedAt = input.logged_at ?? new Date().toISOString();
+    const idempotencyKey =
+        input.idempotency_key ?? mealIdempotencyKey(userId, input, loggedAt);
+    const description = decodeEscapeSequences(input.description);
+    const notes =
+        input.notes == null ? null : decodeEscapeSequences(input.notes);
+    return {
+        user_id: userId,
+        idempotency_key: idempotencyKey,
+        reported_at: loggedAt,
+        consumed_at: loggedAt,
+        meal_type: input.meal_type,
+        items: [
+            {
+                ordinal: 0,
+                raw_item_text: description,
+                normalized_name: description,
+                notes,
+            },
+        ],
+        inputs: [
+            {
+                source_kind: "user_text",
+                content: description,
+                metadata: { compatibility: "legacy_log_meal" },
+            },
+        ],
+        media: [],
+        provider_results: [
+            {
+                provider: "own",
+                status: "succeeded",
+                request_fingerprint: `legacy:${idempotencyKey}`,
+                algorithm_version: "legacy-compat",
+                nutrients: {
+                    calories:
+                        input.calories == null
+                            ? null
+                            : toStoredInteger(input.calories),
+                    protein_g: input.protein_g ?? null,
+                    carbs_g: input.carbs_g ?? null,
+                    fat_g: input.fat_g ?? null,
+                    fiber_g: input.fiber_g ?? null,
+                    sugar_g: input.sugar_g ?? null,
+                    alcohol_g: input.alcohol_g ?? null,
+                },
+            },
+        ],
+        parser_policy_version: "legacy-compat-v1",
+        created_by: "legacy-log-meal",
+    };
+}
+
 export async function insertMeal(
     userId: string,
     input: MealInput,
 ): Promise<MealInsertResult> {
-    const meal: MealInput =
-        input.calories == null
-            ? input
-            : { ...input, calories: toStoredInteger(input.calories) };
-
-    const loggedAt = meal.logged_at ?? new Date().toISOString();
-    const idempotencyKey =
-        meal.idempotency_key ?? mealIdempotencyKey(userId, meal, loggedAt);
-
-    // Check for existing meal with same idempotency key.
-    {
-        const { rows } = await pool.query(
-            `SELECT * FROM meals WHERE user_id = $1 AND idempotency_key = $2`,
-            [userId, idempotencyKey],
-        );
-        if (rows.length > 0) {
-            return { meal: mealFromRow(rows[0]!), deduplicated: true };
-        }
-    }
-
-    try {
-        const { rows } = await pool.query(
-            `INSERT INTO meals
-                (user_id, description, meal_type, calories, protein_g, carbs_g, fat_g,
-                 fiber_g, sugar_g, alcohol_g, logged_at, notes, idempotency_key)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-             RETURNING *`,
-            [
-                userId,
-                decodeEscapeSequences(meal.description),
-                meal.meal_type,
-                meal.calories ?? null,
-                meal.protein_g ?? null,
-                meal.carbs_g ?? null,
-                meal.fat_g ?? null,
-                meal.fiber_g ?? null,
-                meal.sugar_g ?? null,
-                meal.alcohol_g ?? null,
-                loggedAt,
-                meal.notes != null ? decodeEscapeSequences(meal.notes) : null,
-                idempotencyKey,
-            ],
-        );
-        return { meal: mealFromRow(rows[0]!), deduplicated: false };
-    } catch (error) {
-        // 23505: concurrent retry with same idempotency key.
-        if ((error as { code?: string }).code === "23505") {
-            const { rows } = await pool.query(
-                `SELECT * FROM meals WHERE user_id = $1 AND idempotency_key = $2`,
-                [userId, idempotencyKey],
-            );
-            if (rows.length > 0) {
-                return { meal: mealFromRow(rows[0]!), deduplicated: true };
-            }
-        }
-        throw new Error(`Failed to insert meal: ${(error as Error).message}`);
-    }
+    const result = await createMealEvent(
+        pool,
+        compatibilityCommand(userId, input),
+    );
+    const meal = await getMealProjection(pool, userId, result.event_id);
+    if (!meal) throw new Error("Failed to read created meal event");
+    return { meal: projectionAsMeal(meal), deduplicated: result.deduplicated };
 }
 
 export async function getMealsByDate(
@@ -222,20 +247,11 @@ export async function getMealsByDate(
     date: string,
     tz: string = "UTC",
 ): Promise<Meal[]> {
-    const startUtc = zonedDayStartUtc(date, tz);
-    const endUtc = zonedNextDayStartUtc(date, tz);
-
-    try {
-        const { rows } = await pool.query(
-            `SELECT * FROM meals
-             WHERE user_id = $1 AND logged_at >= $2 AND logged_at < $3
-             ORDER BY logged_at ASC`,
-            [userId, startUtc.toISOString(), endUtc.toISOString()],
-        );
-        return rows.map(mealFromRow);
-    } catch (error) {
-        throw new Error(`Failed to get meals: ${(error as Error).message}`);
-    }
+    const startUtc = zonedDayStartUtc(date, tz).toISOString();
+    const endUtc = zonedNextDayStartUtc(date, tz).toISOString();
+    return (
+        await getMealProjectionsByRange(pool, userId, startUtc, endUtc)
+    ).map(projectionAsMeal);
 }
 
 export async function getMealsInRange(
@@ -244,58 +260,22 @@ export async function getMealsInRange(
     endDate: string,
     tz: string = "UTC",
 ): Promise<Meal[]> {
-    const startUtc = zonedDayStartUtc(startDate, tz);
-    const endUtc = zonedNextDayStartUtc(endDate, tz);
-
-    try {
-        const { rows } = await pool.query(
-            `SELECT * FROM meals
-             WHERE user_id = $1 AND logged_at >= $2 AND logged_at < $3
-             ORDER BY logged_at ASC`,
-            [userId, startUtc.toISOString(), endUtc.toISOString()],
-        );
-        return rows.map(mealFromRow);
-    } catch (error) {
-        throw new Error(`Failed to get meals: ${(error as Error).message}`);
-    }
+    const startUtc = zonedDayStartUtc(startDate, tz).toISOString();
+    const endUtc = zonedNextDayStartUtc(endDate, tz).toISOString();
+    return (
+        await getMealProjectionsByRange(pool, userId, startUtc, endUtc)
+    ).map(projectionAsMeal);
 }
 
 export async function countMeals(userId: string): Promise<number> {
-    try {
-        const { rows } = await pool.query(
-            `SELECT count(*)::int AS count FROM meals WHERE user_id = $1`,
-            [userId],
-        );
-        return (rows[0] as { count: number }).count ?? 0;
-    } catch (error) {
-        throw new Error(`Failed to count meals: ${(error as Error).message}`);
-    }
+    return countMealProjections(pool, userId);
 }
 
 export async function existingIdempotencyKeys(
     userId: string,
     keys: string[],
 ): Promise<Set<string>> {
-    if (keys.length === 0) return new Set();
-    try {
-        const { rows } = await pool.query(
-            `SELECT idempotency_key FROM meals
-             WHERE user_id = $1 AND idempotency_key = ANY($2::text[])`,
-            [userId, keys],
-        );
-        return new Set(
-            rows
-                .map(
-                    (r: { idempotency_key: string | null }) =>
-                        r.idempotency_key,
-                )
-                .filter((k: string | null): k is string => k !== null),
-        );
-    } catch (error) {
-        throw new Error(
-            `Failed to check existing meals: ${(error as Error).message}`,
-        );
-    }
+    return existingMealIdempotencyKeys(pool, userId, keys);
 }
 
 export async function fetchAllPages<T>(
@@ -312,26 +292,7 @@ export async function fetchAllPages<T>(
 }
 
 export async function getAllMeals(userId: string): Promise<Meal[]> {
-    const expected = await countMeals(userId);
-    if (expected === 0) return [];
-
-    const meals = await fetchAllPages<Meal>(async (offset, limit) => {
-        const { rows } = await pool.query(
-            `SELECT * FROM meals
-             WHERE user_id = $1
-             ORDER BY logged_at ASC, id ASC
-             LIMIT $2 OFFSET $3`,
-            [userId, limit, offset],
-        );
-        return rows.map(mealFromRow);
-    });
-
-    if (meals.length < expected) {
-        throw new Error(
-            `getAllMeals: fetched ${meals.length} meals but countMeals reported ${expected} — export would be truncated`,
-        );
-    }
-    return meals;
+    return (await getAllMealProjections(pool, userId)).map(projectionAsMeal);
 }
 
 export async function searchMeals(
@@ -339,70 +300,16 @@ export async function searchMeals(
     queries: string[],
     opts: { limit?: number; sinceIso?: string } = {},
 ): Promise<Meal[]> {
-    const limit = opts.limit ?? 50;
-    const tokenized = queries
-        .map(tokenizeQuery)
-        .filter((tokens) => tokens.length > 0);
-    if (tokenized.length === 0) return [];
-
-    const buildQuery = async (
-        tokens: string[],
-        column: "description" | "notes",
-    ): Promise<Meal[]> => {
-        const params: unknown[] = [userId];
-        const conditions: string[] = ["user_id = $1"];
-
-        let paramIdx = 2;
-        if (opts.sinceIso) {
-            conditions.push(`logged_at >= $${paramIdx}`);
-            params.push(opts.sinceIso);
-            paramIdx++;
-        }
-
-        for (const token of tokens) {
-            conditions.push(`${column} ILIKE $${paramIdx}`);
-            params.push(`%${escapeLikePattern(token)}%`);
-            paramIdx++;
-        }
-
-        const sql = `SELECT * FROM meals WHERE ${conditions.join(" AND ")}
-                     ORDER BY logged_at DESC LIMIT $${paramIdx}`;
-        params.push(limit);
-
-        const { rows } = await pool.query(sql, params);
-        return rows.map(mealFromRow);
-    };
-
-    const results = await Promise.all(
-        tokenized.flatMap((tokens) => [
-            buildQuery(tokens, "description"),
-            buildQuery(tokens, "notes"),
-        ]),
+    return (await searchMealProjections(pool, userId, queries, opts)).map(
+        projectionAsMeal,
     );
-
-    const seen = new Set<string>();
-    const merged: Meal[] = [];
-    for (const meals of results) {
-        for (const meal of meals) {
-            if (!seen.has(meal.id)) {
-                seen.add(meal.id);
-                merged.push(meal);
-            }
-        }
-    }
-    merged.sort((a, b) => b.logged_at.localeCompare(a.logged_at));
-    return merged.slice(0, limit);
 }
 
 export async function deleteMeal(userId: string, id: string): Promise<void> {
-    try {
-        await pool.query(`DELETE FROM meals WHERE id = $1 AND user_id = $2`, [
-            id,
-            userId,
-        ]);
-    } catch (error) {
-        throw new Error(`Failed to delete meal: ${(error as Error).message}`);
-    }
+    await pool.query(
+        `UPDATE meal_events SET status = 'deleted', deleted_at = COALESCE(deleted_at, now()), updated_at = now() WHERE id = $1 AND user_id = $2`,
+        [id, userId],
+    );
 }
 
 export async function updateMeal(
@@ -410,96 +317,39 @@ export async function updateMeal(
     id: string,
     fields: Partial<MealInput>,
 ): Promise<Meal> {
-    const setClauses: string[] = [];
-    const params: unknown[] = [];
-    let paramIdx = 1;
-
-    if (fields.description !== undefined) {
-        setClauses.push(`description = $${paramIdx}`);
-        params.push(decodeEscapeSequences(fields.description));
-        paramIdx++;
-    }
-    if (fields.meal_type !== undefined) {
-        setClauses.push(`meal_type = $${paramIdx}`);
-        params.push(fields.meal_type);
-        paramIdx++;
-    }
-    if (fields.calories !== undefined) {
-        setClauses.push(`calories = $${paramIdx}`);
-        params.push(toStoredInteger(fields.calories));
-        paramIdx++;
-    }
-    if (fields.protein_g !== undefined) {
-        setClauses.push(`protein_g = $${paramIdx}`);
-        params.push(fields.protein_g);
-        paramIdx++;
-    }
-    if (fields.carbs_g !== undefined) {
-        setClauses.push(`carbs_g = $${paramIdx}`);
-        params.push(fields.carbs_g);
-        paramIdx++;
-    }
-    if (fields.fat_g !== undefined) {
-        setClauses.push(`fat_g = $${paramIdx}`);
-        params.push(fields.fat_g);
-        paramIdx++;
-    }
-    if (fields.fiber_g !== undefined) {
-        setClauses.push(`fiber_g = $${paramIdx}`);
-        params.push(fields.fiber_g);
-        paramIdx++;
-    }
-    if (fields.sugar_g !== undefined) {
-        setClauses.push(`sugar_g = $${paramIdx}`);
-        params.push(fields.sugar_g);
-        paramIdx++;
-    }
-    if (fields.alcohol_g !== undefined) {
-        setClauses.push(`alcohol_g = $${paramIdx}`);
-        params.push(fields.alcohol_g);
-        paramIdx++;
-    }
-    if (fields.logged_at !== undefined) {
-        setClauses.push(`logged_at = $${paramIdx}`);
-        params.push(fields.logged_at);
-        paramIdx++;
-    }
-    if (fields.notes !== undefined) {
-        setClauses.push(`notes = $${paramIdx}`);
-        params.push(
-            fields.notes != null
-                ? decodeEscapeSequences(fields.notes)
-                : fields.notes,
-        );
-        paramIdx++;
-    }
-
-    if (setClauses.length === 0) {
-        // Nothing to update — return the existing row.
-        const { rows } = await pool.query(
-            `SELECT * FROM meals WHERE id = $1 AND user_id = $2`,
-            [id, userId],
-        );
-        if (rows.length === 0) {
-            throw new Error("Meal not found");
-        }
-        return mealFromRow(rows[0]!);
-    }
-
-    params.push(id, userId);
-    const sql = `UPDATE meals SET ${setClauses.join(", ")}
-                 WHERE id = $${paramIdx} AND user_id = $${paramIdx + 1}
-                 RETURNING *`;
-
-    try {
-        const { rows } = await pool.query(sql, params);
-        if (rows.length === 0) {
-            throw new Error("Meal not found");
-        }
-        return mealFromRow(rows[0]!);
-    } catch (error) {
-        throw new Error(`Failed to update meal: ${(error as Error).message}`);
-    }
+    const current = await getMealProjection(pool, userId, id);
+    if (!current) throw new Error("Meal not found");
+    const merged: MealInput = {
+        description: fields.description ?? current.description,
+        meal_type:
+            fields.meal_type ?? (current.meal_type as MealInput["meal_type"]),
+        calories: fields.calories ?? current.calories ?? undefined,
+        protein_g: fields.protein_g ?? current.protein_g ?? undefined,
+        carbs_g: fields.carbs_g ?? current.carbs_g ?? undefined,
+        fat_g: fields.fat_g ?? current.fat_g ?? undefined,
+        fiber_g: fields.fiber_g ?? current.fiber_g ?? undefined,
+        sugar_g: fields.sugar_g ?? current.sugar_g ?? undefined,
+        alcohol_g: fields.alcohol_g ?? current.alcohol_g ?? undefined,
+        logged_at: fields.logged_at ?? current.logged_at,
+        notes: fields.notes ?? current.notes ?? undefined,
+    };
+    const cmd = compatibilityCommand(userId, merged);
+    const correction: CorrectMealEventCommand = {
+        event_id: id,
+        correction_idempotency_key: `legacy-update:${id}:${JSON.stringify(fields)}`,
+        correction_reason: "legacy update_meal compatibility correction",
+        items: cmd.items,
+        inputs: cmd.inputs,
+        media: [],
+        provider_results: cmd.provider_results,
+        raw_text_snapshot: merged.description,
+        parser_policy_version: "legacy-compat-v1",
+        created_by: "legacy-update-meal",
+    };
+    await correctMealEvent(pool, correction);
+    const updated = await getMealProjection(pool, userId, id);
+    if (!updated) throw new Error("Meal not found");
+    return projectionAsMeal(updated);
 }
 
 // ============================================================================
@@ -1127,34 +977,35 @@ export async function deleteWeight(
 // ============================================================================
 
 export async function deleteAllUserData(userId: string): Promise<void> {
-    // Delete in dependency order (child tables first).
-    const tables = [
+    const eventChildren = [
+        "meal_event_sync_journal",
+        "meal_event_canonical_results",
+        "meal_event_nutrition_results",
+        "meal_event_media",
+        "meal_event_inputs",
+        "meal_event_items",
+        "meal_event_versions",
+    ] as const;
+    for (const table of eventChildren) {
+        await pool.query(
+            `DELETE FROM ${table} WHERE event_id IN (SELECT id FROM meal_events WHERE user_id = $1)`,
+            [userId],
+        );
+    }
+    await pool.query("DELETE FROM meal_events WHERE user_id = $1", [userId]);
+    for (const table of [
         "tool_analytics",
         "water_log",
         "weight_log",
         "nutrition_goals",
         "profiles",
-        "meals",
-    ] as const;
-
-    for (const table of tables) {
-        try {
-            await pool.query(`DELETE FROM ${table} WHERE user_id = $1`, [
-                userId,
-            ]);
-        } catch (error) {
-            throw new Error(
-                `Failed to delete ${table}: ${(error as Error).message}`,
-            );
-        }
+    ] as const) {
+        await pool.query(`DELETE FROM ${table} WHERE user_id = $1`, [userId]);
     }
 
-    // Clean up any local export file (best-effort; ENOENT is not an error).
     try {
         const exportPath = `./exports/${userId}/meals.csv`;
-        if (existsSync(exportPath)) {
-            unlinkSync(exportPath);
-        }
+        if (existsSync(exportPath)) unlinkSync(exportPath);
     } catch {
         // Ignore — the export file is transient.
     }

@@ -1,6 +1,13 @@
 import { getAllMeals, getUserTimezone, type Meal } from "./db.js";
 import { formatLocalDateTime } from "./tz.js";
-import { readdirSync, statSync, unlinkSync, rmdirSync, mkdirSync, existsSync } from "node:fs";
+import {
+    readdirSync,
+    statSync,
+    unlinkSync,
+    rmdirSync,
+    mkdirSync,
+    existsSync,
+} from "node:fs";
 import { join } from "node:path";
 
 const EXPORT_DIR = "./exports";
@@ -138,7 +145,10 @@ export function sweepStaleExports(): void {
             }
         }
     } catch (err) {
-        console.warn("Export sweep: failed to scan exports dir:", (err as Error).message);
+        console.warn(
+            "Export sweep: failed to scan exports dir:",
+            (err as Error).message,
+        );
         return;
     }
 
