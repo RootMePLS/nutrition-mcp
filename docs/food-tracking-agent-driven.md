@@ -109,6 +109,24 @@ missing until a real bundle is committed. `null` means unavailable evidence,
 while an explicitly stored numeric zero remains zero. Deleted and cross-user
 events are hidden as not found.
 
+## Totals presence contract (NULL vs zero)
+
+The public aggregates (`get_nutrition_summary`, `get_goal_progress`,
+`get_trends`, the log/update-meal progress payloads, the MCP Apps widgets, and
+the `export_meals` CSV) follow the same null-vs-zero rule as the stored rows.
+In every totals payload the four core macros (`calories`, `protein_g`,
+`carbs_g`, `fat_g`) are nullable: a total is `null` only when **no** meal in
+the selection has a calculated value for that nutrient — pending calculations
+and empty days are never coalesced to `0`. A mixed selection sums only the
+calculated values, and every totals payload carries the integer presence
+counts `meals_total` and `meals_calculated` so a partial sum is never mistaken
+for a complete one. An explicitly stored `0` stays `0` end to end. Range
+averages keep the historical denominator (every logged day) but are `null`
+when no day in the window carries the nutrient. Text progress renders a null
+total as `no data yet` (never `0%` of goal, never `NaN`), the widgets render
+`—`/`no data yet` for null and `0` only for a real zero, and the CSV export
+keeps empty cells for missing values.
+
 `commit_calculation_correction` is the public immutable correction boundary. It
 requires a complete validated bundle, explicit confirmation, correction
 reason/author/timestamp, user ownership, and idempotency identity. It appends
