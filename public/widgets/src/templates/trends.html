@@ -144,7 +144,7 @@
                 for (const d of days) {
                     if (d[key] == null) continue;
                     seen++;
-                    sum += d[key] || 0;
+                    sum += d[key];
                 }
                 if (!seen) return null;
                 return sum / seen;

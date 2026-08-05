@@ -59,6 +59,13 @@ test.each(KEYS)("%s inlines each @include'd partial in full", async (key) => {
     }
 });
 
+test("trends widget preserves null and explicit zero averages", async () => {
+    const html = await getWidgetHtml("trends");
+    expect(html).toContain("if (d[key] == null) continue;");
+    expect(html).toContain("sum += d[key];");
+    expect(html).not.toContain("sum += d[key] || 0;");
+});
+
 test("unknown widget key throws", async () => {
     expect(getWidgetHtml("nope")).rejects.toThrow(/unknown widget/);
 });
