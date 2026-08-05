@@ -581,7 +581,7 @@ const FEATURES = `                    <div class="features-grid">
                             <p>
                                 Import your history from another app's CSV
                                 export — parsed in your browser, not by the AI.
-                                Export it all back out, or delete your account,
+                                Export it all back out, or delete it all,
                                 whenever you want.
                             </p>
                         </article>
@@ -627,8 +627,9 @@ const INSTALL = `                    <div class="card install-card">
                                 click <strong>Add</strong>.
                             </li>
                             <li>
-                                Click <strong>Connect</strong>, sign in, and start
-                                logging by saying what you ate.
+                                Click <strong>Connect</strong> and start logging
+                                by saying what you ate. There is no sign-in
+                                step.
                             </li>
                         </ol>
                         <p class="note">
@@ -666,7 +667,7 @@ function faqsFor(app: App): { q: string; a: string }[] {
         },
         {
             q: `How do I connect ${app.name} to Claude?`,
-            a: `There is no official ${app.name} connector for Claude, because ${app.name} has no MCP server or public MCP integration. The closest option is Nutrition MCP, a free MCP server: add https://nutrition-mcp.com/mcp as a custom connector in Claude, sign in, and start logging by conversation.`,
+            a: `There is no official ${app.name} connector for Claude, because ${app.name} has no MCP server or public MCP integration. The closest option is Nutrition MCP, a free MCP server: add https://nutrition-mcp.com/mcp as a custom connector in Claude and start logging by conversation. There is no sign-in step.`,
         },
         ...app.extraFaqs,
         {
@@ -953,9 +954,11 @@ ${app.importSection.body
                         <p class="eyebrow">How to switch</p>
                         <h2 class="section-title">Connect in under a minute</h2>
                         <p class="section-sub">
-                            Works with any MCP client that supports OAuth 2.0
-                            with PKCE. On first connect you create an account
-                            with Google or an email and password.
+                            Connect using a client that supports this server's
+                            remote HTTP MCP endpoint. This checkout does not
+                            implement OAuth, Google or email/password accounts,
+                            account registration, access or refresh tokens, or
+                            authorization codes.
                         </p>
                     </div>
 ${INSTALL}

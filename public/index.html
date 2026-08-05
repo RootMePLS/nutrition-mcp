@@ -83,7 +83,7 @@
                         "name": "Does it work with ChatGPT?",
                         "acceptedAnswer": {
                             "@type": "Answer",
-                            "text": "Yes. In ChatGPT on the web, open Settings → Apps, create a custom app with the server URL https://nutrition-mcp.com/mcp using OAuth, and sign in. It works on every ChatGPT plan."
+                            "text": "Nutrition MCP is a remote HTTP MCP endpoint at https://nutrition-mcp.com/mcp with no sign-in. This checkout does not implement OAuth, Google or email/password accounts, account registration, access or refresh tokens, or authorization codes. Whether ChatGPT connects depends on its support for unauthenticated remote MCP servers."
                         }
                     },
                     {
@@ -91,7 +91,7 @@
                         "name": "Which other clients are supported?",
                         "acceptedAnswer": {
                             "@type": "Answer",
-                            "text": "Any MCP client that supports OAuth 2.0 with PKCE — including Claude.ai, the Claude desktop and mobile apps, Claude Code, Cursor, Windsurf, and VS Code."
+                            "text": "Connect using a client that supports this server's remote HTTP MCP endpoint. This checkout does not implement OAuth, Google or email/password accounts, account registration, access or refresh tokens, or authorization codes. Check your client's documentation for unauthenticated remote server support."
                         }
                     },
                     {
@@ -139,7 +139,7 @@
                         "name": "Is my data private?",
                         "acceptedAnswer": {
                             "@type": "Answer",
-                            "text": "Your data is stored securely and linked to your personal account. Only you can access your nutrition history through your authenticated session. Nutrition MCP does not sell or share your data, and you can delete your account and all data at any time."
+                            "text": "Nutrition MCP stores your logs in a PostgreSQL database and never sells or shares your data. There is no account or sign-in layer: no registration, no password, and no OAuth. You can ask your AI assistant to delete any entry, or all of your stored data, at any time."
                         }
                     }
                 ]
@@ -223,7 +223,7 @@
             <section class="hero">
                 <div class="container hero-grid">
                     <div class="hero-copy">
-                        <p class="eyebrow">Free · Open source · OAuth 2.0</p>
+                        <p class="eyebrow">Free · Open source · No sign-up</p>
                         <h1 class="hero-title">
                             Track your nutrition by <em>talking</em> to your AI.
                         </h1>
@@ -633,10 +633,11 @@
                         <p class="eyebrow">Quick install</p>
                         <h2 class="section-title">Connect in under a minute</h2>
                         <p class="section-sub">
-                            Works with any MCP client that supports OAuth 2.0
-                            with PKCE. On first connect you create an account
-                            with Google or an email and password; sign in the
-                            same way to keep your data.
+                            Connect using a client that supports this server's
+                            remote HTTP MCP endpoint. This checkout does not
+                            implement OAuth, Google or email/password accounts,
+                            account registration, access or refresh tokens, or
+                            authorization codes.
                         </p>
                     </div>
 
@@ -724,9 +725,9 @@
                                     </li>
                                     <li>Click <strong>Add</strong>.</li>
                                     <li>
-                                        Click <strong>Connect</strong> — the
-                                        login page opens; continue with Google
-                                        or sign in with an email and password.
+                                        Click <strong>Connect</strong>. There is
+                                        no login page or sign-in: this checkout
+                                        has no account or authentication layer.
                                     </li>
                                     <li>
                                         Done. It works right away and shows up
@@ -777,8 +778,9 @@
                                     </li>
                                     <li>
                                         For <strong>Authentication</strong>,
-                                        choose <strong>OAuth</strong> — leave
-                                        everything else as it is.
+                                        select the option for no authentication:
+                                        this server does not implement OAuth,
+                                        accounts, or authorization codes.
                                     </li>
                                     <li>
                                         Check
@@ -789,11 +791,10 @@
                                     </li>
                                     <li>Click <strong>Create</strong>.</li>
                                     <li>
-                                        Click
-                                        <strong>Sign in with Nutrition</strong>
-                                        — the login page opens; continue with
-                                        Google or sign in with an email and
-                                        password.
+                                        Start logging by saying what you ate.
+                                        There is no sign-in step: this checkout
+                                        has no login page, accounts, or
+                                        passwords.
                                     </li>
                                     <li>
                                         Done. It works right away and shows up
@@ -822,8 +823,9 @@
                                         >claude mcp add --transport http
                                         nutrition
                                         https://nutrition-mcp.com/mcp</code
-                                    >. Your client handles the OAuth login
-                                    automatically.
+                                    >. There is no login step: this checkout
+                                    does not implement OAuth, accounts, access
+                                    or refresh tokens, or authorization codes.
                                 </p>
                             </div>
                         </div>
@@ -2525,8 +2527,9 @@
                             ></span>
                             <h3>Export &amp; own your data</h3>
                             <p>
-                                Export everything to CSV anytime, and delete
-                                your account and data whenever you want.
+                                Export everything to CSV anytime, and delete any
+                                entry or all of your stored data whenever you
+                                want.
                             </p>
                         </article>
                     </div>
@@ -2623,7 +2626,7 @@
                     <div class="trust-item">
                         <i class="fa-solid fa-trash"></i>
                         <span>Delete instantly</span>
-                        <small>Remove your account &amp; data.</small>
+                        <small>Remove any entry or all stored data.</small>
                     </div>
                 </div>
             </section>
@@ -2767,10 +2770,14 @@
                         <details>
                             <summary>Does it work with ChatGPT?</summary>
                             <p>
-                                Yes. In ChatGPT on the web, open Settings →
-                                Apps, create a custom app with the server URL
-                                using OAuth, and sign in. It works on every
-                                ChatGPT plan.
+                                Nutrition MCP is a remote HTTP MCP endpoint at
+                                https://nutrition-mcp.com/mcp with no sign-in.
+                                This checkout does not implement OAuth, Google
+                                or email/password accounts, account
+                                registration, access or refresh tokens, or
+                                authorization codes. Whether ChatGPT connects
+                                depends on its support for unauthenticated
+                                remote MCP servers.
                             </p>
                         </details>
                         <details>
@@ -2778,10 +2785,13 @@
                                 Which other clients are supported?
                             </summary>
                             <p>
-                                Any MCP client that supports OAuth 2.0 with PKCE
-                                — including Claude.ai, the Claude desktop and
-                                mobile apps, Claude Code, Cursor, Windsurf, and
-                                VS Code.
+                                Connect using a client that supports this
+                                server's remote HTTP MCP endpoint. This checkout
+                                does not implement OAuth, Google or
+                                email/password accounts, account registration,
+                                access or refresh tokens, or authorization
+                                codes. Check your client's documentation for
+                                unauthenticated remote server support.
                             </p>
                         </details>
                         <details>
@@ -2863,12 +2873,12 @@
                         <details>
                             <summary>Is my data private?</summary>
                             <p>
-                                Your data is stored securely and linked to your
-                                personal account. Only you can access your
-                                nutrition history through your authenticated
-                                session. Nutrition MCP does not sell or share
-                                your data, and you can delete your account and
-                                all data at any time.
+                                Nutrition MCP stores your logs in a PostgreSQL
+                                database and never sells or shares your data.
+                                There is no account or sign-in layer: no
+                                registration, no password, and no OAuth. You can
+                                ask your AI assistant to delete any entry, or
+                                all of your stored data, at any time.
                             </p>
                         </details>
                     </div>

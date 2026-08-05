@@ -6,12 +6,12 @@
         <meta charset="utf-8" />
         <meta
             name="description"
-            content="How Nutrition MCP handles your data: what we store, how it is used, where it lives, and how to delete your account and everything in it at any time."
+            content="How Nutrition MCP handles your data: what we store, how it is used, where it lives, and how to delete your stored data at any time."
         />
         <meta property="og:title" content="Privacy Policy — Nutrition MCP" />
         <meta
             property="og:description"
-            content="How Nutrition MCP handles your data: what we store, how it is used, where it lives, and how to delete your account and everything in it at any time."
+            content="How Nutrition MCP handles your data: what we store, how it is used, where it lives, and how to delete your stored data at any time."
         />
         <meta property="og:type" content="website" />
         <meta property="og:url" content="https://nutrition-mcp.com/privacy" />
@@ -23,7 +23,7 @@
         <meta name="twitter:title" content="Privacy Policy — Nutrition MCP" />
         <meta
             name="twitter:description"
-            content="How Nutrition MCP handles your data: what we store, how it is used, where it lives, and how to delete your account and everything in it at any time."
+            content="How Nutrition MCP handles your data: what we store, how it is used, where it lives, and how to delete your stored data at any time."
         />
         <link rel="canonical" href="https://nutrition-mcp.com/privacy" />
         <link rel="icon" href="/favicon.ico" />
@@ -76,16 +76,15 @@
                     <h1 class="auth-title">Privacy Policy</h1>
                 </div>
 
-                <p class="legal-updated">Last updated: July 26, 2026</p>
+                <p class="legal-updated">Last updated: August 6, 2026</p>
 
                 <div class="legal-section">
                     <h2 class="legal-heading">What we collect</h2>
                     <p>
-                        When you register, we store your
-                        <strong>email address</strong> and a securely hashed
-                        password via Supabase Auth. If you sign in with Google
-                        instead, we receive your email address from Google and
-                        never see a password at all.
+                        There is no registration. This checkout has no account
+                        or authentication layer, so we never collect an email
+                        address, a password, or a Google sign-in, and the server
+                        issues no OAuth tokens or authorization codes.
                     </p>
                     <p>When you use the service, we store:</p>
                     <ul>
@@ -122,9 +121,8 @@
                             tool call, which tool ran, whether it succeeded, how
                             long it took, a coarse error category when it
                             failed, the span in days of any date range you asked
-                            for, and the MCP session id. It is linked to your
-                            account id. It never includes the content of your
-                            logs.
+                            for, and the MCP session id. It never includes the
+                            content of your logs.
                         </li>
                     </ul>
                     <p>
@@ -142,13 +140,13 @@
                         whether the setting is on or off, anything already
                         stored stays in the database, and all of it still
                         appears in your CSV export. To actually remove an
-                        alcohol figure, delete the meal it belongs to, or delete
-                        your account.
+                        alcohol figure, delete the meal it belongs to, or remove
+                        all of your stored data as described below.
                     </p>
                     <p>
-                        We also keep the OAuth access and refresh tokens and
-                        authorization codes that let your AI assistant stay
-                        connected to your account.
+                        We do not hold OAuth access tokens, refresh tokens, or
+                        authorization codes: the server has no sign-in layer, so
+                        there are no credentials of that kind to store.
                     </p>
                 </div>
 
@@ -183,11 +181,10 @@
                         <li>
                             <strong>Server telemetry.</strong> Every MCP tool
                             call writes one row of usage telemetry — which tool
-                            ran, whether it succeeded, how long it took — linked
-                            to your account id but not to what you logged. We
-                            use it to find slow and broken tools. It is not
-                            shared with anyone, and it is deleted along with
-                            everything else when you delete your account.
+                            ran, whether it succeeded, how long it took — not
+                            linked to what you logged. We use it to find slow
+                            and broken tools. It is not shared with anyone, and
+                            it is removed by the delete tool described below.
                         </li>
                     </ul>
                     <p>
@@ -201,25 +198,26 @@
                 <div class="legal-section">
                     <h2 class="legal-heading">Where it's stored</h2>
                     <p>
-                        All data is stored in a PostgreSQL database.
-                        Authentication is handled by Supabase Auth. The server
-                        is hosted on DigitalOcean.
+                        All data is stored in a PostgreSQL database. The server
+                        is hosted on DigitalOcean. There is no authentication
+                        provider: this checkout has no account or auth layer.
                     </p>
                 </div>
 
                 <div class="legal-section">
                     <h2 class="legal-heading">Data deletion</h2>
                     <p>
-                        You can delete your account and all associated data at
-                        any time by asking your AI assistant to
-                        <strong>delete your account</strong> while connected to
-                        the Nutrition MCP server. This action is immediate and
-                        irreversible. It removes your meals, water and weight
-                        logs, goals, profile settings, any stored CSV export,
-                        your tool-usage telemetry, your access tokens, and the
-                        account itself. That includes every alcohol figure you
-                        ever logged, whether or not alcohol tracking was
-                        switched on.
+                        Because there is no account system, there is no account
+                        to close. You can ask your AI assistant to delete
+                        individual meals, water, or weight entries at any time.
+                        To remove everything, ask it to
+                        <strong>delete all of your data</strong>: the server's
+                        delete tool permanently removes your meal, water and
+                        weight logs, goals, profile settings, tool-usage
+                        telemetry, and any stored CSV export. That action is
+                        immediate and irreversible, and it includes every
+                        alcohol figure you ever logged, whether or not alcohol
+                        tracking was switched on.
                     </p>
                 </div>
 
