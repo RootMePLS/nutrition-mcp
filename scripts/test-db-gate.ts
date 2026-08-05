@@ -28,6 +28,7 @@ const suites = [
     "src/mcp-food-tracking.test.ts",
     "src/backup-policy.test.ts",
     "src/legacy-meal-tools.integration.test.ts",
+    "src/calculation-acceptance.integration.test.ts",
 ];
 const env = {
     ...process.env,
