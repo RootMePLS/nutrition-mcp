@@ -1420,6 +1420,132 @@ export const ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA = z
     })
     .strict();
 
+// ---------------------------------------------------------------------------
+// Structured-output contracts for the water, weight and widget-display tools
+// (S6 sweep). The entry objects are shared by every tool that returns them so
+// the declared shape cannot drift between the log and read paths, and the
+// serializers are the only places entry literals are built. Nullable fields
+// are emitted as required-with-null so an omitted key is a validation error
+// rather than a silent undefined. Exported so transport tests can parse real
+// structuredContent against the exact declared contract.
+// ---------------------------------------------------------------------------
+
+export const WATER_ENTRY_OUTPUT_SCHEMA = z
+    .object({
+        id: z.string(),
+        amount_ml: z.number(),
+        logged_at: z.string(),
+        notes: z.string().nullable(),
+    })
+    .strict();
+
+export function waterEntryPayload(entry: WaterEntry) {
+    return {
+        id: entry.id,
+        amount_ml: entry.amount_ml,
+        logged_at: entry.logged_at,
+        notes: entry.notes,
+    };
+}
+
+export const LOG_WATER_OUTPUT_SCHEMA = {
+    deduplicated: z.boolean(),
+    entry: WATER_ENTRY_OUTPUT_SCHEMA,
+};
+
+export const WATER_DAY_OUTPUT_SCHEMA = {
+    date: z.string(),
+    total_ml: z.number(),
+    entries: z.array(WATER_ENTRY_OUTPUT_SCHEMA),
+};
+
+export const DELETE_WATER_OUTPUT_SCHEMA = {
+    id: z.string(),
+    deleted: z.boolean(),
+};
+
+export const WEIGHT_ENTRY_OUTPUT_SCHEMA = z
+    .object({
+        id: z.string(),
+        weight_g: z.number(),
+        logged_at: z.string(),
+        notes: z.string().nullable(),
+    })
+    .strict();
+
+export function weightEntryPayload(entry: WeightEntry) {
+    return {
+        id: entry.id,
+        weight_g: entry.weight_g,
+        logged_at: entry.logged_at,
+        notes: entry.notes,
+    };
+}
+
+const WEIGHT_UNIT_FIELD = z.enum(["kg", "lb"]);
+
+export const LOG_WEIGHT_OUTPUT_SCHEMA = {
+    deduplicated: z.boolean(),
+    unit: WEIGHT_UNIT_FIELD,
+    entry: WEIGHT_ENTRY_OUTPUT_SCHEMA,
+};
+
+// Shared by get_weight_today and get_weight_by_date: identical payload, with
+// the resolved local date included either way.
+export const WEIGHT_DAY_OUTPUT_SCHEMA = {
+    date: z.string(),
+    unit: WEIGHT_UNIT_FIELD,
+    entries: z.array(WEIGHT_ENTRY_OUTPUT_SCHEMA),
+};
+
+export const WEIGHT_RANGE_OUTPUT_SCHEMA = {
+    start_date: z.string(),
+    end_date: z.string(),
+    unit: WEIGHT_UNIT_FIELD,
+    days: z.array(
+        z
+            .object({
+                date: z.string(),
+                average_weight_g: z.number(),
+                entries: z.array(WEIGHT_ENTRY_OUTPUT_SCHEMA),
+            })
+            .strict(),
+    ),
+};
+
+export const UPDATE_WEIGHT_OUTPUT_SCHEMA = {
+    unit: WEIGHT_UNIT_FIELD,
+    entry: WEIGHT_ENTRY_OUTPUT_SCHEMA,
+};
+
+export const DELETE_WEIGHT_OUTPUT_SCHEMA = {
+    id: z.string(),
+    deleted: z.boolean(),
+};
+
+// get_weight_trends: the widget-facing contract, hoisted from the inline
+// declaration so the shape has one exported source of truth. Unchanged —
+// the weight-trends widget consumes exactly these fields.
+export const WEIGHT_TRENDS_OUTPUT_SCHEMA = {
+    end_date: z.string(),
+    unit: z.string(),
+    target: z.number().nullable(),
+    default_range: z.number(),
+    // Per-day weight (same-day weigh-ins averaged) in display units, for
+    // logged days within the last 30 days; the widget slices 7/14/30.
+    days: z.array(
+        z.object({
+            date: z.string(),
+            weight: z.number(),
+        }),
+    ),
+};
+
+// Shared by set_widget_display and get_widget_display.
+export const WIDGET_DISPLAY_OUTPUT_SCHEMA = {
+    widgets_enabled: z.boolean(),
+};
+
 // One media store per process. MEDIA_ROOT is resolved lazily so tests that
 // inject their own store never touch the real root; buildMcpServer reaches
 // this through registerTools' deps default, which is what src/index.ts's
@@ -2988,6 +3114,7 @@ export function registerTools(
                         "Optional stable key for safe retries. You normally don't need to set this: when omitted, the server derives a stable key from the entry content (including logged_at), so replaying the identical call returns the original entry instead of duplicating it. Pass a UUID only to force-override that behavior. Do NOT reuse a key for genuinely different sips.",
                     ),
             },
+            outputSchema: LOG_WATER_OUTPUT_SCHEMA,
         },
         async (args) => {
             return withAnalytics(
@@ -3007,6 +3134,10 @@ export function registerTools(
                                 text: `${prefix}: ${entry.amount_ml} ml at ${entry.logged_at}${entry.notes ? ` (${entry.notes})` : ""}. ID: ${entry.id}`,
                             },
                         ],
+                        structuredContent: {
+                            deduplicated,
+                            entry: waterEntryPayload(entry),
+                        },
                     };
                 },
                 { userId },
@@ -3081,6 +3212,7 @@ export function registerTools(
             inputSchema: {
                 date: z.string().describe("Date in YYYY-MM-DD format"),
             },
+            outputSchema: WATER_DAY_OUTPUT_SCHEMA,
         },
         async ({ date }) => {
             return withAnalytics(
@@ -3096,6 +3228,11 @@ export function registerTools(
                                     text: `No water logged on ${date}.`,
                                 },
                             ],
+                            structuredContent: {
+                                date,
+                                total_ml: 0,
+                                entries: [],
+                            },
                         };
                     }
                     const total = sumWater(entries);
@@ -3110,6 +3247,11 @@ export function registerTools(
                                 text: `Total on ${date}: ${total} ml (${entries.length} entr${entries.length === 1 ? "y" : "ies"})\n\n${lines.join("\n")}`,
                             },
                         ],
+                        structuredContent: {
+                            date,
+                            total_ml: total,
+                            entries: entries.map(waterEntryPayload),
+                        },
                     };
                 },
                 { userId },
@@ -3132,19 +3274,23 @@ export function registerTools(
             inputSchema: {
                 id: z.string().describe("UUID of the water entry to delete"),
             },
+            outputSchema: DELETE_WATER_OUTPUT_SCHEMA,
         },
         async ({ id }) => {
             return withAnalytics(
                 "delete_water",
                 async () => {
-                    await deleteWater(userId, id);
+                    const deleted = await deleteWater(userId, id);
                     return {
                         content: [
                             {
                                 type: "text",
-                                text: `Water entry ${id} deleted.`,
+                                text: deleted
+                                    ? `Water entry ${id} deleted.`
+                                    : `No water entry found with id ${id}.`,
                             },
                         ],
+                        structuredContent: { id, deleted },
                     };
                 },
                 { userId },
@@ -3196,6 +3342,7 @@ export function registerTools(
                         "Optional stable key for safe retries. You normally don't need to set this: when omitted, the server derives a stable key from the entry content (including logged_at), so replaying the identical call returns the original entry instead of duplicating it. Pass a UUID only to force-override that behavior.",
                     ),
             },
+            outputSchema: LOG_WEIGHT_OUTPUT_SCHEMA,
         },
         async (args) => {
             return withAnalytics(
@@ -3225,6 +3372,11 @@ export function registerTools(
                                 text: `${prefix}: ${formatWeight(entry.weight_g, unit)} at ${entry.logged_at}${entry.notes ? ` (${entry.notes})` : ""}. ID: ${entry.id}`,
                             },
                         ],
+                        structuredContent: {
+                            deduplicated,
+                            unit,
+                            entry: weightEntryPayload(entry),
+                        },
                     };
                 },
                 { userId },
@@ -3244,6 +3396,7 @@ export function registerTools(
                 idempotentHint: true,
                 openWorldHint: false,
             },
+            outputSchema: WEIGHT_DAY_OUTPUT_SCHEMA,
         },
         async () => {
             return withAnalytics(
@@ -3254,11 +3407,8 @@ export function registerTools(
                         getPreferredWeightUnit(userId),
                     ]);
                     const unit = weightPref ?? "kg";
-                    const entries = await getWeightByDate(
-                        userId,
-                        todayInTz(tz),
-                        tz,
-                    );
+                    const today = todayInTz(tz);
+                    const entries = await getWeightByDate(userId, today, tz);
                     if (entries.length === 0) {
                         return {
                             content: [
@@ -3267,6 +3417,11 @@ export function registerTools(
                                     text: "No weight logged today.",
                                 },
                             ],
+                            structuredContent: {
+                                date: today,
+                                unit,
+                                entries: [],
+                            },
                         };
                     }
                     const lines = entries.map((e) =>
@@ -3279,6 +3434,11 @@ export function registerTools(
                                 text: `Today (${entries.length} entr${entries.length === 1 ? "y" : "ies"}):\n\n${lines.join("\n")}`,
                             },
                         ],
+                        structuredContent: {
+                            date: today,
+                            unit,
+                            entries: entries.map(weightEntryPayload),
+                        },
                     };
                 },
                 { userId },
@@ -3301,6 +3461,7 @@ export function registerTools(
             inputSchema: {
                 date: z.string().describe("Date in YYYY-MM-DD format"),
             },
+            outputSchema: WEIGHT_DAY_OUTPUT_SCHEMA,
         },
         async ({ date }) => {
             return withAnalytics(
@@ -3320,6 +3481,11 @@ export function registerTools(
                                     text: `No weight logged on ${date}.`,
                                 },
                             ],
+                            structuredContent: {
+                                date,
+                                unit,
+                                entries: [],
+                            },
                         };
                     }
                     const lines = entries.map((e) =>
@@ -3332,6 +3498,11 @@ export function registerTools(
                                 text: `${date} (${entries.length} entr${entries.length === 1 ? "y" : "ies"}):\n\n${lines.join("\n")}`,
                             },
                         ],
+                        structuredContent: {
+                            date,
+                            unit,
+                            entries: entries.map(weightEntryPayload),
+                        },
                     };
                 },
                 { userId },
@@ -3356,6 +3527,7 @@ export function registerTools(
                 start_date: z.string().describe("Start date (YYYY-MM-DD)"),
                 end_date: z.string().describe("End date (YYYY-MM-DD)"),
             },
+            outputSchema: WEIGHT_RANGE_OUTPUT_SCHEMA,
         },
         async ({ start_date, end_date }) => {
             return withAnalytics(
@@ -3380,6 +3552,12 @@ export function registerTools(
                                     text: `No weight found between ${start_date} and ${end_date}.`,
                                 },
                             ],
+                            structuredContent: {
+                                start_date,
+                                end_date,
+                                unit,
+                                days: [],
+                            },
                         };
                     }
 
@@ -3392,6 +3570,11 @@ export function registerTools(
                     }
 
                     const sections: string[] = [];
+                    const days: {
+                        date: string;
+                        average_weight_g: number;
+                        entries: ReturnType<typeof weightEntryPayload>[];
+                    }[] = [];
                     for (const [date, dayEntries] of [
                         ...byDate.entries(),
                     ].sort()) {
@@ -3406,6 +3589,11 @@ export function registerTools(
                             .map((e) => formatWeightEntry(e, unit))
                             .join("\n");
                         sections.push(`${header}\n${formatted}`);
+                        days.push({
+                            date,
+                            average_weight_g: avgG,
+                            entries: dayEntries.map(weightEntryPayload),
+                        });
                     }
 
                     return {
@@ -3415,6 +3603,12 @@ export function registerTools(
                                 text: sections.join("\n\n"),
                             },
                         ],
+                        structuredContent: {
+                            start_date,
+                            end_date,
+                            unit,
+                            days,
+                        },
                     };
                 },
                 { userId },
@@ -3448,20 +3642,7 @@ export function registerTools(
                     .optional()
                     .describe("Window end date YYYY-MM-DD (default today)."),
             },
-            outputSchema: {
-                end_date: z.string(),
-                unit: z.string(),
-                target: z.number().nullable(),
-                default_range: z.number(),
-                // Per-day weight (same-day weigh-ins averaged) in display units,
-                // for logged days within the last 30 days; widget slices 7/14/30.
-                days: z.array(
-                    z.object({
-                        date: z.string(),
-                        weight: z.number(),
-                    }),
-                ),
-            },
+            outputSchema: WEIGHT_TRENDS_OUTPUT_SCHEMA,
             // Link the tool to its interactive weight-trends UI (MCP Apps).
             ...uiMeta(WEIGHT_TRENDS_WIDGET_URI),
         },
@@ -3587,6 +3768,7 @@ export function registerTools(
                 logged_at: z.string().optional().describe("ISO 8601 timestamp"),
                 notes: z.string().optional(),
             },
+            outputSchema: UPDATE_WEIGHT_OUTPUT_SCHEMA,
         },
         async ({ id, weight, unit, logged_at, notes }) => {
             return withAnalytics(
@@ -3625,6 +3807,10 @@ export function registerTools(
                                 text: `Weight updated:\n${formatWeightEntry(entry, displayUnit)}`,
                             },
                         ],
+                        structuredContent: {
+                            unit: displayUnit,
+                            entry: weightEntryPayload(entry),
+                        },
                     };
                 },
                 { userId },
@@ -3646,6 +3832,7 @@ export function registerTools(
             inputSchema: {
                 id: z.string().describe("UUID of the weight entry to delete"),
             },
+            outputSchema: DELETE_WEIGHT_OUTPUT_SCHEMA,
         },
         async ({ id }) => {
             return withAnalytics(
@@ -3661,6 +3848,7 @@ export function registerTools(
                                     : `No weight entry found with id ${id}.`,
                             },
                         ],
+                        structuredContent: { id, deleted },
                     };
                 },
                 { userId },
@@ -3770,6 +3958,7 @@ export function registerTools(
                         "true to show widgets (default), false for text-only responses with no widget.",
                     ),
             },
+            outputSchema: WIDGET_DISPLAY_OUTPUT_SCHEMA,
         },
         async ({ enabled }) => {
             return withAnalytics(
@@ -3787,6 +3976,9 @@ export function registerTools(
                                     : "Widgets disabled. Supported tools will return text and data only, with no widget, in new conversations.",
                             },
                         ],
+                        structuredContent: {
+                            widgets_enabled: profile.widgets_enabled,
+                        },
                     };
                 },
                 { userId },
@@ -3806,6 +3998,7 @@ export function registerTools(
                 idempotentHint: true,
                 openWorldHint: false,
             },
+            outputSchema: WIDGET_DISPLAY_OUTPUT_SCHEMA,
         },
         async () => {
             return withAnalytics(
@@ -3821,6 +4014,7 @@ export function registerTools(
                                     : "Widgets are disabled. Supported tools return text and data only.",
                             },
                         ],
+                        structuredContent: { widgets_enabled: enabled },
                     };
                 },
                 { userId },
@@ -5167,7 +5361,7 @@ async function buildMcpServer(c: Context, userId: string): Promise<McpServer> {
     const server = new McpServer(
         {
             name: "nutrition-mcp",
-            version: "1.23.2",
+            version: "1.23.3",
             icons: [
                 {
                     src: `${baseUrl}/favicon.ico`,

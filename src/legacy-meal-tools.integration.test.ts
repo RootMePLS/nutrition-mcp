@@ -12,6 +12,19 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Pool } from "pg";
 import { registerTools, TOTALS_ITEM, TRENDS_DAY_ITEM } from "./mcp.js";
+import {
+    LOG_WATER_OUTPUT_SCHEMA,
+    WATER_DAY_OUTPUT_SCHEMA,
+    DELETE_WATER_OUTPUT_SCHEMA,
+    LOG_WEIGHT_OUTPUT_SCHEMA,
+    WEIGHT_DAY_OUTPUT_SCHEMA,
+    WEIGHT_RANGE_OUTPUT_SCHEMA,
+    UPDATE_WEIGHT_OUTPUT_SCHEMA,
+    DELETE_WEIGHT_OUTPUT_SCHEMA,
+    WEIGHT_TRENDS_OUTPUT_SCHEMA,
+    WIDGET_DISPLAY_OUTPUT_SCHEMA,
+    START_IMPORT_OUTPUT_SCHEMA,
+} from "./mcp.js";
 import { z } from "zod";
 import { flushAnalytics } from "./analytics.js";
 import { MEAL_PROGRESS_OUTPUT_SCHEMA } from "./mcp.js";
@@ -61,6 +74,7 @@ async function callTools(
             name: string,
             args?: Record<string, unknown>,
         ) => Promise<ToolResult>,
+        client: Client,
     ) => Promise<void>,
     userId = "u1",
 ): Promise<void> {
@@ -85,6 +99,7 @@ async function callTools(
                     name,
                     arguments: args,
                 }) as Promise<ToolResult>,
+            client,
         );
     } finally {
         await client.close();
@@ -1985,6 +2000,308 @@ describeDb("legacy meal MCP tools use the event projection", () => {
             });
         },
     );
+});
+
+// ---------------------------------------------------------------------------
+// S6 structured-output contract sweep. Every tool in the planned sweep must
+// (a) advertise a declared outputSchema over listTools and (b) return runtime
+// structuredContent on EVERY successful path, parseable by the exact exported
+// declared schema.
+// ---------------------------------------------------------------------------
+
+const S6_SWEEP_OUTPUT_SCHEMAS = {
+    log_water: LOG_WATER_OUTPUT_SCHEMA,
+    get_water_by_date: WATER_DAY_OUTPUT_SCHEMA,
+    delete_water: DELETE_WATER_OUTPUT_SCHEMA,
+    log_weight: LOG_WEIGHT_OUTPUT_SCHEMA,
+    get_weight_today: WEIGHT_DAY_OUTPUT_SCHEMA,
+    get_weight_by_date: WEIGHT_DAY_OUTPUT_SCHEMA,
+    get_weight_by_date_range: WEIGHT_RANGE_OUTPUT_SCHEMA,
+    update_weight: UPDATE_WEIGHT_OUTPUT_SCHEMA,
+    delete_weight: DELETE_WEIGHT_OUTPUT_SCHEMA,
+    get_weight_trends: WEIGHT_TRENDS_OUTPUT_SCHEMA,
+    start_meal_import: START_IMPORT_OUTPUT_SCHEMA,
+    set_widget_display: WIDGET_DISPLAY_OUTPUT_SCHEMA,
+    get_widget_display: WIDGET_DISPLAY_OUTPUT_SCHEMA,
+};
+
+type S6SweepTool = keyof typeof S6_SWEEP_OUTPUT_SCHEMAS;
+
+function parseS6Structured(
+    tool: S6SweepTool,
+    result: ToolResult,
+): Record<string, unknown> {
+    expect(result.isError, `${tool} returned an MCP error`).not.toBe(true);
+    expect(
+        result.structuredContent,
+        `${tool} returned no structuredContent`,
+    ).toBeDefined();
+    const shape = S6_SWEEP_OUTPUT_SCHEMAS[tool];
+    expect(shape, `${tool} exports no declared output schema`).toBeDefined();
+    return z.object(shape).strict().parse(result.structuredContent);
+}
+
+describeDb("S6 sweep tools declare and return structured outputs", () => {
+    let pool: Pool;
+
+    beforeAll(() => {
+        pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        activePool = pool;
+    });
+
+    afterAll(async () => {
+        activePool = null;
+        await pool.end();
+    });
+
+    afterEach(async () => {
+        await flushAnalytics();
+    });
+
+    beforeEach(async () => {
+        const client = await pool.connect();
+        try {
+            await client.query(
+                "DROP SCHEMA public CASCADE; CREATE SCHEMA public;",
+            );
+            for (const migration of migrations) {
+                await client.query(
+                    await Bun.file(`db/migrations/${migration}`).text(),
+                );
+            }
+        } finally {
+            client.release();
+        }
+    });
+
+    test("inventory: every sweep tool advertises a declared outputSchema", async () => {
+        expect(Object.keys(S6_SWEEP_OUTPUT_SCHEMAS)).toHaveLength(13);
+        await callTools(async (_call, client) => {
+            const { tools } = await client.listTools();
+            const byName = new Map(tools.map((t) => [t.name, t]));
+            for (const name of Object.keys(S6_SWEEP_OUTPUT_SCHEMAS)) {
+                const tool = byName.get(name);
+                expect(tool, `${name} is not registered`).toBeDefined();
+                expect(
+                    tool!.outputSchema,
+                    `${name} advertises no outputSchema`,
+                ).toBeDefined();
+            }
+        });
+    });
+
+    test("water tools return parseable structuredContent on every success path", async () => {
+        await callTools(async (call) => {
+            const logged = await call("log_water", {
+                amount_ml: 250,
+                logged_at: "2026-08-05T08:00:00.000Z",
+                notes: "tea",
+            });
+            const loggedParsed = parseS6Structured("log_water", logged);
+            expect(loggedParsed.deduplicated).toBe(false);
+            const entry = loggedParsed.entry as Record<string, unknown>;
+            expect(entry.amount_ml).toBe(250);
+            expect(entry.notes).toBe("tea");
+            const entryId = entry.id as string;
+
+            const replayed = await call("log_water", {
+                amount_ml: 250,
+                logged_at: "2026-08-05T08:00:00.000Z",
+                notes: "tea",
+            });
+            expect(parseS6Structured("log_water", replayed).deduplicated).toBe(
+                true,
+            );
+
+            const day = await call("get_water_by_date", {
+                date: "2026-08-05",
+            });
+            const dayParsed = parseS6Structured("get_water_by_date", day);
+            expect(dayParsed.date).toBe("2026-08-05");
+            expect(dayParsed.total_ml).toBe(250);
+            expect(dayParsed.entries).toHaveLength(1);
+
+            // The empty-day success path must carry structured content too.
+            const empty = await call("get_water_by_date", {
+                date: "2026-08-04",
+            });
+            const emptyParsed = parseS6Structured("get_water_by_date", empty);
+            expect(emptyParsed.total_ml).toBe(0);
+            expect(emptyParsed.entries).toEqual([]);
+
+            const deleted = await call("delete_water", { id: entryId });
+            expect(parseS6Structured("delete_water", deleted).deleted).toBe(
+                true,
+            );
+            const missing = await call("delete_water", { id: entryId });
+            expect(parseS6Structured("delete_water", missing).deleted).toBe(
+                false,
+            );
+        });
+    });
+
+    test("weight log and date reads return parseable structuredContent", async () => {
+        await callTools(async (call) => {
+            const first = await call("log_weight", {
+                weight: 80,
+                unit: "kg",
+                logged_at: "2026-08-05T07:00:00.000Z",
+                notes: "fasted",
+            });
+            const firstParsed = parseS6Structured("log_weight", first);
+            expect(firstParsed.deduplicated).toBe(false);
+            expect(firstParsed.unit).toBe("kg");
+            const firstEntry = firstParsed.entry as Record<string, unknown>;
+            expect(firstEntry.weight_g).toBe(80000);
+            expect(firstEntry.notes).toBe("fasted");
+
+            await call("log_weight", {
+                weight: 82,
+                unit: "kg",
+                logged_at: "2026-08-05T19:00:00.000Z",
+            });
+            await call("log_weight", {
+                weight: 180,
+                unit: "lb",
+                logged_at: "2026-08-04T07:30:00.000Z",
+            });
+
+            const byDate = await call("get_weight_by_date", {
+                date: "2026-08-05",
+            });
+            const byDateParsed = parseS6Structured(
+                "get_weight_by_date",
+                byDate,
+            );
+            expect(byDateParsed.date).toBe("2026-08-05");
+            expect(byDateParsed.unit).toBe("kg");
+            expect(byDateParsed.entries).toHaveLength(2);
+
+            // The empty-day success path must carry structured content too.
+            const empty = await call("get_weight_by_date", {
+                date: "2026-08-03",
+            });
+            const emptyParsed = parseS6Structured("get_weight_by_date", empty);
+            expect(emptyParsed.entries).toEqual([]);
+
+            const range = await call("get_weight_by_date_range", {
+                start_date: "2026-08-04",
+                end_date: "2026-08-05",
+            });
+            const rangeParsed = parseS6Structured(
+                "get_weight_by_date_range",
+                range,
+            );
+            expect(rangeParsed.start_date).toBe("2026-08-04");
+            expect(rangeParsed.end_date).toBe("2026-08-05");
+            const days = rangeParsed.days as Record<string, unknown>[];
+            expect(days).toHaveLength(2);
+            const aug5 = days.find((d) => d.date === "2026-08-05")!;
+            expect(aug5.average_weight_g).toBe(81000);
+            expect(aug5.entries).toHaveLength(2);
+
+            // The empty-range success path must carry structured content too.
+            const emptyRange = await call("get_weight_by_date_range", {
+                start_date: "2026-08-01",
+                end_date: "2026-08-02",
+            });
+            expect(
+                parseS6Structured("get_weight_by_date_range", emptyRange).days,
+            ).toEqual([]);
+        });
+    });
+
+    test("weight today/update/delete return parseable structuredContent", async () => {
+        await callTools(async (call) => {
+            const logged = await call("log_weight", {
+                weight: 80,
+                unit: "kg",
+                logged_at: new Date().toISOString(),
+            });
+            const entry = parseS6Structured("log_weight", logged)
+                .entry as Record<string, unknown>;
+            const entryId = entry.id as string;
+
+            const today = await call("get_weight_today");
+            const todayParsed = parseS6Structured("get_weight_today", today);
+            expect(todayParsed.unit).toBe("kg");
+            expect(todayParsed.entries).toHaveLength(1);
+
+            const updated = await call("update_weight", {
+                id: entryId,
+                weight: 81,
+                unit: "kg",
+            });
+            const updatedParsed = parseS6Structured("update_weight", updated);
+            expect(updatedParsed.unit).toBe("kg");
+            expect(
+                (updatedParsed.entry as Record<string, unknown>).weight_g,
+            ).toBe(81000);
+
+            const deleted = await call("delete_weight", { id: entryId });
+            expect(parseS6Structured("delete_weight", deleted).deleted).toBe(
+                true,
+            );
+            const missing = await call("delete_weight", { id: entryId });
+            expect(parseS6Structured("delete_weight", missing).deleted).toBe(
+                false,
+            );
+        });
+    });
+
+    test("get_weight_trends returns parseable structuredContent", async () => {
+        await callTools(async (call) => {
+            await call("log_weight", {
+                weight: 80,
+                unit: "kg",
+                logged_at: new Date().toISOString(),
+            });
+            const trends = await call("get_weight_trends", { days: 30 });
+            const parsed = parseS6Structured("get_weight_trends", trends);
+            expect(parsed.unit).toBe("kg");
+            expect(parsed.target).toBeNull();
+            expect(parsed.default_range).toBe(30);
+            expect(
+                (parsed.days as Record<string, unknown>[]).length,
+            ).toBeGreaterThan(0);
+        });
+    });
+
+    test("widget display tools return parseable structuredContent", async () => {
+        await callTools(async (call) => {
+            const disabled = await call("set_widget_display", {
+                enabled: false,
+            });
+            expect(
+                parseS6Structured("set_widget_display", disabled)
+                    .widgets_enabled,
+            ).toBe(false);
+
+            const readBack = await call("get_widget_display");
+            expect(
+                parseS6Structured("get_widget_display", readBack)
+                    .widgets_enabled,
+            ).toBe(false);
+
+            const enabled = await call("set_widget_display", {
+                enabled: true,
+            });
+            expect(
+                parseS6Structured("set_widget_display", enabled)
+                    .widgets_enabled,
+            ).toBe(true);
+        });
+    });
+
+    test("start_meal_import returns parseable structuredContent", async () => {
+        await callTools(async (call) => {
+            const result = await call("start_meal_import");
+            const parsed = parseS6Structured("start_meal_import", result);
+            expect(parsed.import_tool_name).toBe("bulk_import_meals");
+            expect(parsed.widgets_enabled).toBe(false);
+            expect(parsed.tz_configured).toBe(false);
+        });
+    });
 });
 
 function publicBundle(

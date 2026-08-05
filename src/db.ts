@@ -838,12 +838,16 @@ export async function getWaterInRange(
     }
 }
 
-export async function deleteWater(userId: string, id: string): Promise<void> {
+export async function deleteWater(
+    userId: string,
+    id: string,
+): Promise<boolean> {
     try {
-        await pool.query(
-            `DELETE FROM water_log WHERE id = $1 AND user_id = $2`,
+        const { rows } = await pool.query(
+            `DELETE FROM water_log WHERE id = $1 AND user_id = $2 RETURNING id`,
             [id, userId],
         );
+        return rows.length > 0;
     } catch (error) {
         throw new Error(`Failed to delete water: ${(error as Error).message}`);
     }
