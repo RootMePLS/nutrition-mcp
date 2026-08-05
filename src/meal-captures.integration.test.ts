@@ -1,7 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Pool, type PoolClient } from "pg";
 import {
     appendCaptureMessage,
+    attachCaptureMediaBytes,
     cancelMealCapture,
     confirmMealCapture,
     expireMealCapture,
@@ -11,6 +15,7 @@ import {
     savePreparedDraft,
     startMealCapture,
 } from "./meal-captures.js";
+import { createMediaStore, type MediaStore } from "./media-store.js";
 import type { PreparedMealDraft } from "./meal-capture-types.js";
 
 const url = process.env.DATABASE_URL_TEST;
@@ -302,5 +307,265 @@ describeDb("durable meal capture lifecycle", () => {
             items: "2",
             media: "1",
         });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// attachCaptureMediaBytes: real byte lifecycle against real PostgreSQL and a
+// real temporary filesystem media root. Assertions read the filesystem bytes
+// and recompute the hash — never DB metadata alone.
+// ---------------------------------------------------------------------------
+
+const PNG_BYTES = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4,
+]);
+const PNG_BASE64 = Buffer.from(PNG_BYTES).toString("base64");
+
+function sha256HexOf(bytes: Uint8Array): string {
+    return new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+}
+
+// Pool wrapper whose client rejects the media INSERT once armed — injects a
+// failure between byte staging and COMMIT without touching production code.
+function poolFailingMediaInsert(pool: Pool): Pool {
+    const proxy = Object.create(pool) as Pool;
+    proxy.connect = async () => {
+        const client = await pool.connect();
+        const realQuery = client.query.bind(client);
+        return new Proxy(client, {
+            get(target, prop, receiver) {
+                if (prop === "query") {
+                    return (text: unknown, ...rest: unknown[]) => {
+                        if (
+                            typeof text === "string" &&
+                            text.includes("INSERT INTO meal_capture_media")
+                        ) {
+                            return Promise.reject(
+                                new Error("injected media insert failure"),
+                            );
+                        }
+                        return (realQuery as any)(text, ...rest);
+                    };
+                }
+                return Reflect.get(target, prop, receiver);
+            },
+        });
+    };
+    return proxy;
+}
+
+async function mediaRootFiles(root: string): Promise<string[]> {
+    try {
+        const entries = await readdir(root, { recursive: true });
+        return entries
+            .map((entry) => entry.toString())
+            .filter((entry) =>
+                /(?:^|\/)(?:photo|audio)-[0-9a-f]{64}$/.test(entry),
+            )
+            .sort();
+    } catch {
+        return [];
+    }
+}
+
+describeDb("capture media byte lifecycle (attachCaptureMediaBytes)", () => {
+    let pool: Pool;
+    let mediaRoot: string;
+    let mediaStore: MediaStore;
+    beforeAll(async () => {
+        pool = new Pool({ connectionString: url, max: 8 });
+        const client = await pool.connect();
+        try {
+            await migrate(client);
+        } finally {
+            client.release();
+        }
+        mediaRoot = await mkdtemp(join(tmpdir(), "capture-media-test-"));
+        mediaStore = createMediaStore(mediaRoot);
+    });
+    afterAll(async () => {
+        await pool.end();
+        await rm(mediaRoot, { recursive: true, force: true });
+    });
+
+    const startCapture = (key: string) =>
+        startMealCapture(pool, {
+            user_id: "media-user",
+            conversation_key: key,
+            idempotency_key: key,
+        });
+
+    test("happy path: stages bytes, persists row, on-disk hash matches", async () => {
+        const capture = await startCapture("media-happy");
+        const result = await attachCaptureMediaBytes(
+            pool,
+            mediaStore,
+            capture.capture_id,
+            "media-user",
+            { kind: "photo", mime_type: "image/png", bytes_base64: PNG_BASE64 },
+        );
+        expect(result.deduplicated).toBe(false);
+        expect(result.capture_state).toBe("receiving");
+        expect(result.sha256).toBe(sha256HexOf(PNG_BYTES));
+        expect(result.byte_size).toBe(PNG_BYTES.byteLength);
+        expect(result.storage_key).toBe(
+            `capture/${capture.capture_id}/photo-${result.sha256}`,
+        );
+        // Filesystem truth: the file exists and its bytes recompute to the
+        // returned hash.
+        const path = join(mediaRoot, result.storage_key);
+        expect(await Bun.file(path).exists()).toBe(true);
+        const onDisk = new Uint8Array(await Bun.file(path).arrayBuffer());
+        expect(onDisk).toEqual(PNG_BYTES);
+        expect(sha256HexOf(onDisk)).toBe(result.sha256);
+        // DB row matches the returned identity.
+        const { rows } = await pool.query(
+            `SELECT storage_key, mime_type, byte_size, sha256 FROM meal_capture_media WHERE id=$1 AND capture_id=$2`,
+            [result.media_id, capture.capture_id],
+        );
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+            storage_key: result.storage_key,
+            mime_type: "image/png",
+            sha256: result.sha256,
+        });
+        expect(Number(rows[0]!.byte_size)).toBe(PNG_BYTES.byteLength);
+    });
+
+    test("rollback: injected INSERT failure removes both DB row and staged file", async () => {
+        const capture = await startCapture("media-rollback");
+        await expect(
+            attachCaptureMediaBytes(
+                poolFailingMediaInsert(pool),
+                mediaStore,
+                capture.capture_id,
+                "media-user",
+                {
+                    kind: "photo",
+                    mime_type: "image/png",
+                    bytes_base64: PNG_BASE64,
+                },
+            ),
+        ).rejects.toThrow("injected media insert failure");
+        const { rows } = await pool.query(
+            `SELECT count(*) AS n FROM meal_capture_media WHERE capture_id=$1`,
+            [capture.capture_id],
+        );
+        expect(Number(rows[0]!.n)).toBe(0);
+        const stagedPath = join(
+            mediaRoot,
+            `capture/${capture.capture_id}/photo-${sha256HexOf(PNG_BYTES)}`,
+        );
+        expect(await Bun.file(stagedPath).exists()).toBe(false);
+    });
+
+    test("retry-safe: identical bytes attached twice yield one row and one file", async () => {
+        const capture = await startCapture("media-retry");
+        const input = {
+            kind: "photo" as const,
+            mime_type: "image/png",
+            bytes_base64: PNG_BASE64,
+        };
+        const first = await attachCaptureMediaBytes(
+            pool,
+            mediaStore,
+            capture.capture_id,
+            "media-user",
+            input,
+        );
+        const second = await attachCaptureMediaBytes(
+            pool,
+            mediaStore,
+            capture.capture_id,
+            "media-user",
+            input,
+        );
+        expect(first.deduplicated).toBe(false);
+        expect(second.deduplicated).toBe(true);
+        expect(second.media_id).toBe(first.media_id);
+        expect(second.storage_key).toBe(first.storage_key);
+        expect(second.sha256).toBe(first.sha256);
+        const { rows } = await pool.query(
+            `SELECT count(*) AS n FROM meal_capture_media WHERE capture_id=$1`,
+            [capture.capture_id],
+        );
+        expect(Number(rows[0]!.n)).toBe(1);
+        const path = join(mediaRoot, first.storage_key);
+        expect(await Bun.file(path).exists()).toBe(true);
+        const onDisk = new Uint8Array(await Bun.file(path).arrayBuffer());
+        expect(sha256HexOf(onDisk)).toBe(first.sha256);
+    });
+
+    test("tampered caller sha256 is rejected; nothing staged or persisted", async () => {
+        const capture = await startCapture("media-tampered");
+        const filesBefore = await mediaRootFiles(mediaRoot);
+        await expect(
+            attachCaptureMediaBytes(
+                pool,
+                mediaStore,
+                capture.capture_id,
+                "media-user",
+                {
+                    kind: "photo",
+                    mime_type: "image/png",
+                    bytes_base64: PNG_BASE64,
+                    sha256: "0".repeat(64),
+                },
+            ),
+        ).rejects.toThrow(/sha256/i);
+        const { rows } = await pool.query(
+            `SELECT count(*) AS n FROM meal_capture_media WHERE capture_id=$1`,
+            [capture.capture_id],
+        );
+        expect(Number(rows[0]!.n)).toBe(0);
+        expect(await mediaRootFiles(mediaRoot)).toEqual(filesBefore);
+    });
+
+    test("state guard: attach on a cancelled capture stages nothing", async () => {
+        const capture = await startCapture("media-cancelled");
+        await cancelMealCapture(pool, capture.capture_id, "media-user");
+        const filesBefore = await mediaRootFiles(mediaRoot);
+        await expect(
+            attachCaptureMediaBytes(
+                pool,
+                mediaStore,
+                capture.capture_id,
+                "media-user",
+                {
+                    kind: "photo",
+                    mime_type: "image/png",
+                    bytes_base64: PNG_BASE64,
+                },
+            ),
+        ).rejects.toThrow("capture is no longer editable");
+        const { rows } = await pool.query(
+            `SELECT count(*) AS n FROM meal_capture_media WHERE capture_id=$1`,
+            [capture.capture_id],
+        );
+        expect(Number(rows[0]!.n)).toBe(0);
+        expect(await mediaRootFiles(mediaRoot)).toEqual(filesBefore);
+    });
+
+    test("cross-user attach is rejected as not found; nothing staged", async () => {
+        const capture = await startMealCapture(pool, {
+            user_id: "other-user",
+            conversation_key: "media-cross-user",
+            idempotency_key: "media-cross-user",
+        });
+        const filesBefore = await mediaRootFiles(mediaRoot);
+        await expect(
+            attachCaptureMediaBytes(
+                pool,
+                mediaStore,
+                capture.capture_id,
+                "media-user",
+                {
+                    kind: "photo",
+                    mime_type: "image/png",
+                    bytes_base64: PNG_BASE64,
+                },
+            ),
+        ).rejects.toThrow("capture not found");
+        expect(await mediaRootFiles(mediaRoot)).toEqual(filesBefore);
     });
 });

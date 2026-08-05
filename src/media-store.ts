@@ -55,6 +55,12 @@ export interface MediaStore {
         bytes: Uint8Array;
         mime_type: string;
     }): Promise<StoredMediaMetadata>;
+    putCapture(args: {
+        capture_id: string;
+        kind: "photo" | "audio";
+        bytes: Uint8Array;
+        mime_type: string;
+    }): Promise<StoredMediaMetadata>;
     read(storageKey: string, expectedSha256: string): Promise<Uint8Array>;
     delete(storageKey: string): Promise<void>;
 }
@@ -92,8 +98,34 @@ export function isGeneratedStorageKey(args: {
     return args.storage_key === generateStorageKey(args);
 }
 
+// Capture-scoped keys: media attached while a capture is still editable has
+// no event/version yet, so identity is capture id + kind + content hash. Like
+// event keys, these are generated here and never caller-supplied.
+export function generateCaptureStorageKey(args: {
+    capture_id: string;
+    kind: "photo" | "audio";
+    sha256: string;
+}): string {
+    return `capture/${args.capture_id}/${args.kind}-${args.sha256}`;
+}
+
+export function isGeneratedCaptureStorageKey(args: {
+    storage_key: string;
+    capture_id: string;
+    kind: "photo" | "audio";
+    sha256: string;
+}): boolean {
+    return args.storage_key === generateCaptureStorageKey(args);
+}
+
 function sha256Hex(bytes: Uint8Array): string {
     return new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+}
+
+// Exported so the capture attach path can verify a caller-supplied hash
+// against the real bytes BEFORE staging anything to disk.
+export function mediaSha256Hex(bytes: Uint8Array): string {
+    return sha256Hex(bytes);
 }
 
 export function createMediaStore(root: string): MediaStore {
@@ -108,30 +140,53 @@ export function createMediaStore(root: string): MediaStore {
         return path;
     }
 
+    async function writeAndVerify(
+        storageKey: string,
+        bytes: Uint8Array,
+        mime_type: string,
+    ): Promise<StoredMediaMetadata> {
+        const sha256 = sha256Hex(bytes);
+        const path = resolveUnderRoot(storageKey);
+        const dir = path.slice(0, path.lastIndexOf(sep));
+        await mkdir(dir, { recursive: true });
+        await Bun.write(path, bytes);
+        // Verify what actually landed on disk before returning metadata.
+        const written = new Uint8Array(await Bun.file(path).arrayBuffer());
+        if (sha256Hex(written) !== sha256) {
+            throw new MediaChecksumError(storageKey);
+        }
+        return {
+            storage_key: storageKey,
+            mime_type,
+            byte_size: bytes.byteLength,
+            sha256,
+        };
+    }
+
     return {
         async put({ event_id, version, kind, bytes, mime_type }) {
-            const sha256 = sha256Hex(bytes);
-            const storageKey = generateStorageKey({
-                event_id,
-                version,
-                kind,
-                sha256,
-            });
-            const path = resolveUnderRoot(storageKey);
-            const dir = path.slice(0, path.lastIndexOf(sep));
-            await mkdir(dir, { recursive: true });
-            await Bun.write(path, bytes);
-            // Verify what actually landed on disk before returning metadata.
-            const written = new Uint8Array(await Bun.file(path).arrayBuffer());
-            if (sha256Hex(written) !== sha256) {
-                throw new MediaChecksumError(storageKey);
-            }
-            return {
-                storage_key: storageKey,
+            return writeAndVerify(
+                generateStorageKey({
+                    event_id,
+                    version,
+                    kind,
+                    sha256: sha256Hex(bytes),
+                }),
+                bytes,
                 mime_type,
-                byte_size: bytes.byteLength,
-                sha256,
-            };
+            );
+        },
+
+        async putCapture({ capture_id, kind, bytes, mime_type }) {
+            return writeAndVerify(
+                generateCaptureStorageKey({
+                    capture_id,
+                    kind,
+                    sha256: sha256Hex(bytes),
+                }),
+                bytes,
+                mime_type,
+            );
         },
 
         async read(storageKey, expectedSha256) {

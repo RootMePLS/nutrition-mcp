@@ -13,6 +13,7 @@ import {
 
 import {
     appendCaptureMessage,
+    attachCaptureMediaBytes,
     cancelMealCapture,
     confirmMealCapture,
     expireMealCapture,
@@ -21,6 +22,7 @@ import {
     savePreparedDraft,
     startMealCapture,
 } from "./meal-captures.js";
+import { createMediaStore, type MediaStore } from "./media-store.js";
 import type {
     CaptureMessageInput,
     ClarificationAnswer,
@@ -1392,6 +1394,43 @@ export function alcoholHiddenNote(
 // a number it was forbidden to show the user for review. That is the widget's
 // choice, announced to the user on screen, not a rule this server enforces — see
 // startImportPayload for the full trade-off.
+// Structured output contract for attach_meal_capture_media. Exported so
+// transport tests can parse structuredContent against the declared schema.
+export const ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA = z
+    .object({
+        capture_id: z.string(),
+        media_id: z.string(),
+        kind: z.enum(["photo", "audio"]),
+        storage_key: z.string(),
+        mime_type: z.string(),
+        byte_size: z.number().int().min(0),
+        sha256: z.string(),
+        duration_ms: z.number().int().nullable(),
+        width: z.number().int().nullable(),
+        height: z.number().int().nullable(),
+        metadata: z.record(z.string(), z.unknown()),
+        capture_state: z.enum([
+            "receiving",
+            "ready_to_confirm",
+            "confirmed",
+            "cancelled",
+            "expired",
+        ]),
+        deduplicated: z.boolean(),
+    })
+    .strict();
+
+// One media store per process. MEDIA_ROOT is resolved lazily so tests that
+// inject their own store never touch the real root; buildMcpServer reaches
+// this through registerTools' deps default, which is what src/index.ts's
+// /mcp route ultimately constructs per request.
+let processMediaStore: MediaStore | undefined;
+function getProcessMediaStore(): MediaStore {
+    return (processMediaStore ??= createMediaStore(
+        process.env.MEDIA_ROOT ?? "var/media",
+    ));
+}
+
 // Exported for tests: the only way to exercise a tool handler end-to-end
 // (schema coercion, handler, response text) is to register the tools on a real
 // McpServer and call them through a client. Production still reaches this only
@@ -1403,7 +1442,7 @@ export function registerTools(
     alcohol: AlcoholDisplay,
     // Optional dependency seam for tests: the food-tracking tool writes
     // through this pool instead of the global one when provided.
-    deps: { mealEventsPool?: Pool } = {},
+    deps: { mealEventsPool?: Pool; mediaStore?: MediaStore } = {},
 ) {
     // Link a tool to its widget only when this user has widgets enabled. Because
     // buildMcpServer registers tools per request, this makes widget display a
@@ -4296,6 +4335,9 @@ export function registerTools(
     // pipeline and makes NO real MyFitnessPal call — external_write_authorized
     // only records the explicit "добавь" intent as a pending sync-journal row.
     const mealEventsPool = deps.mealEventsPool ?? getPool();
+    // Process-wide default media store (created once per process, honoring
+    // MEDIA_ROOT); tests inject a tmp-rooted store through the deps seam.
+    const mediaStore = deps.mediaStore ?? getProcessMediaStore();
 
     server.registerTool(
         "log_meal_event",
@@ -4828,6 +4870,65 @@ export function registerTools(
             );
             return {
                 content: [{ type: "text", text: "Capture answer retained." }],
+            };
+        },
+    );
+
+    server.registerTool(
+        "attach_meal_capture_media",
+        {
+            title: "Attach Meal Capture Media",
+            description:
+                "Attach raw media bytes (base64) to an editable meal capture. The backend decodes and verifies the bytes (8 MiB decoded cap; image/jpeg, image/png, image/webp, audio/ogg, audio/mpeg, audio/mp4 only), computes SHA-256 server-side, generates the capture-scoped storage key, and stages the file before persisting metadata — you never supply storage_key, and an optional sha256 must match the server-computed hash. Re-attaching identical bytes is idempotent and returns the existing media identity. No STT/OCR/vision runs here.",
+            annotations: {
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                capture_id: z.string().min(1),
+                kind: z.enum(["photo", "audio"]),
+                mime_type: z.string().min(1),
+                bytes_base64: z.string().min(1),
+                sha256: z
+                    .string()
+                    .regex(/^[0-9a-f]{64}$/)
+                    .optional(),
+                duration_ms: z.number().int().min(0).optional(),
+                width: z.number().int().min(0).optional(),
+                height: z.number().int().min(0).optional(),
+                metadata: z.record(z.string(), z.unknown()).optional(),
+                idempotency_key: z.string().min(1).optional(),
+            },
+            outputSchema: ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA,
+        },
+        async (args) => {
+            const result = await attachCaptureMediaBytes(
+                mealEventsPool,
+                mediaStore,
+                args.capture_id,
+                userId,
+                {
+                    kind: args.kind,
+                    mime_type: args.mime_type,
+                    bytes_base64: args.bytes_base64,
+                    sha256: args.sha256,
+                    duration_ms: args.duration_ms,
+                    width: args.width,
+                    height: args.height,
+                    metadata: args.metadata as
+                        Record<string, unknown> | undefined,
+                },
+            );
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify(result),
+                    },
+                ],
+                structuredContent: { ...result },
             };
         },
     );

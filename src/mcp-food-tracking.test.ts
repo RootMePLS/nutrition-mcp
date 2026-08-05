@@ -7,12 +7,19 @@ import {
     expect,
     test,
 } from "bun:test";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Pool } from "pg";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { registerTools } from "./mcp.js";
+import {
+    registerTools,
+    ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA,
+} from "./mcp.js";
 import { startMealCapture } from "./meal-captures.js";
+import { createMediaStore, type MediaStore } from "./media-store.js";
 import { flushAnalytics } from "./analytics.js";
 import { stableBundleFingerprint } from "./nutrition-bundle-types.js";
 import {
@@ -69,12 +76,16 @@ async function withTools(
         ) => Promise<ToolResult>,
         client?: Client,
     ) => Promise<void>,
+    extraDeps: { mediaStore?: MediaStore; userId?: string } = {},
 ): Promise<void> {
     const server = new McpServer(
         { name: "nutrition-mcp-test", version: "0.0.0" },
         { capabilities: { tools: {}, resources: {} } },
     );
-    registerTools(server, "u1", false, null, { mealEventsPool: pool });
+    registerTools(server, extraDeps.userId ?? "u1", false, null, {
+        mealEventsPool: pool,
+        ...(extraDeps.mediaStore ? { mediaStore: extraDeps.mediaStore } : {}),
+    });
     const [clientTransport, serverTransport] =
         InMemoryTransport.createLinkedPair();
     const client = new Client({ name: "test-client", version: "0.0.0" });
@@ -654,5 +665,338 @@ describeDb("meal capture MCP lifecycle tools", () => {
                 )
             ).rows[0]!.n,
         ).toBe("0");
+    });
+});
+
+// ---------------------------------------------------------------------------
+// attach_meal_capture_media: the public byte path. Real InMemoryTransport,
+// real PostgreSQL, real temporary filesystem media root. Filesystem bytes and
+// recomputed hashes are asserted alongside DB rows.
+// ---------------------------------------------------------------------------
+
+const MCP_PNG_BYTES = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 5, 6, 7, 8,
+]);
+const MCP_PNG_BASE64 = Buffer.from(MCP_PNG_BYTES).toString("base64");
+const MCP_PNG_SHA256 = new Bun.CryptoHasher("sha256")
+    .update(MCP_PNG_BYTES)
+    .digest("hex");
+
+async function stagedMediaFiles(root: string): Promise<string[]> {
+    try {
+        const entries = await readdir(root, { recursive: true });
+        return entries
+            .map((entry) => entry.toString())
+            .filter((entry) =>
+                /(?:^|\/)(?:photo|audio)-[0-9a-f]{64}$/.test(entry),
+            )
+            .sort();
+    } catch {
+        return [];
+    }
+}
+
+describeDb("attach_meal_capture_media MCP tool", () => {
+    let pool: Pool;
+    let mediaRoot: string;
+    let mediaStore: MediaStore;
+    beforeAll(() => {
+        pool = new Pool({ connectionString: DATABASE_URL_TEST });
+    });
+    afterAll(async () => {
+        await pool.end();
+    });
+    afterEach(async () => {
+        await flushAnalytics();
+        await rm(mediaRoot, { recursive: true, force: true });
+    });
+    beforeEach(async () => {
+        await resetSchemaWithMigrations(pool, [
+            "001_initial_schema.sql",
+            "002_food_tracking.sql",
+            "003_meal_captures.sql",
+            "004_calculation_bundles.sql",
+            "005_calculation_corrections.sql",
+        ]);
+        // Fresh media root per test: the DB resets per test, so the
+        // filesystem must too, or staged files from prior tests leak in.
+        mediaRoot = await mkdtemp(join(tmpdir(), "mcp-capture-media-test-"));
+        mediaStore = createMediaStore(mediaRoot);
+    });
+
+    test("start -> attach -> draft referencing media -> confirm persists event media", async () => {
+        await withTools(
+            pool,
+            async (call) => {
+                const started = await call("start_meal_capture", {
+                    conversation_key: "media-flow",
+                    idempotency_key: "mcp-media-flow",
+                });
+                expect(started.isError).not.toBe(true);
+                const captureId = JSON.parse(started.content[0]!.text!)
+                    .capture_id as string;
+
+                const attached = await call("attach_meal_capture_media", {
+                    capture_id: captureId,
+                    kind: "photo",
+                    mime_type: "image/png",
+                    bytes_base64: MCP_PNG_BASE64,
+                    idempotency_key: "mcp-media-flow-attach-1",
+                });
+                expect(attached.isError).not.toBe(true);
+                const media = ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA.parse(
+                    attached.structuredContent,
+                );
+                expect(media.capture_id).toBe(captureId);
+                expect(media.deduplicated).toBe(false);
+                expect(media.sha256).toBe(MCP_PNG_SHA256);
+                expect(media.byte_size).toBe(MCP_PNG_BYTES.byteLength);
+                expect(media.storage_key).toBe(
+                    `capture/${captureId}/photo-${MCP_PNG_SHA256}`,
+                );
+                expect(media.capture_state).toBe("receiving");
+                // Filesystem truth before confirm.
+                const stagedPath = join(mediaRoot, media.storage_key);
+                expect(await Bun.file(stagedPath).exists()).toBe(true);
+                const onDisk = new Uint8Array(
+                    await Bun.file(stagedPath).arrayBuffer(),
+                );
+                expect(onDisk).toEqual(MCP_PNG_BYTES);
+                expect(
+                    new Bun.CryptoHasher("sha256").update(onDisk).digest("hex"),
+                ).toBe(media.sha256);
+
+                const drafted = await call("save_meal_capture_draft", {
+                    capture_id: captureId,
+                    draft: {
+                        reported_at: "2026-08-05T12:00:00Z",
+                        items: [{ ordinal: 0, raw_item_text: "oatmeal" }],
+                        inputs: [
+                            {
+                                source_kind: "user_text",
+                                content: "oatmeal with a photo",
+                            },
+                        ],
+                        media: [
+                            {
+                                kind: media.kind,
+                                storage_key: media.storage_key,
+                                mime_type: media.mime_type,
+                                byte_size: media.byte_size,
+                                sha256: media.sha256,
+                                metadata: media.metadata,
+                            },
+                        ],
+                        parser_policy_version: "hermes.v1",
+                        created_by: "hermes",
+                    },
+                });
+                expect(drafted.isError).not.toBe(true);
+
+                const confirmed = await call("confirm_meal_capture", {
+                    capture_id: captureId,
+                    confirmation: "add",
+                });
+                expect(confirmed.isError).not.toBe(true);
+                const confirmedContent = confirmed.structuredContent!;
+                expect(confirmedContent.state).toBe("confirmed");
+                const eventId = confirmedContent.event_id as string;
+
+                // The event aggregate carries the capture-scoped media row.
+                const eventMedia = await pool.query(
+                    `SELECT kind, storage_key, mime_type, byte_size, sha256 FROM meal_event_media WHERE event_id=$1 AND version=1`,
+                    [eventId],
+                );
+                expect(eventMedia.rows).toHaveLength(1);
+                expect(eventMedia.rows[0]).toMatchObject({
+                    kind: "photo",
+                    storage_key: media.storage_key,
+                    mime_type: "image/png",
+                    sha256: media.sha256,
+                });
+                expect(Number(eventMedia.rows[0]!.byte_size)).toBe(
+                    MCP_PNG_BYTES.byteLength,
+                );
+                // Bytes survive confirmation (no promotion in this slice).
+                expect(await Bun.file(stagedPath).exists()).toBe(true);
+            },
+            { mediaStore },
+        );
+    });
+
+    test("retry through MCP returns the same media identity without duplicating row or file", async () => {
+        await withTools(
+            pool,
+            async (call) => {
+                const started = await call("start_meal_capture", {
+                    conversation_key: "media-retry",
+                    idempotency_key: "mcp-media-retry",
+                });
+                const captureId = JSON.parse(started.content[0]!.text!)
+                    .capture_id as string;
+                const args = {
+                    capture_id: captureId,
+                    kind: "photo",
+                    mime_type: "image/png",
+                    bytes_base64: MCP_PNG_BASE64,
+                };
+                const first = await call("attach_meal_capture_media", args);
+                const second = await call("attach_meal_capture_media", args);
+                expect(first.isError).not.toBe(true);
+                expect(second.isError).not.toBe(true);
+                const a = ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA.parse(
+                    first.structuredContent,
+                );
+                const b = ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA.parse(
+                    second.structuredContent,
+                );
+                expect(a.deduplicated).toBe(false);
+                expect(b.deduplicated).toBe(true);
+                expect(b.media_id).toBe(a.media_id);
+                expect(b.storage_key).toBe(a.storage_key);
+                const { rows } = await pool.query(
+                    `SELECT count(*) AS n FROM meal_capture_media WHERE capture_id=$1`,
+                    [captureId],
+                );
+                expect(Number(rows[0]!.n)).toBe(1);
+                expect(await stagedMediaFiles(mediaRoot)).toEqual([
+                    a.storage_key,
+                ]);
+            },
+            { mediaStore },
+        );
+    });
+
+    test("rejects cross-user capture media attach", async () => {
+        const other = await startMealCapture(pool, {
+            user_id: "u2",
+            conversation_key: "other-media",
+            idempotency_key: "mcp-other-media",
+        });
+        await withTools(
+            pool,
+            async (call) => {
+                const r = await call("attach_meal_capture_media", {
+                    capture_id: other.capture_id,
+                    kind: "photo",
+                    mime_type: "image/png",
+                    bytes_base64: MCP_PNG_BASE64,
+                });
+                expect(r.isError).toBe(true);
+            },
+            { mediaStore },
+        );
+        const { rows } = await pool.query(
+            `SELECT count(*) AS n FROM meal_capture_media WHERE capture_id=$1`,
+            [other.capture_id],
+        );
+        expect(Number(rows[0]!.n)).toBe(0);
+        expect(await stagedMediaFiles(mediaRoot)).toEqual([]);
+    });
+
+    test("malformed input matrix: invalid base64, disallowed MIME, kind mismatch, oversized", async () => {
+        await withTools(
+            pool,
+            async (call) => {
+                const started = await call("start_meal_capture", {
+                    conversation_key: "media-malformed",
+                    idempotency_key: "mcp-media-malformed",
+                });
+                const captureId = JSON.parse(started.content[0]!.text!)
+                    .capture_id as string;
+                const oversized = Buffer.alloc(8 * 1024 * 1024 + 1, 0x61);
+                const cases: Record<string, unknown>[] = [
+                    {
+                        capture_id: captureId,
+                        kind: "photo",
+                        mime_type: "image/png",
+                        bytes_base64: "!!!not-valid-base64!!!",
+                    },
+                    {
+                        capture_id: captureId,
+                        kind: "photo",
+                        mime_type: "image/gif",
+                        bytes_base64: MCP_PNG_BASE64,
+                    },
+                    {
+                        capture_id: captureId,
+                        kind: "audio",
+                        mime_type: "image/png",
+                        bytes_base64: MCP_PNG_BASE64,
+                    },
+                    {
+                        capture_id: captureId,
+                        kind: "photo",
+                        mime_type: "image/png",
+                        bytes_base64: oversized.toString("base64"),
+                    },
+                    {
+                        capture_id: captureId,
+                        kind: "photo",
+                        mime_type: "image/png",
+                        bytes_base64: MCP_PNG_BASE64,
+                        sha256: "f".repeat(64),
+                    },
+                ];
+                for (const args of cases) {
+                    const r = await call("attach_meal_capture_media", args);
+                    expect(r.isError).toBe(true);
+                }
+                const { rows } = await pool.query(
+                    `SELECT count(*) AS n FROM meal_capture_media WHERE capture_id=$1`,
+                    [captureId],
+                );
+                expect(Number(rows[0]!.n)).toBe(0);
+                expect(await stagedMediaFiles(mediaRoot)).toEqual([]);
+            },
+            { mediaStore },
+        );
+    });
+
+    test("attach on a confirmed capture is rejected and stages nothing", async () => {
+        await withTools(
+            pool,
+            async (call) => {
+                const started = await call("start_meal_capture", {
+                    conversation_key: "media-confirmed",
+                    idempotency_key: "mcp-media-confirmed",
+                });
+                const captureId = JSON.parse(started.content[0]!.text!)
+                    .capture_id as string;
+                await call("save_meal_capture_draft", {
+                    capture_id: captureId,
+                    draft: {
+                        reported_at: "2026-08-05T12:00:00Z",
+                        items: [{ ordinal: 0, raw_item_text: "oatmeal" }],
+                        inputs: [],
+                        media: [],
+                        parser_policy_version: "hermes.v1",
+                        created_by: "hermes",
+                    },
+                });
+                const confirmed = await call("confirm_meal_capture", {
+                    capture_id: captureId,
+                    confirmation: "add",
+                });
+                expect(confirmed.isError).not.toBe(true);
+                const late = await call("attach_meal_capture_media", {
+                    capture_id: captureId,
+                    kind: "photo",
+                    mime_type: "image/png",
+                    bytes_base64: MCP_PNG_BASE64,
+                });
+                expect(late.isError).toBe(true);
+                expect(late.content[0]!.text).toContain(
+                    "capture is no longer editable",
+                );
+                const { rows } = await pool.query(
+                    `SELECT count(*) AS n FROM meal_capture_media WHERE capture_id=$1`,
+                    [captureId],
+                );
+                expect(Number(rows[0]!.n)).toBe(0);
+                expect(await stagedMediaFiles(mediaRoot)).toEqual([]);
+            },
+            { mediaStore },
+        );
     });
 });

@@ -1,12 +1,18 @@
 import { withTransaction } from "./db.js";
 import { createMealEvent, type CreateMealEventResult } from "./meal-events.js";
 import {
+    generateCaptureStorageKey,
+    mediaSha256Hex,
+    type MediaStore,
+} from "./media-store.js";
+import {
     validateCaptureMedia,
     validateCaptureMessage,
     validatePreparedDraft,
     type CaptureMediaInput,
     type CaptureMessageInput,
     type CaptureResult,
+    type CaptureState,
     type ClarificationAnswer,
     type ConfirmCaptureCommand,
     type PreparedMealDraft,
@@ -216,6 +222,210 @@ export async function saveCaptureAnswer(
         );
     });
 }
+// ---------------------------------------------------------------------------
+// Public capture-media byte path (S5). Bytes arrive base64-encoded, are
+// decoded and verified here (size cap, MIME allow-list, server-side SHA-256),
+// staged through the capture-scoped MediaStore, and only then recorded in the
+// database. The caller NEVER controls storage_key. On any transactional
+// failure the staged file is deleted before the error propagates.
+// ---------------------------------------------------------------------------
+
+export const CAPTURE_MEDIA_MAX_BYTES = 8 * 1024 * 1024;
+
+export const CAPTURE_MEDIA_MIME_ALLOW_LIST: Readonly<
+    Record<"photo" | "audio", ReadonlySet<string>>
+> = {
+    photo: new Set(["image/jpeg", "image/png", "image/webp"]),
+    audio: new Set(["audio/ogg", "audio/mpeg", "audio/mp4"]),
+};
+
+const STRICT_BASE64 =
+    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+export interface AttachCaptureMediaInput {
+    kind: "photo" | "audio";
+    mime_type: string;
+    bytes_base64: string;
+    sha256?: string;
+    duration_ms?: number | null;
+    width?: number | null;
+    height?: number | null;
+    metadata?: Record<string, unknown>;
+}
+
+export interface AttachCaptureMediaResult {
+    capture_id: string;
+    media_id: string;
+    kind: "photo" | "audio";
+    storage_key: string;
+    mime_type: string;
+    byte_size: number;
+    sha256: string;
+    duration_ms: number | null;
+    width: number | null;
+    height: number | null;
+    metadata: Record<string, unknown>;
+    capture_state: CaptureState;
+    deduplicated: boolean;
+}
+
+export async function attachCaptureMediaBytes(
+    pool: Pool,
+    mediaStore: MediaStore,
+    captureId: string,
+    userId: string,
+    input: AttachCaptureMediaInput,
+): Promise<AttachCaptureMediaResult> {
+    const errors: string[] = [];
+    const kind = input?.kind;
+    if (kind !== "photo" && kind !== "audio") {
+        errors.push("media kind is unsupported");
+    } else if (!CAPTURE_MEDIA_MIME_ALLOW_LIST[kind].has(input.mime_type)) {
+        errors.push(
+            `media mime_type is not in the capture allow-list for ${kind}`,
+        );
+    }
+    let bytes: Uint8Array | null = null;
+    if (
+        typeof input.bytes_base64 !== "string" ||
+        !STRICT_BASE64.test(input.bytes_base64)
+    ) {
+        errors.push("media bytes_base64 must be canonical base64");
+    } else {
+        const decoded = Buffer.from(input.bytes_base64, "base64");
+        if (decoded.toString("base64") !== input.bytes_base64) {
+            errors.push("media bytes_base64 must be canonical base64");
+        } else if (decoded.byteLength > CAPTURE_MEDIA_MAX_BYTES) {
+            errors.push("media bytes exceed the 8 MiB decoded capture limit");
+        } else {
+            bytes = new Uint8Array(decoded);
+        }
+    }
+    for (const [field, value] of [
+        ["duration_ms", input.duration_ms],
+        ["width", input.width],
+        ["height", input.height],
+    ] as const) {
+        if (
+            value !== undefined &&
+            value !== null &&
+            (!Number.isInteger(value) || value < 0)
+        )
+            errors.push(`media ${field} must be a non-negative integer`);
+    }
+    if (errors.length) throw new MealCaptureValidationError(errors);
+
+    // The server is the sole authority on identity: hash the decoded bytes,
+    // never trust a caller-supplied digest.
+    const sha256 = mediaSha256Hex(bytes!);
+    if (input.sha256 !== undefined && input.sha256 !== sha256)
+        throw new MealCaptureValidationError([
+            "caller sha256 does not match the server-computed sha256 of the decoded bytes",
+        ]);
+
+    // Record-level validation (metadata JSON shape, hash format, …) reuses
+    // the same validator as the internal saveCaptureMedia seam; the storage
+    // key here is backend-generated, not caller input.
+    const candidate: CaptureMediaInput = {
+        kind: kind as "photo" | "audio",
+        storage_key: generateCaptureStorageKey({
+            capture_id: captureId,
+            kind: kind as "photo" | "audio",
+            sha256,
+        }),
+        mime_type: input.mime_type,
+        byte_size: bytes!.byteLength,
+        sha256,
+        duration_ms: input.duration_ms ?? null,
+        width: input.width ?? null,
+        height: input.height ?? null,
+        metadata: input.metadata ?? {},
+    };
+    const recordErrors = validateCaptureMedia(candidate);
+    if (recordErrors.length) throw new MealCaptureValidationError(recordErrors);
+
+    // Stage bytes FIRST; the DB row is written only after the bytes are
+    // verified on disk.
+    const staged = await mediaStore.putCapture({
+        capture_id: captureId,
+        kind: candidate.kind,
+        bytes: bytes!,
+        mime_type: candidate.mime_type,
+    });
+    let redundantStagedKey: string | null = null;
+    try {
+        const identity = await withTransaction(pool, async (client) => {
+            const { rows } = await client.query(
+                `SELECT state FROM meal_captures WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+                [captureId, userId],
+            );
+            if (!rows.length) return notFound();
+            const state = rows[0]!.state as CaptureState;
+            if (!["receiving", "ready_to_confirm"].includes(state))
+                throw new MealCaptureValidationError([
+                    "capture is no longer editable",
+                ]);
+            const inserted = await client.query(
+                `INSERT INTO meal_capture_media (capture_id,kind,storage_key,mime_type,byte_size,sha256,duration_ms,width,height,metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (capture_id,sha256) DO NOTHING RETURNING id`,
+                [
+                    captureId,
+                    candidate.kind,
+                    staged.storage_key,
+                    staged.mime_type,
+                    staged.byte_size,
+                    staged.sha256,
+                    candidate.duration_ms,
+                    candidate.width,
+                    candidate.height,
+                    JSON.stringify(candidate.metadata),
+                ],
+            );
+            if (inserted.rows.length)
+                return {
+                    media_id: inserted.rows[0]!.id as string,
+                    storage_key: staged.storage_key,
+                    capture_state: state,
+                    deduplicated: false,
+                };
+            // Retry of the same content: the content-addressed row already
+            // exists; return its identity. Same bytes normally regenerate the
+            // same key (the re-stage was a no-op overwrite); if the stored key
+            // ever differs, the freshly staged copy is redundant.
+            const existing = await client.query(
+                `SELECT id, storage_key FROM meal_capture_media WHERE capture_id=$1 AND sha256=$2`,
+                [captureId, staged.sha256],
+            );
+            const row = existing.rows[0]!;
+            if (row.storage_key !== staged.storage_key)
+                redundantStagedKey = staged.storage_key;
+            return {
+                media_id: row.id as string,
+                storage_key: row.storage_key as string,
+                capture_state: state,
+                deduplicated: true,
+            };
+        });
+        if (redundantStagedKey) await mediaStore.delete(redundantStagedKey);
+        return {
+            capture_id: captureId,
+            kind: candidate.kind,
+            mime_type: candidate.mime_type,
+            byte_size: staged.byte_size,
+            sha256: staged.sha256,
+            duration_ms: candidate.duration_ms ?? null,
+            width: candidate.width ?? null,
+            height: candidate.height ?? null,
+            metadata: candidate.metadata ?? {},
+            ...identity,
+        };
+    } catch (error) {
+        // Rollback cleanup: the transaction never committed, so the staged
+        // file must not survive either.
+        await mediaStore.delete(staged.storage_key);
+        throw error;
+    }
+}
+
 export async function saveCaptureMedia(
     pool: Pool,
     captureId: string,
