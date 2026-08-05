@@ -118,12 +118,18 @@ In every totals payload the four core macros (`calories`, `protein_g`,
 `carbs_g`, `fat_g`) are nullable: a total is `null` only when **no** meal in
 the selection has a calculated value for that nutrient — pending calculations
 and empty days are never coalesced to `0`. A mixed selection sums only the
-calculated values, and every totals payload carries the integer presence
-counts `meals_total` and `meals_calculated` so a partial sum is never mistaken
-for a complete one. An explicitly stored `0` stays `0` end to end. Range
-averages keep the historical denominator (every logged day) but are `null`
-when no day in the window carries the nutrient. Text progress renders a null
-total as `no data yet` (never `0%` of goal, never `NaN`), the widgets render
+calculated values, and every totals payload carries the integer counts
+`meals_total` and `meals_calculated`, where `meals_calculated` is a
+per-nutrient object `{ calories, protein_g, carbs_g, fat_g }` counting how
+many meals carry each specific macro — presence differs per nutrient, so a
+partial per-nutrient sum is never mistaken for a complete one (calories `2/2`
+with protein `1/2` is disclosed as exactly that, never as `2/2` overall). An
+explicitly stored `0` stays `0` end to end and counts as coverage for its own
+macro. Range averages keep the historical denominator (every logged day) but
+are `null` for any core nutrient no day in the window carries — including an
+empty range, whose core averages are all `null` with zero counts (water alone
+keeps its legacy `0` average). Text progress renders a null total as
+`no data yet` (never `0%` of goal, never `NaN`), the widgets render
 `—`/`no data yet` for null and `0` only for a real zero, and the CSV export
 keeps empty cells for missing values.
 
