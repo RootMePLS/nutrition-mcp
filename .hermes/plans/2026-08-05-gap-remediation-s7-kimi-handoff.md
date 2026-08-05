@@ -65,10 +65,12 @@ because Bun auto-loads `.env` and `??` masked the simulated missing-URL case.
   default, so the probe can never exceed 2s).
 - On timeout the error is
   `database not ready: probe timed out after <N>ms (target <redacted>)`.
-- The losing probe promise keeps its `Promise.race` handlers attached, so a
-  late driver rejection cannot become an unhandled rejection; the timer is
-  always cleared in `finally`. No background work or retries survive a
-  failed/timed-out probe.
+- The probe clears its own timeout timer and starts no retry loop.
+  `Promise.race` retains handlers for the losing query promise, so a late
+  driver rejection is handled (it cannot become an unhandled rejection). A
+  timed-out `pg` connection/query attempt itself may continue until the
+  driver completes it; this work is invisible to the caller and is not
+  cancelled by this helper.
 - Unit proof: a never-resolving stub pool with `timeoutMs: 50` fails in
   < 2s (asserted elapsed) with the timeout message. Integration proof: wrong
   port 5439 fails bounded (asserted elapsed < 5s; actual ~5ms, ECONNREFUSED).
