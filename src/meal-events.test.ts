@@ -159,6 +159,7 @@ describe("meal event domain contracts", () => {
             correction_idempotency_key: "corr:1",
             command: {
                 event_id: "evt-1",
+                user_id: "u1",
                 correction_idempotency_key: "corr:1",
                 items: validCommand().items,
                 inputs: validCommand().inputs,
@@ -504,6 +505,7 @@ describeDb("meal event corrections (requires DATABASE_URL_TEST)", () => {
     function correctionFor(eventId: string, key = "corr:1") {
         return {
             event_id: eventId,
+            user_id: "u1",
             correction_idempotency_key: key,
             correction_reason: "portion was wrong",
             items: [

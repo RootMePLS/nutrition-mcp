@@ -14,13 +14,14 @@ import { registerTools } from "./mcp.js";
 
 const DATABASE_URL_TEST = process.env.DATABASE_URL_TEST;
 const RUN_DB_REGRESSION =
+    process.env.RUN_LEGACY_MEAL_DB_TESTS === "1" &&
     Boolean(DATABASE_URL_TEST) &&
     process.env.DATABASE_URL === DATABASE_URL_TEST;
 const describeDb = RUN_DB_REGRESSION ? describe : describe.skip;
 
 if (!RUN_DB_REGRESSION) {
     console.log(
-        "src/legacy-meal-tools.integration.test.ts: SKIPPED — set DATABASE_URL and DATABASE_URL_TEST to the same disposable database URL",
+        "src/legacy-meal-tools.integration.test.ts: SKIPPED — set matching DATABASE_URL/DATABASE_URL_TEST and RUN_LEGACY_MEAL_DB_TESTS=1 for the isolated legacy DB regression suite",
     );
 }
 
@@ -37,12 +38,13 @@ async function callTools(
             args?: Record<string, unknown>,
         ) => Promise<ToolResult>,
     ) => Promise<void>,
+    userId = "u1",
 ): Promise<void> {
     const server = new McpServer(
         { name: "nutrition-mcp-legacy-test", version: "0.0.0" },
         { capabilities: { tools: {}, resources: {} } },
     );
-    registerTools(server, "u1", false, null);
+    registerTools(server, userId, false, null);
     const [clientTransport, serverTransport] =
         InMemoryTransport.createLinkedPair();
     const client = new Client({ name: "legacy-test-client", version: "0.0.0" });
@@ -181,5 +183,155 @@ describeDb("legacy meal MCP tools use the event projection", () => {
             "SELECT to_regclass('public.meals') AS table_name",
         );
         expect(legacy.rows[0]!.table_name).toBeNull();
+    });
+
+    test("bulk import, update, delete and export use current append-only projections", async () => {
+        let mealId = "";
+        await callTools(async (call) => {
+            const imported = await call("bulk_import_meals", {
+                meals: [
+                    {
+                        source_line: 1,
+                        description: "bulk oats",
+                        meal_type: "breakfast",
+                        logged_at: "2026-08-05T23:30:00.000Z",
+                        calories: 321,
+                        notes: "keep this",
+                    },
+                ],
+                expected_row_count: 1,
+                expected_total_kcal: 321,
+                dry_run: false,
+            });
+            expect(imported.isError).not.toBe(true);
+            expect(imported.structuredContent?.summary).toMatchObject({
+                created: 1,
+            });
+
+            const row = await pool.query(
+                "SELECT id FROM meal_events WHERE user_id = $1",
+                ["u1"],
+            );
+            mealId = row.rows[0]!.id as string;
+            const updated = await call("update_meal", {
+                id: mealId,
+                meal_type: "dinner",
+                logged_at: "2026-08-06T00:30:00.000Z",
+                notes: null,
+                calories: 333,
+            });
+            expect(updated.isError).not.toBe(true);
+            expect(updated.content[0]!.text).toContain("333");
+
+            const retry = await call("update_meal", {
+                id: mealId,
+                meal_type: "dinner",
+                logged_at: "2026-08-06T00:30:00.000Z",
+                notes: null,
+                calories: 333,
+            });
+            expect(retry.isError).not.toBe(true);
+
+            const deleted = await call("delete_meal", { id: mealId });
+            expect(deleted.isError).not.toBe(true);
+            const exported = await call("export_meals");
+            expect(exported.isError).not.toBe(true);
+            expect(exported.content[0]!.text).toContain("No meals");
+        });
+
+        const versions = await pool.query(
+            `SELECT version, raw_text_snapshot FROM meal_event_versions
+             WHERE event_id = $1 ORDER BY version`,
+            [mealId],
+        );
+        expect(versions.rows.map((r) => r.version)).toEqual([1, 2]);
+        const root = await pool.query(
+            "SELECT meal_type, consumed_at, status FROM meal_events WHERE id = $1",
+            [mealId],
+        );
+        expect(root.rows[0]).toMatchObject({
+            meal_type: "dinner",
+            status: "deleted",
+        });
+        expect(new Date(root.rows[0]!.consumed_at).toISOString()).toBe(
+            "2026-08-06T00:30:00.000Z",
+        );
+        const notes = await pool.query(
+            `SELECT notes FROM meal_event_items WHERE event_id = $1 AND version = 1`,
+            [mealId],
+        );
+        expect(notes.rows[0]!.notes).toBe("keep this");
+        const currentNotes = await pool.query(
+            `SELECT notes FROM meal_event_items WHERE event_id = $1 AND version = 2`,
+            [mealId],
+        );
+        expect(currentNotes.rows[0]!.notes).toBeNull();
+    });
+
+    test("correction and cleanup are user scoped and preserve another user's rows", async () => {
+        let userOneId = "";
+        await callTools(async (call) => {
+            const logged = await call("log_meal", {
+                description: "user one meal",
+                meal_type: "lunch",
+                logged_at: "2026-08-05T23:59:00.000Z",
+                idempotency_key: "scope-u1",
+            });
+            expect(logged.isError).not.toBe(true);
+            const row = await pool.query(
+                "SELECT id FROM meal_events WHERE user_id = $1",
+                ["u1"],
+            );
+            userOneId = row.rows[0]!.id as string;
+        });
+        await callTools(async (call) => {
+            const logged = await call("log_meal", {
+                description: "user two meal",
+                meal_type: "dinner",
+                idempotency_key: "scope-u2",
+            });
+            expect(logged.isError).not.toBe(true);
+            const foreign = await call("update_meal", {
+                id: userOneId,
+                notes: "must not change",
+            });
+            expect(foreign.isError).toBe(true);
+        }, "u2");
+        const unchanged = await pool.query(
+            `SELECT count(*)::int AS count FROM meal_event_items
+             WHERE event_id = $1 AND version = 1 AND notes IS NULL`,
+            [userOneId],
+        );
+        expect(unchanged.rows[0]!.count).toBe(1);
+    });
+
+    test("account cleanup removes all event children for one user only", async () => {
+        await callTools(async (call) => {
+            const result = await call("log_meal", {
+                description: "cleanup me",
+                meal_type: "snack",
+                idempotency_key: "cleanup-u1",
+            });
+            expect(result.isError).not.toBe(true);
+        });
+        await callTools(async (call) => {
+            const result = await call("log_meal", {
+                description: "keep me",
+                meal_type: "snack",
+                idempotency_key: "cleanup-u2",
+            });
+            expect(result.isError).not.toBe(true);
+        }, "u2");
+        const { deleteAllUserData } = await import("./db.js");
+        await deleteAllUserData("u1");
+        const remaining = await pool.query(
+            "SELECT user_id FROM meal_events ORDER BY user_id",
+        );
+        expect(remaining.rows.map((r) => r.user_id)).toEqual(["u2"]);
+        const children = await pool.query(
+            `SELECT count(*)::int AS count FROM meal_event_items
+             WHERE event_id NOT IN (SELECT id FROM meal_events)`,
+        );
+        expect(children.rows[0]!.count).toBe(0);
     });
 });

@@ -2606,7 +2606,7 @@ export function registerTools(
                         "Grams of pure ethanol — NOT the drink's volume and NOT its ABV. Compute it rather than estimating: grams = millilitres x (ABV% / 100) x 0.789 (a 330 ml 5% beer = 13 g).",
                     ),
                 logged_at: z.string().optional(),
-                notes: z.string().optional(),
+                notes: z.string().nullable().optional(),
             },
             outputSchema: MEAL_PROGRESS_OUTPUT_SCHEMA,
             // Reuses the SAME meal-logged widget as log_meal (see

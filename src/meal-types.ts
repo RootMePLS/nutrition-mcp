@@ -166,6 +166,7 @@ export interface CreateMealEventCommand {
 
 export interface CorrectMealEventCommand {
     event_id: string;
+    user_id: string;
     correction_idempotency_key: string;
     correction_reason?: string | null;
     items: MealEventItemInput[];
@@ -173,6 +174,8 @@ export interface CorrectMealEventCommand {
     media: MealEventMediaInput[];
     provider_results: ProviderResultInput[];
     raw_text_snapshot?: string | null;
+    consumed_at?: Date | string | null;
+    meal_type?: MealType | null;
     parser_policy_version: string;
     created_by: string;
 }

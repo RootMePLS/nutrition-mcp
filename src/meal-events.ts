@@ -530,9 +530,9 @@ export async function correctMealEvent(
             // current version inside the transaction.
             const { rows: roots } = await client.query(
                 `SELECT id, current_version FROM meal_events
-                 WHERE id = $1 AND status = 'active'
+                 WHERE id = $1 AND user_id = $2 AND status = 'active'
                  FOR UPDATE`,
-                [command.event_id],
+                [command.event_id, command.user_id],
             );
             if (roots.length === 0) {
                 throw new MealEventValidationError([
@@ -588,9 +588,21 @@ export async function correctMealEvent(
             // One atomic root pointer update; historical versions untouched.
             await client.query(
                 `UPDATE meal_events
-                 SET current_version = $2, updated_at = now()
-                 WHERE id = $1`,
-                [command.event_id, nextVersion],
+                 SET current_version = $2,
+                     consumed_at = COALESCE($3, consumed_at),
+                     meal_type = CASE WHEN $4::boolean THEN $5 ELSE meal_type END,
+                     updated_at = now()
+                 WHERE id = $1 AND user_id = $6`,
+                [
+                    command.event_id,
+                    nextVersion,
+                    command.consumed_at == null
+                        ? null
+                        : resolveConsumedAt(command.consumed_at, null),
+                    command.meal_type !== undefined,
+                    command.meal_type ?? null,
+                    command.user_id,
+                ],
             );
             return {
                 event_id: command.event_id,

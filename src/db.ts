@@ -105,7 +105,7 @@ export interface MealInput {
     sugar_g?: number;
     alcohol_g?: number;
     logged_at?: string;
-    notes?: string;
+    notes?: string | null;
     idempotency_key?: string;
 }
 
@@ -331,11 +331,12 @@ export async function updateMeal(
         sugar_g: fields.sugar_g ?? current.sugar_g ?? undefined,
         alcohol_g: fields.alcohol_g ?? current.alcohol_g ?? undefined,
         logged_at: fields.logged_at ?? current.logged_at,
-        notes: fields.notes ?? current.notes ?? undefined,
+        notes: fields.notes !== undefined ? fields.notes : current.notes,
     };
     const cmd = compatibilityCommand(userId, merged);
     const correction: CorrectMealEventCommand = {
         event_id: id,
+        user_id: userId,
         correction_idempotency_key: `legacy-update:${id}:${JSON.stringify(fields)}`,
         correction_reason: "legacy update_meal compatibility correction",
         items: cmd.items,
@@ -345,6 +346,8 @@ export async function updateMeal(
         raw_text_snapshot: merged.description,
         parser_policy_version: "legacy-compat-v1",
         created_by: "legacy-update-meal",
+        consumed_at: merged.logged_at,
+        meal_type: merged.meal_type,
     };
     await correctMealEvent(pool, correction);
     const updated = await getMealProjection(pool, userId, id);
