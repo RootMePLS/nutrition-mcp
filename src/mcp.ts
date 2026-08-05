@@ -366,6 +366,17 @@ export { MAX_CALORIES, MAX_MACRO_G, MAX_ALCOHOL_G };
 // 10000 up is a Postgres "numeric field overflow" rather than a saved goal.
 export const MAX_GOAL_G = 9_999.99;
 
+// Per-core-macro coverage: for each of the four core macros, how many meals
+// in the selection carry a calculated value for THAT nutrient. Presence
+// differs per macro (a calorie-only meal covers calories but not protein), so
+// a single any-macro count could falsely imply complete per-macro coverage.
+export interface MealsCalculated {
+    calories: number;
+    protein_g: number;
+    carbs_g: number;
+    fat_g: number;
+}
+
 interface DailyTotals {
     // The four core macros are presence-aware (campaign decision D4): null when
     // NO meal in the selection carries a calculated value for the nutrient —
@@ -378,10 +389,11 @@ interface DailyTotals {
     sugar_g: number;
     alcohol_g: number;
     water_ml: number;
-    // How many meals the selection holds vs how many contributed at least one
-    // calculated core macro — so a partial sum is never read as a complete one.
+    // How many meals the selection holds (meals_total) and, per core macro,
+    // how many of them carry that specific nutrient — so a partial per-
+    // nutrient sum is never read as a complete one.
     meals_total: number;
-    meals_calculated: number;
+    meals_calculated: MealsCalculated;
 }
 
 interface DailyAverages extends Omit<
@@ -404,7 +416,7 @@ function emptyTotals(): DailyTotals {
         alcohol_g: 0,
         water_ml: 0,
         meals_total: 0,
-        meals_calculated: 0,
+        meals_calculated: { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 },
     };
 }
 
@@ -426,10 +438,23 @@ export function presenceSum(meals: Meal[], key: CoreMacroKey): number | null {
     return sum;
 }
 
-// A meal counts as calculated when it carries at least one core macro value —
-// the unit behind meals_calculated.
-function hasCalculatedCore(m: Meal): boolean {
-    return CORE_MACRO_KEYS.some((key) => m[key] != null);
+// Count, per core macro, how many meals carry a calculated value for that
+// specific nutrient — the per-nutrient coverage behind meals_calculated.
+// Shared by sumMeals and trendsDayPayloadOf so the counting rule exists
+// exactly once. An explicit stored 0 counts: it is data, not absence.
+export function coreMacroCounts(meals: Meal[]): MealsCalculated {
+    const counts: MealsCalculated = {
+        calories: 0,
+        protein_g: 0,
+        carbs_g: 0,
+        fat_g: 0,
+    };
+    for (const m of meals) {
+        for (const key of CORE_MACRO_KEYS) {
+            if (m[key] != null) counts[key] += 1;
+        }
+    }
+    return counts;
 }
 
 export function sumMeals(meals: Meal[]): DailyTotals {
@@ -439,8 +464,8 @@ export function sumMeals(meals: Meal[]): DailyTotals {
     totals.protein_g = presenceSum(meals, "protein_g");
     totals.carbs_g = presenceSum(meals, "carbs_g");
     totals.fat_g = presenceSum(meals, "fat_g");
+    totals.meals_calculated = coreMacroCounts(meals);
     for (const m of meals) {
-        if (hasCalculatedCore(m)) totals.meals_calculated += 1;
         // Summed regardless of the alcohol opt-in: the flag gates display, and
         // gating here would make the total depend on when it was computed.
         // The `?? 0` here is a SUM, which is fine — a missing value adds
@@ -487,9 +512,12 @@ export function nutrientPresence(meals: Meal[]): NutrientPresence {
 // Since S3 the core macros are presence-aware too, but only at the edges: a
 // pending day (no calculated values) adds nothing to a core numerator while
 // still counting as a logged day in its denominator — and when NO day in the
-// range carries a calculated value, the average is null, never a fabricated 0.
-// The meals_total/meals_calculated counts (summed over the range) are what
-// disclose such partial coverage; the average itself stays on the historical
+// range carries a calculated value for a nutrient, its average is null, never
+// a fabricated 0. That holds for an EMPTY range too: with no days at all
+// there is no calculated value to average, so every core average is null
+// (water alone keeps its independently documented legacy 0). The
+// meals_total/meals_calculated counts (summed over the range) disclose such
+// partial coverage PER NUTRIENT; the average itself stays on the historical
 // denominator so existing history does not shift.
 export function rangeAverages(
     perDay: Array<{ meals: Meal[]; totals: DailyTotals }>,
@@ -501,30 +529,31 @@ export function rangeAverages(
     const covered = { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 };
     let water = 0;
     let mealsTotal = 0;
-    let mealsCalculated = 0;
+    const mealsCalculated: MealsCalculated = {
+        calories: 0,
+        protein_g: 0,
+        carbs_g: 0,
+        fat_g: 0,
+    };
     for (const { totals } of perDay) {
-        for (const key of [
-            "calories",
-            "protein_g",
-            "carbs_g",
-            "fat_g",
-        ] as const) {
+        for (const key of CORE_MACRO_KEYS) {
             const value = totals[key];
             if (value == null) continue;
             sums[key] += value;
             covered[key] += 1;
+            mealsCalculated[key] += totals.meals_calculated[key];
         }
         water += totals.water_ml;
         mealsTotal += totals.meals_total;
-        mealsCalculated += totals.meals_calculated;
     }
     const mealsByDay = perDay.map((d) => d.meals);
     const fiber = coveredDailyAverage(mealsByDay, "fiber_g");
     const sugar = coveredDailyAverage(mealsByDay, "sugar_g");
     const alcohol = coveredDailyAverage(mealsByDay, "alcohol_g");
-    const n = perDay.length || 1;
     const coreAverage = (key: keyof typeof sums): number | null =>
-        perDay.length > 0 && covered[key] === 0 ? null : sums[key] / n;
+        perDay.length === 0 || covered[key] === 0
+            ? null
+            : sums[key] / perDay.length;
     return {
         averages: {
             calories: coreAverage("calories"),
@@ -534,7 +563,7 @@ export function rangeAverages(
             fiber_g: fiber.avg,
             sugar_g: sugar.avg,
             alcohol_g: alcohol.avg,
-            water_ml: Math.round(water / n),
+            water_ml: Math.round(water / (perDay.length || 1)),
             meals_total: mealsTotal,
             meals_calculated: mealsCalculated,
         },
@@ -623,9 +652,17 @@ export const GOALS_ITEM = z.object({
 
 // Presence contract (campaign decision D4): the four core macros are nullable
 // — null means "no calculated value in the selection", never a coalesced 0,
-// while a stored explicit 0 round-trips as a real 0. meals_total /
-// meals_calculated are integer presence counts so a partial sum is never
-// mistaken for a complete one.
+// while a stored explicit 0 round-trips as a real 0. Coverage is per nutrient:
+// meals_total counts the selection and meals_calculated counts, for EACH core
+// macro, how many meals carry that specific nutrient — presence differs per
+// macro, so a single any-macro count could falsely imply complete coverage.
+export const MEALS_CALCULATED_ITEM = z.object({
+    calories: z.number().int(),
+    protein_g: z.number().int(),
+    carbs_g: z.number().int(),
+    fat_g: z.number().int(),
+});
+
 export const TOTALS_ITEM = z.object({
     calories: z.number().nullable(),
     protein_g: z.number().nullable(),
@@ -636,7 +673,7 @@ export const TOTALS_ITEM = z.object({
     alcohol_g: z.number().nullable(),
     water_ml: z.number(),
     meals_total: z.number().int(),
-    meals_calculated: z.number().int(),
+    meals_calculated: MEALS_CALCULATED_ITEM,
 });
 
 // get_trends' per-day series shape: like TOTALS_ITEM, but fiber_g/sugar_g are
@@ -808,7 +845,7 @@ export function trendsDayPayloadOf(
             alcohol_g: bucket.alcohol_g,
             water_ml: bucket.waterMl,
             meals_total: bucket.meals.length,
-            meals_calculated: bucket.meals.filter(hasCalculatedCore).length,
+            meals_calculated: coreMacroCounts(bucket.meals),
         },
         alcohol,
     );

@@ -224,9 +224,10 @@ describe("sumMeals", () => {
 
 // The S3 presence contract (campaign decision D4): a core macro total is null
 // when NO meal in the selection carries a calculated value for it — never
-// coalesced to 0 — while a stored explicit 0 stays a real 0. meals_total /
-// meals_calculated expose how much of the selection the sum actually covers,
-// so a partial sum is never mistaken for a complete one.
+// coalesced to 0 — while a stored explicit 0 stays a real 0. Coverage is
+// per-macro: meals_total counts the selection, and meals_calculated counts,
+// for EACH core macro, how many meals carry that specific nutrient, so a
+// partial per-nutrient sum is never mistaken for a complete one.
 describe("sumMeals presence contract", () => {
     const pendingMeal = (over: Partial<Meal> = {}): Meal =>
         meal({
@@ -243,7 +244,12 @@ describe("sumMeals presence contract", () => {
         expect(t.protein_g).toBeNull();
         expect(t.carbs_g).toBeNull();
         expect(t.fat_g).toBeNull();
-        expect(t.meals_calculated).toBe(0);
+        expect(t.meals_calculated).toEqual({
+            calories: 0,
+            protein_g: 0,
+            carbs_g: 0,
+            fat_g: 0,
+        });
         expect(t.meals_total).toBe(2);
     });
 
@@ -251,7 +257,12 @@ describe("sumMeals presence contract", () => {
         const t = sumMeals([pendingMeal(), meal({ calories: 300 })]);
         expect(t.calories).toBe(300);
         expect(t.protein_g).toBe(25);
-        expect(t.meals_calculated).toBe(1);
+        expect(t.meals_calculated).toEqual({
+            calories: 1,
+            protein_g: 1,
+            carbs_g: 1,
+            fat_g: 1,
+        });
         expect(t.meals_total).toBe(2);
     });
 
@@ -261,7 +272,12 @@ describe("sumMeals presence contract", () => {
         ]);
         expect(t.calories).toBe(0);
         expect(t.protein_g).toBe(0);
-        expect(t.meals_calculated).toBe(1);
+        expect(t.meals_calculated).toEqual({
+            calories: 1,
+            protein_g: 1,
+            carbs_g: 1,
+            fat_g: 1,
+        });
         expect(t.meals_total).toBe(1);
     });
 
@@ -279,15 +295,59 @@ describe("sumMeals presence contract", () => {
         expect(t.protein_g).toBeNull();
         expect(t.carbs_g).toBeNull();
         expect(t.fat_g).toBeNull();
-        expect(t.meals_calculated).toBe(1);
+        expect(t.meals_calculated).toEqual({
+            calories: 1,
+            protein_g: 0,
+            carbs_g: 0,
+            fat_g: 0,
+        });
         expect(t.meals_total).toBe(2);
+    });
+
+    // The reviewer-terra counterexample: a single any-macro count would read
+    // 2/2 here and falsely imply complete protein coverage. Per-macro counts
+    // must say calories 2/2 but protein/carbs/fat 1/2.
+    test("distinct presence matrix: counts are per-macro, not any-macro", () => {
+        const t = sumMeals([
+            pendingMeal({ calories: 300 }),
+            meal({ calories: 200, protein_g: 10, carbs_g: 20, fat_g: 5 }),
+        ]);
+        expect(t.calories).toBe(500);
+        expect(t.protein_g).toBe(10);
+        expect(t.carbs_g).toBe(20);
+        expect(t.fat_g).toBe(5);
+        expect(t.meals_total).toBe(2);
+        expect(t.meals_calculated).toEqual({
+            calories: 2,
+            protein_g: 1,
+            carbs_g: 1,
+            fat_g: 1,
+        });
+    });
+
+    test("an explicit zero counts as coverage for its own macro only", () => {
+        const t = sumMeals([pendingMeal({ calories: 0 }), pendingMeal()]);
+        expect(t.calories).toBe(0);
+        expect(t.protein_g).toBeNull();
+        expect(t.meals_total).toBe(2);
+        expect(t.meals_calculated).toEqual({
+            calories: 1,
+            protein_g: 0,
+            carbs_g: 0,
+            fat_g: 0,
+        });
     });
 
     test("an empty selection has null core macros and zero counts", () => {
         const t = sumMeals([]);
         expect(t.calories).toBeNull();
         expect(t.meals_total).toBe(0);
-        expect(t.meals_calculated).toBe(0);
+        expect(t.meals_calculated).toEqual({
+            calories: 0,
+            protein_g: 0,
+            carbs_g: 0,
+            fat_g: 0,
+        });
     });
 });
 
@@ -411,10 +471,23 @@ describe("rangeAverages", () => {
         expect(averages.alcohol_g).toBeNull();
     });
 
-    test("an empty range divides nothing by zero", () => {
+    // D4: an empty range has NO meal with a calculated value for any core
+    // nutrient, so core averages are null — never a fabricated numeric 0.
+    // Water keeps its independently documented legacy 0 average.
+    test("an empty range has null core averages and zero counts", () => {
         const { averages } = rangeAverages([]);
-        expect(averages.calories).toBe(0);
+        expect(averages.calories).toBeNull();
+        expect(averages.protein_g).toBeNull();
+        expect(averages.carbs_g).toBeNull();
+        expect(averages.fat_g).toBeNull();
         expect(averages.water_ml).toBe(0);
+        expect(averages.meals_total).toBe(0);
+        expect(averages.meals_calculated).toEqual({
+            calories: 0,
+            protein_g: 0,
+            carbs_g: 0,
+            fat_g: 0,
+        });
     });
 
     test("core averages are null when no day has a calculated value", () => {
@@ -430,7 +503,12 @@ describe("rangeAverages", () => {
         expect(averages.calories).toBeNull();
         expect(averages.protein_g).toBeNull();
         expect(averages.meals_total).toBe(2);
-        expect(averages.meals_calculated).toBe(0);
+        expect(averages.meals_calculated).toEqual({
+            calories: 0,
+            protein_g: 0,
+            carbs_g: 0,
+            fat_g: 0,
+        });
     });
 
     test("a pending day still counts as a logged day in the core denominator", () => {
@@ -446,11 +524,44 @@ describe("rangeAverages", () => {
         ]);
         // The historical rule stands: core macros divide by EVERY logged day —
         // the pending day adds nothing to the numerator but stays in the
-        // denominator. The per-day nulls and presence counts (not the average)
-        // are what disclose the partial coverage.
+        // denominator. The per-day nulls and per-macro presence counts (not
+        // the average) are what disclose the partial coverage.
         expect(averages.calories).toBe(250);
         expect(averages.meals_total).toBe(2);
-        expect(averages.meals_calculated).toBe(1);
+        expect(averages.meals_calculated).toEqual({
+            calories: 1,
+            protein_g: 1,
+            carbs_g: 1,
+            fat_g: 1,
+        });
+    });
+
+    // Range-level distinct presence: calories are covered on both days (2/2
+    // meals) but protein/carbs/fat only on one (1/2). The averages keep the
+    // every-logged-day denominator; the per-macro counts expose the
+    // difference honestly.
+    test("per-macro coverage differs across a range: calories 2/2, protein 1/2", () => {
+        const calorieOnly = {
+            calories: 300,
+            protein_g: null,
+            carbs_g: null,
+            fat_g: null,
+        };
+        const { averages } = rangeAverages([
+            day({ calories: 500, protein_g: 40, carbs_g: 60, fat_g: 10 }),
+            day(calorieOnly),
+        ]);
+        expect(averages.calories).toBe(400);
+        expect(averages.protein_g).toBe(20);
+        expect(averages.carbs_g).toBe(30);
+        expect(averages.fat_g).toBe(5);
+        expect(averages.meals_total).toBe(2);
+        expect(averages.meals_calculated).toEqual({
+            calories: 2,
+            protein_g: 1,
+            carbs_g: 1,
+            fat_g: 1,
+        });
     });
 });
 
@@ -934,7 +1045,12 @@ describe("structuredContent literals satisfy their schemas", () => {
         expect(parsed.carbs_g).toBeNull();
         expect(parsed.fat_g).toBeNull();
         expect(parsed.meals_total).toBe(1);
-        expect(parsed.meals_calculated).toBe(0);
+        expect(parsed.meals_calculated).toEqual({
+            calories: 0,
+            protein_g: 0,
+            carbs_g: 0,
+            fat_g: 0,
+        });
     });
 
     test("an explicit zero survives the payload as a real zero", () => {
@@ -948,7 +1064,43 @@ describe("structuredContent literals satisfy their schemas", () => {
         );
         expect(parsed.calories).toBe(0);
         expect(parsed.meals_total).toBe(1);
-        expect(parsed.meals_calculated).toBe(1);
+        expect(parsed.meals_calculated).toEqual({
+            calories: 1,
+            protein_g: 1,
+            carbs_g: 1,
+            fat_g: 1,
+        });
+    });
+
+    test("distinct presence parses with per-macro coverage counts", () => {
+        const parsed = TOTALS_ITEM.parse(
+            totalsPayloadOf(
+                sumMeals([
+                    meal({
+                        calories: 300,
+                        protein_g: null,
+                        carbs_g: null,
+                        fat_g: null,
+                    }),
+                    meal({
+                        calories: 200,
+                        protein_g: 10,
+                        carbs_g: 20,
+                        fat_g: 5,
+                    }),
+                ]),
+                "us",
+            ),
+        );
+        expect(parsed.calories).toBe(500);
+        expect(parsed.protein_g).toBe(10);
+        expect(parsed.meals_total).toBe(2);
+        expect(parsed.meals_calculated).toEqual({
+            calories: 2,
+            protein_g: 1,
+            carbs_g: 1,
+            fat_g: 1,
+        });
     });
 });
 
@@ -1013,7 +1165,12 @@ describe("trendsDayPayloadOf", () => {
         expect(payload.carbs_g).toBeNull();
         expect(payload.fat_g).toBeNull();
         expect(payload.meals_total).toBe(1);
-        expect(payload.meals_calculated).toBe(0);
+        expect(payload.meals_calculated).toEqual({
+            calories: 0,
+            protein_g: 0,
+            carbs_g: 0,
+            fat_g: 0,
+        });
         expect(() => TRENDS_DAY_ITEM.parse(payload)).not.toThrow();
     });
 
@@ -1031,14 +1188,51 @@ describe("trendsDayPayloadOf", () => {
         expect(payload.calories).toBe(0);
         expect(payload.protein_g).toBe(0);
         expect(payload.meals_total).toBe(1);
-        expect(payload.meals_calculated).toBe(1);
+        expect(payload.meals_calculated).toEqual({
+            calories: 1,
+            protein_g: 1,
+            carbs_g: 1,
+            fat_g: 1,
+        });
     });
 
     test("a day with no meals at all has null core macros and zero counts", () => {
         const payload = trendsDayPayloadOf(bucketWith([]), "us");
         expect(payload.calories).toBeNull();
         expect(payload.meals_total).toBe(0);
-        expect(payload.meals_calculated).toBe(0);
+        expect(payload.meals_calculated).toEqual({
+            calories: 0,
+            protein_g: 0,
+            carbs_g: 0,
+            fat_g: 0,
+        });
+        expect(() => TRENDS_DAY_ITEM.parse(payload)).not.toThrow();
+    });
+
+    // A logged day whose only calculated value is calories: the trends series
+    // must disclose per-macro coverage, never an any-macro count that reads
+    // as complete protein coverage.
+    test("a calorie-only day discloses per-macro coverage", () => {
+        const bucket = bucketWith([
+            meal({
+                calories: 300,
+                protein_g: null,
+                carbs_g: null,
+                fat_g: null,
+            }),
+        ]);
+        const payload = trendsDayPayloadOf(bucket, "us");
+        expect(payload.calories).toBe(300);
+        expect(payload.protein_g).toBeNull();
+        expect(payload.carbs_g).toBeNull();
+        expect(payload.fat_g).toBeNull();
+        expect(payload.meals_total).toBe(1);
+        expect(payload.meals_calculated).toEqual({
+            calories: 1,
+            protein_g: 0,
+            carbs_g: 0,
+            fat_g: 0,
+        });
         expect(() => TRENDS_DAY_ITEM.parse(payload)).not.toThrow();
     });
 

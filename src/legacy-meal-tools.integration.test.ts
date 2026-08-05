@@ -11,7 +11,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Pool } from "pg";
-import { registerTools } from "./mcp.js";
+import { registerTools, TOTALS_ITEM, TRENDS_DAY_ITEM } from "./mcp.js";
+import { z } from "zod";
 import { flushAnalytics } from "./analytics.js";
 import {
     CALCULATION_BUNDLE_OUTPUT_SCHEMA,
@@ -42,6 +43,15 @@ interface ToolResult {
     content: { type: string; text?: string }[];
     structuredContent?: Record<string, unknown>;
 }
+
+// The declared public output schemas, reused to PARSE every structured
+// payload the presence assertions touch — toMatchObject alone cannot prove
+// the payload still satisfies the contract a real MCP client validates
+// against.
+const SUMMARY_DAYS = z.array(
+    TOTALS_ITEM.extend({ date: z.string(), meal_count: z.number() }),
+);
+const TREND_DAYS = z.array(TRENDS_DAY_ITEM);
 
 async function callTools(
     run: (
@@ -654,28 +664,29 @@ describeDb("legacy meal MCP tools use the event projection", () => {
 
                 // Presence contract (campaign decision D4): a pending event
                 // still counts as a logged meal (meals_total), but its core
-                // macros are NULL — never a fabricated 0 — and
-                // meals_calculated discloses that the sum covers nothing.
+                // macros are NULL — never a fabricated 0 — and the per-macro
+                // meals_calculated counts disclose that each sum covers
+                // nothing on the pending day.
                 const summary = await call("get_nutrition_summary", {
                     start_date: "2026-08-05",
                     end_date: "2026-08-06",
                 });
                 expect(summary.isError).not.toBe(true);
-                const days = summary.structuredContent?.days as {
-                    date: string;
-                    meal_count: number;
-                    calories: number | null;
-                    protein_g: number | null;
-                    meals_total: number;
-                    meals_calculated: number;
-                }[];
+                const days = SUMMARY_DAYS.parse(
+                    summary.structuredContent?.days,
+                );
                 expect(days.find((d) => d.date === "2026-08-05")).toMatchObject(
                     {
                         meal_count: 1,
                         calories: 250,
                         protein_g: 20,
                         meals_total: 1,
-                        meals_calculated: 1,
+                        meals_calculated: {
+                            calories: 1,
+                            protein_g: 1,
+                            carbs_g: 1,
+                            fat_g: 1,
+                        },
                     },
                 );
                 expect(days.find((d) => d.date === "2026-08-06")).toMatchObject(
@@ -684,20 +695,29 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                         calories: null,
                         protein_g: null,
                         meals_total: 1,
-                        meals_calculated: 0,
+                        meals_calculated: {
+                            calories: 0,
+                            protein_g: 0,
+                            carbs_g: 0,
+                            fat_g: 0,
+                        },
                     },
                 );
                 // The range average keeps the historical denominator (every
                 // logged day) but cannot invent a figure for the pending day:
-                // 250 over 2 logged days, with the counts exposing coverage.
-                const averages = summary.structuredContent?.averages as {
-                    calories: number | null;
-                    meals_total: number;
-                    meals_calculated: number;
-                };
+                // 250 over 2 logged days, with the per-macro counts exposing
+                // that only 1 of 2 meals carries each nutrient.
+                const averages = TOTALS_ITEM.parse(
+                    summary.structuredContent?.averages,
+                );
                 expect(averages.calories).toBe(125);
                 expect(averages.meals_total).toBe(2);
-                expect(averages.meals_calculated).toBe(1);
+                expect(averages.meals_calculated).toEqual({
+                    calories: 1,
+                    protein_g: 1,
+                    carbs_g: 1,
+                    fat_g: 1,
+                });
                 expect(summary.content[0]!.text).not.toContain("NaN");
                 expect(summary.content[0]!.text).toContain("no data yet");
 
@@ -707,13 +727,21 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                     date: "2026-08-06",
                 });
                 expect(progress.isError).not.toBe(true);
-                expect(progress.structuredContent?.totals).toMatchObject({
+                const progressTotals = TOTALS_ITEM.parse(
+                    progress.structuredContent?.totals,
+                );
+                expect(progressTotals).toMatchObject({
                     calories: null,
                     protein_g: null,
                     carbs_g: null,
                     fat_g: null,
                     meals_total: 1,
-                    meals_calculated: 0,
+                    meals_calculated: {
+                        calories: 0,
+                        protein_g: 0,
+                        carbs_g: 0,
+                        fat_g: 0,
+                    },
                 });
                 expect(progress.content[0]!.text).toContain("no data yet");
                 expect(progress.content[0]!.text).not.toContain("Calories: 0");
@@ -726,20 +754,21 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                     end_date: "2026-08-06",
                 });
                 expect(trends.isError).not.toBe(true);
-                const trendDays = trends.structuredContent?.days as {
-                    date: string;
-                    calories: number | null;
-                    protein_g: number | null;
-                    meals_total: number;
-                    meals_calculated: number;
-                }[];
+                const trendDays = TREND_DAYS.parse(
+                    trends.structuredContent?.days,
+                );
                 expect(
                     trendDays.find((d) => d.date === "2026-08-06"),
                 ).toMatchObject({
                     calories: null,
                     protein_g: null,
                     meals_total: 1,
-                    meals_calculated: 0,
+                    meals_calculated: {
+                        calories: 0,
+                        protein_g: 0,
+                        carbs_g: 0,
+                        fat_g: 0,
+                    },
                 });
                 expect(
                     trendDays.find((d) => d.date === "2026-08-05"),
@@ -747,7 +776,12 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                     calories: 250,
                     protein_g: 20,
                     meals_total: 1,
-                    meals_calculated: 1,
+                    meals_calculated: {
+                        calories: 1,
+                        protein_g: 1,
+                        carbs_g: 1,
+                        fat_g: 1,
+                    },
                 });
 
                 // Export keeps empty fields for the pending event, never zeros.
@@ -821,24 +855,22 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                     end_date: "2026-08-08",
                 });
                 expect(summary.isError).not.toBe(true);
-                const days = summary.structuredContent?.days as {
-                    date: string;
-                    meal_count: number;
-                    calories: number | null;
-                    protein_g: number | null;
-                    carbs_g: number | null;
-                    fat_g: number | null;
-                    meals_total: number;
-                    meals_calculated: number;
-                }[];
-                // Mixed day: partial sum, honest counts.
+                const days = SUMMARY_DAYS.parse(
+                    summary.structuredContent?.days,
+                );
+                // Mixed day: partial sum, honest per-macro counts.
                 expect(days.find((d) => d.date === "2026-08-07")).toMatchObject(
                     {
                         meal_count: 2,
                         calories: 300,
                         protein_g: 12,
                         meals_total: 2,
-                        meals_calculated: 1,
+                        meals_calculated: {
+                            calories: 1,
+                            protein_g: 1,
+                            carbs_g: 1,
+                            fat_g: 1,
+                        },
                     },
                 );
                 // Explicit-zero day: real zeros, fully calculated.
@@ -850,7 +882,12 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                         carbs_g: 0,
                         fat_g: 0,
                         meals_total: 1,
-                        meals_calculated: 1,
+                        meals_calculated: {
+                            calories: 1,
+                            protein_g: 1,
+                            carbs_g: 1,
+                            fat_g: 1,
+                        },
                     },
                 );
 
@@ -858,10 +895,17 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                     date: "2026-08-07",
                 });
                 expect(mixedProgress.isError).not.toBe(true);
-                expect(mixedProgress.structuredContent?.totals).toMatchObject({
+                expect(
+                    TOTALS_ITEM.parse(mixedProgress.structuredContent?.totals),
+                ).toMatchObject({
                     calories: 300,
                     meals_total: 2,
-                    meals_calculated: 1,
+                    meals_calculated: {
+                        calories: 1,
+                        protein_g: 1,
+                        carbs_g: 1,
+                        fat_g: 1,
+                    },
                 });
                 expect(mixedProgress.content[0]!.text).toContain(
                     "Calories: 300",
@@ -871,11 +915,18 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                     date: "2026-08-08",
                 });
                 expect(zeroProgress.isError).not.toBe(true);
-                expect(zeroProgress.structuredContent?.totals).toMatchObject({
+                expect(
+                    TOTALS_ITEM.parse(zeroProgress.structuredContent?.totals),
+                ).toMatchObject({
                     calories: 0,
                     protein_g: 0,
                     meals_total: 1,
-                    meals_calculated: 1,
+                    meals_calculated: {
+                        calories: 1,
+                        protein_g: 1,
+                        carbs_g: 1,
+                        fat_g: 1,
+                    },
                 });
                 expect(zeroProgress.content[0]!.text).toContain(
                     "Calories: 0 kcal",
@@ -889,25 +940,32 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                     end_date: "2026-08-08",
                 });
                 expect(trends.isError).not.toBe(true);
-                const trendDays = trends.structuredContent?.days as {
-                    date: string;
-                    calories: number | null;
-                    meals_total: number;
-                    meals_calculated: number;
-                }[];
+                const trendDays = TREND_DAYS.parse(
+                    trends.structuredContent?.days,
+                );
                 expect(
                     trendDays.find((d) => d.date === "2026-08-07"),
                 ).toMatchObject({
                     calories: 300,
                     meals_total: 2,
-                    meals_calculated: 1,
+                    meals_calculated: {
+                        calories: 1,
+                        protein_g: 1,
+                        carbs_g: 1,
+                        fat_g: 1,
+                    },
                 });
                 expect(
                     trendDays.find((d) => d.date === "2026-08-08"),
                 ).toMatchObject({
                     calories: 0,
                     meals_total: 1,
-                    meals_calculated: 1,
+                    meals_calculated: {
+                        calories: 1,
+                        protein_g: 1,
+                        carbs_g: 1,
+                        fat_g: 1,
+                    },
                 });
 
                 // CSV export: the explicit-zero meal keeps its 0s, the pending
@@ -936,6 +994,190 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                     "",
                     "",
                     "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ]);
+            });
+        },
+    );
+
+    test.serial(
+        "distinct per-nutrient presence, unlogged days and empty ranges disclose per-macro coverage",
+        async () => {
+            // A calorie-only meal beside a fully calculated one on the same
+            // day: calories are covered 2/2 but protein/carbs/fat only 1/2. A
+            // single any-macro count would read 2/2 and lie about protein.
+            await seedProjectionEvent(pool, {
+                userId: "u1",
+                idempotencyKey: "distinct-calorie-only",
+                consumedAt: "2026-08-09T12:00:00.000Z",
+                currentVersion: 1,
+                description: "calorie-only bar",
+                calories: 400,
+                protein_g: null,
+                carbs_g: null,
+                fat_g: null,
+            });
+            await seedProjectionEvent(pool, {
+                userId: "u1",
+                idempotencyKey: "distinct-full",
+                consumedAt: "2026-08-09T13:00:00.000Z",
+                currentVersion: 1,
+                description: "full bowl",
+                calories: 200,
+                protein_g: 10,
+                carbs_g: 20,
+                fat_g: 5,
+            });
+
+            await callTools(async (call) => {
+                // Summary: per-macro counts say calories 2/2, the rest 1/2.
+                const summary = await call("get_nutrition_summary", {
+                    start_date: "2026-08-09",
+                    end_date: "2026-08-09",
+                });
+                expect(summary.isError).not.toBe(true);
+                const days = SUMMARY_DAYS.parse(
+                    summary.structuredContent?.days,
+                );
+                expect(days.find((d) => d.date === "2026-08-09")).toMatchObject(
+                    {
+                        meal_count: 2,
+                        calories: 600,
+                        protein_g: 10,
+                        meals_total: 2,
+                        meals_calculated: {
+                            calories: 2,
+                            protein_g: 1,
+                            carbs_g: 1,
+                            fat_g: 1,
+                        },
+                    },
+                );
+                const averages = TOTALS_ITEM.parse(
+                    summary.structuredContent?.averages,
+                );
+                expect(averages.calories).toBe(600);
+                expect(averages.protein_g).toBe(10);
+                expect(averages.meals_total).toBe(2);
+                expect(averages.meals_calculated).toEqual({
+                    calories: 2,
+                    protein_g: 1,
+                    carbs_g: 1,
+                    fat_g: 1,
+                });
+
+                // Goal progress over the distinct-presence day.
+                const progress = await call("get_goal_progress", {
+                    date: "2026-08-09",
+                });
+                expect(progress.isError).not.toBe(true);
+                expect(
+                    TOTALS_ITEM.parse(progress.structuredContent?.totals),
+                ).toMatchObject({
+                    calories: 600,
+                    protein_g: 10,
+                    meals_total: 2,
+                    meals_calculated: {
+                        calories: 2,
+                        protein_g: 1,
+                        carbs_g: 1,
+                        fat_g: 1,
+                    },
+                });
+
+                // Trends: the logged day shows 2/1/1/1 coverage; the unlogged
+                // day before it shows null cores and zero per-macro coverage.
+                const trends = await call("get_trends", {
+                    days: 2,
+                    end_date: "2026-08-09",
+                });
+                expect(trends.isError).not.toBe(true);
+                const trendDays = TREND_DAYS.parse(
+                    trends.structuredContent?.days,
+                );
+                expect(
+                    trendDays.find((d) => d.date === "2026-08-09"),
+                ).toMatchObject({
+                    calories: 600,
+                    protein_g: 10,
+                    meals_total: 2,
+                    meals_calculated: {
+                        calories: 2,
+                        protein_g: 1,
+                        carbs_g: 1,
+                        fat_g: 1,
+                    },
+                });
+                expect(
+                    trendDays.find((d) => d.date === "2026-08-08"),
+                ).toMatchObject({
+                    calories: null,
+                    protein_g: null,
+                    carbs_g: null,
+                    fat_g: null,
+                    meals_total: 0,
+                    meals_calculated: {
+                        calories: 0,
+                        protein_g: 0,
+                        carbs_g: 0,
+                        fat_g: 0,
+                    },
+                });
+
+                // Empty range (D4): core averages are null — never fabricated
+                // numeric 0s — with zero meals and zero per-macro coverage.
+                const empty = await call("get_nutrition_summary", {
+                    start_date: "2026-08-20",
+                    end_date: "2026-08-21",
+                });
+                expect(empty.isError).not.toBe(true);
+                const emptyAverages = TOTALS_ITEM.parse(
+                    empty.structuredContent?.averages,
+                );
+                expect(emptyAverages.calories).toBeNull();
+                expect(emptyAverages.protein_g).toBeNull();
+                expect(emptyAverages.carbs_g).toBeNull();
+                expect(emptyAverages.fat_g).toBeNull();
+                expect(emptyAverages.meals_total).toBe(0);
+                expect(emptyAverages.meals_calculated).toEqual({
+                    calories: 0,
+                    protein_g: 0,
+                    carbs_g: 0,
+                    fat_g: 0,
+                });
+                expect(
+                    SUMMARY_DAYS.parse(empty.structuredContent?.days),
+                ).toEqual([]);
+
+                // CSV: the calorie-only meal keeps its calories and leaves the
+                // uncovered macro cells empty; the full meal keeps every value.
+                const exported = await call("export_meals");
+                expect(exported.isError).not.toBe(true);
+                const csv = await Bun.file("./exports/u1/meals.csv").text();
+                const calorieOnlyLine = csv
+                    .split("\n")
+                    .find((line) => line.includes("calorie-only bar"))!;
+                expect(calorieOnlyLine.split(",").slice(5)).toEqual([
+                    "400",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ]);
+                const fullLine = csv
+                    .split("\n")
+                    .find((line) => line.includes("full bowl"))!;
+                expect(fullLine.split(",").slice(5)).toEqual([
+                    "200",
+                    "10",
+                    "20",
+                    "5",
                     "",
                     "",
                     "",
