@@ -6,6 +6,9 @@ out
 dist
 *.tgz
 
+# generated meal exports (disposable test/runtime artifacts)
+exports/
+
 # code coverage
 coverage
 *.lcov

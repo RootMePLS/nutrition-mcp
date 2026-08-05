@@ -1,5 +1,6 @@
 import {
     afterAll,
+    afterEach,
     beforeAll,
     beforeEach,
     describe,
@@ -12,6 +13,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerTools } from "./mcp.js";
 import { startMealCapture } from "./meal-captures.js";
+import { flushAnalytics } from "./analytics.js";
 
 // ---------------------------------------------------------------------------
 // Bounded MCP tool: log_meal_event. The caller supplies already-prepared
@@ -117,6 +119,12 @@ describeDb("log_meal_event MCP tool (requires DATABASE_URL_TEST)", () => {
 
     afterAll(async () => {
         await pool.end();
+    });
+
+    // Drain fire-and-forget analytics writes before the next test drops the
+    // schema, so no write lands on a missing tool_analytics table.
+    afterEach(async () => {
+        await flushAnalytics();
     });
 
     beforeEach(async () => {
@@ -298,6 +306,9 @@ describeDb("meal capture MCP lifecycle tools", () => {
         pool = new Pool({ connectionString: DATABASE_URL_TEST });
     });
     afterAll(() => pool.end());
+    afterEach(async () => {
+        await flushAnalytics();
+    });
     beforeEach(async () => {
         const client = await pool.connect();
         try {

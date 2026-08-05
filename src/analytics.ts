@@ -70,8 +70,20 @@ function calculateDateRangeDays(
     );
 }
 
+// Fire-and-forget writes in flight. Tracked so tests can drain them before
+// resetting the schema — otherwise a write issued at the end of one test can
+// land after the next test's DROP SCHEMA and warn about a missing table.
+const pendingWrites = new Set<Promise<void>>();
+
+/** Test hook: wait until every queued analytics write has settled. */
+export async function flushAnalytics(): Promise<void> {
+    while (pendingWrites.size > 0) {
+        await Promise.allSettled([...pendingWrites]);
+    }
+}
+
 function persistAnalytics(record: AnalyticsRecord): void {
-    getPool()
+    const write = getPool()
         .query(
             `INSERT INTO tool_analytics
                 (user_id, tool_name, success, duration_ms, error_category,
@@ -88,12 +100,17 @@ function persistAnalytics(record: AnalyticsRecord): void {
                 record.invoked_at,
             ],
         )
-        .catch((error: unknown) => {
-            console.warn(
-                `Failed to persist analytics for ${record.tool_name}:`,
-                (error as Error).message,
-            );
-        });
+        .then(
+            () => undefined,
+            (error: unknown) => {
+                console.warn(
+                    `Failed to persist analytics for ${record.tool_name}:`,
+                    (error as Error).message,
+                );
+            },
+        );
+    pendingWrites.add(write);
+    void write.finally(() => pendingWrites.delete(write));
 }
 
 /**

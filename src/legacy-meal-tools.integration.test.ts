@@ -1,5 +1,6 @@
 import {
     afterAll,
+    afterEach,
     beforeAll,
     beforeEach,
     describe,
@@ -11,6 +12,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Pool } from "pg";
 import { registerTools } from "./mcp.js";
+import { flushAnalytics } from "./analytics.js";
 
 const DATABASE_URL_TEST = process.env.DATABASE_URL_TEST;
 const RUN_DB_REGRESSION =
@@ -85,6 +87,10 @@ async function seedProjectionEvent(
         description: string;
         calories: number | null;
         protein_g?: number | null;
+        carbs_g?: number | null;
+        fat_g?: number | null;
+        canonicalStatus?: "pending" | "ready" | "low_confidence";
+        consensusStatus?: string;
     },
 ): Promise<string> {
     const currentVersion = opts.currentVersion ?? 2;
@@ -125,12 +131,28 @@ async function seedProjectionEvent(
             `INSERT INTO meal_event_canonical_results
                 (event_id, version, ordinal, status, consensus_status, calories, protein_g,
                  carbs_g, fat_g, fiber_g, sugar_g, alcohol_g, policy_version)
-             VALUES ($1, $2, NULL, 'ready', 'all_agree', $3, $4, 10, 5, NULL, NULL, NULL, 'fixture')`,
+             VALUES ($1, $2, NULL, $5, $6, $3, $4, $7, $8, NULL, NULL, NULL, 'fixture')`,
             [
                 eventId,
                 version,
                 version === currentVersion ? opts.calories : 9999,
-                version === currentVersion ? (opts.protein_g ?? 20) : 999,
+                version === currentVersion
+                    ? opts.protein_g === undefined
+                        ? 20
+                        : opts.protein_g
+                    : 999,
+                opts.canonicalStatus ?? "ready",
+                opts.consensusStatus ?? "all_agree",
+                version === currentVersion
+                    ? opts.carbs_g === undefined
+                        ? 10
+                        : opts.carbs_g
+                    : 10,
+                version === currentVersion
+                    ? opts.fat_g === undefined
+                        ? 5
+                        : opts.fat_g
+                    : 5,
             ],
         );
     }
@@ -153,6 +175,12 @@ describeDb("legacy meal MCP tools use the event projection", () => {
     });
 
     afterAll(() => pool.end());
+
+    // Drain fire-and-forget analytics writes before the next test drops the
+    // schema, so no write lands on a missing tool_analytics table.
+    afterEach(async () => {
+        await flushAnalytics();
+    });
 
     beforeEach(async () => {
         const client = await pool.connect();
@@ -535,6 +563,226 @@ describeDb("legacy meal MCP tools use the event projection", () => {
             "SELECT count(*)::int AS count FROM meal_events WHERE user_id = 'u1' AND status = 'active'",
         );
         expect(count.rows[0]!.count).toBe(2);
+    });
+
+    test("pending event-scope nutrition retains nulls end to end and never fabricates zeros", async () => {
+        const pendingId = await seedProjectionEvent(pool, {
+            userId: "u1",
+            idempotencyKey: "pending-nutrition",
+            consumedAt: "2026-08-06T12:00:00.000Z",
+            currentVersion: 1,
+            description: "pending oats",
+            calories: null,
+            protein_g: null,
+            carbs_g: null,
+            fat_g: null,
+            canonicalStatus: "pending",
+            consensusStatus: "insufficient_data",
+        });
+        await seedProjectionEvent(pool, {
+            userId: "u1",
+            idempotencyKey: "ready-nutrition",
+            consumedAt: "2026-08-05T12:00:00.000Z",
+            currentVersion: 1,
+            description: "ready oats",
+            calories: 250,
+            protein_g: 20,
+        });
+
+        // The stored event-scope canonical row stays pending with NULL nutrients.
+        const stored = await pool.query(
+            `SELECT status, calories, protein_g FROM meal_event_canonical_results
+             WHERE event_id = $1 AND ordinal IS NULL`,
+            [pendingId],
+        );
+        expect(stored.rows[0]).toMatchObject({
+            status: "pending",
+            calories: null,
+            protein_g: null,
+        });
+
+        await callTools(async (call) => {
+            // Reads retain nulls: no fabricated "Calories: 0" line.
+            const byDate = await call("get_meals_by_date", {
+                date: "2026-08-06",
+            });
+            expect(byDate.isError).not.toBe(true);
+            expect(byDate.content[0]!.text).toContain("pending oats");
+            expect(byDate.content[0]!.text).not.toContain("Calories:");
+            expect(byDate.content[0]!.text).not.toContain("Protein:");
+
+            // Approved aggregation contract: a pending event still counts as a
+            // logged meal but adds nothing to the nutrient sums, while the
+            // ready event on the other day keeps its values.
+            const summary = await call("get_nutrition_summary", {
+                start_date: "2026-08-05",
+                end_date: "2026-08-06",
+            });
+            expect(summary.isError).not.toBe(true);
+            const days = summary.structuredContent?.days as {
+                date: string;
+                meal_count: number;
+                calories: number;
+                protein_g: number;
+            }[];
+            expect(days.find((d) => d.date === "2026-08-05")).toMatchObject({
+                meal_count: 1,
+                calories: 250,
+                protein_g: 20,
+            });
+            expect(days.find((d) => d.date === "2026-08-06")).toMatchObject({
+                meal_count: 1,
+                calories: 0,
+                protein_g: 0,
+            });
+            expect(summary.content[0]!.text).not.toContain("NaN");
+
+            // Export keeps empty fields for the pending event, never zeros.
+            const exported = await call("export_meals");
+            expect(exported.isError).not.toBe(true);
+            expect(exported.content[0]!.text).toContain("2 meal");
+            const csv = await Bun.file("./exports/u1/meals.csv").text();
+            const pendingLine = csv
+                .split("\n")
+                .find((line) => line.includes("pending oats"))!;
+            // id, logged_at, timezone, meal_type, description, then the eight
+            // nutrient/notes fields — all empty for a pending event.
+            expect(pendingLine.split(",").slice(5)).toEqual([
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ]);
+        });
+    });
+
+    test("timezone local midnight assigns events to the correct local day on both sides", async () => {
+        await pool.query(
+            "INSERT INTO profiles (user_id, timezone) VALUES ('u1', 'America/New_York')",
+        );
+        // New York is UTC-4 in August: 04:00:00Z is exactly local midnight.
+        await seedProjectionEvent(pool, {
+            userId: "u1",
+            idempotencyKey: "tz-before-midnight",
+            consumedAt: "2026-08-05T03:59:59.000Z", // 2026-08-04 23:59:59 local
+            currentVersion: 1,
+            description: "before midnight snack",
+            calories: 111,
+        });
+        await seedProjectionEvent(pool, {
+            userId: "u1",
+            idempotencyKey: "tz-after-midnight",
+            consumedAt: "2026-08-05T04:00:01.000Z", // 2026-08-05 00:00:01 local
+            currentVersion: 1,
+            description: "after midnight snack",
+            calories: 222,
+        });
+        await callTools(async (call) => {
+            const before = await call("get_meals_by_date", {
+                date: "2026-08-04",
+            });
+            expect(before.isError).not.toBe(true);
+            expect(before.content[0]!.text).toContain("before midnight snack");
+            expect(before.content[0]!.text).not.toContain(
+                "after midnight snack",
+            );
+
+            const after = await call("get_meals_by_date", {
+                date: "2026-08-05",
+            });
+            expect(after.isError).not.toBe(true);
+            expect(after.content[0]!.text).toContain("after midnight snack");
+            expect(after.content[0]!.text).not.toContain(
+                "before midnight snack",
+            );
+
+            const summary = await call("get_nutrition_summary", {
+                start_date: "2026-08-04",
+                end_date: "2026-08-05",
+            });
+            expect(summary.isError).not.toBe(true);
+            const days = summary.structuredContent?.days as {
+                date: string;
+                meal_count: number;
+                calories: number;
+            }[];
+            expect(days.find((d) => d.date === "2026-08-04")).toMatchObject({
+                meal_count: 1,
+                calories: 111,
+            });
+            expect(days.find((d) => d.date === "2026-08-05")).toMatchObject({
+                meal_count: 1,
+                calories: 222,
+            });
+        });
+    });
+
+    test("export carries the active correction before deletion excludes the event", async () => {
+        let mealId = "";
+        await callTools(async (call) => {
+            const logged = await call("log_meal", {
+                description: "correction export meal",
+                meal_type: "lunch",
+                calories: 400,
+                protein_g: 30,
+                carbs_g: 50,
+                fat_g: 12,
+                logged_at: "2026-08-05T12:00:00.000Z",
+                idempotency_key: "export-correction",
+            });
+            expect(logged.isError).not.toBe(true);
+            const row = await pool.query(
+                "SELECT id FROM meal_events WHERE user_id = $1",
+                ["u1"],
+            );
+            mealId = row.rows[0]!.id as string;
+
+            const corrected = await call("update_meal", {
+                id: mealId,
+                meal_type: "dinner",
+                logged_at: "2026-08-05T18:30:00.000Z",
+                calories: 555,
+                protein_g: 35,
+                notes: "corrected note",
+            });
+            expect(corrected.isError).not.toBe(true);
+
+            // Export BEFORE deletion: exactly one row with the corrected
+            // current-version totals and root fields.
+            const exported = await call("export_meals");
+            expect(exported.isError).not.toBe(true);
+            expect(exported.content[0]!.text).toContain("1 meal");
+            const csv = await Bun.file("./exports/u1/meals.csv").text();
+            const lines = csv.split("\n");
+            expect(lines.length).toBe(2); // header + one data row
+            const fields = lines[1]!.split(",");
+            expect(fields[1]).toBe("2026-08-05 18:30:00");
+            expect(fields[3]).toBe("dinner");
+            expect(fields[4]).toBe("correction export meal");
+            expect(fields[5]).toBe("555");
+            expect(fields[6]).toBe("35");
+            expect(fields[12]).toBe("corrected note");
+
+            // Only after the export does deletion exclude the event.
+            const deleted = await call("delete_meal", { id: mealId });
+            expect(deleted.isError).not.toBe(true);
+            const afterDelete = await call("export_meals");
+            expect(afterDelete.isError).not.toBe(true);
+            expect(afterDelete.content[0]!.text).toContain("No meals");
+        });
+        const root = await pool.query(
+            "SELECT meal_type, status, current_version FROM meal_events WHERE id = $1",
+            [mealId],
+        );
+        expect(root.rows[0]).toMatchObject({
+            meal_type: "dinner",
+            status: "deleted",
+            current_version: 2,
+        });
     });
 
     test("account cleanup removes every event child and preserves unrelated user data", async () => {
