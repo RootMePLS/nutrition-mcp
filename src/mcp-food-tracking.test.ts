@@ -602,7 +602,7 @@ describeDb("meal capture MCP lifecycle tools", () => {
             expect(illegal.isError).toBe(true);
         });
     });
-    test("rejects cross-user capture message, answer, and draft mutations", async () => {
+    test("rejects cross-user capture message, answer, and draft mutations without persisting rows", async () => {
         const other = await startMealCapture(pool, {
             user_id: "u2",
             conversation_key: "other-mutators",

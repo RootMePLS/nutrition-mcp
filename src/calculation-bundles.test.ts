@@ -14,6 +14,7 @@ import {
 } from "./calculation-bundles.js";
 import {
     validateCalculationCorrection,
+    CALCULATION_BUNDLE_OUTPUT_SCHEMA,
     CALCULATION_CORRECTION_OUTPUT_SCHEMA,
     type CalculationCorrectionMetadata,
 } from "./calculation-bundles.js";
@@ -55,43 +56,102 @@ describe("calculation bundle commit seam", () => {
         ).toContain("user id is required");
     });
 
-    test("correction output contract is strict and exposes durable result fields", () => {
-        expect(CALCULATION_CORRECTION_OUTPUT_SCHEMA).toBeDefined();
+    test("correction output contract is a distinct strict schema carrying correction metadata", () => {
+        // D7: the correction contract must NOT be the bundle contract.
+        expect(CALCULATION_CORRECTION_OUTPUT_SCHEMA).not.toBe(
+            CALCULATION_BUNDLE_OUTPUT_SCHEMA,
+        );
+        const bundleFields = {
+            event_id: "00000000-0000-4000-8000-000000000001",
+            version: 2,
+            fingerprint: "fp",
+            deduplicated: false,
+            provenance_status: "ready",
+            compatibility: false,
+            is_current: true,
+            canonical: {
+                status: "ready",
+                consensus_status: "all_agree",
+                nutrients: {
+                    calories: 1,
+                    protein_g: null,
+                    carbs_g: null,
+                    fat_g: null,
+                    fiber_g: null,
+                    sugar_g: null,
+                    alcohol_g: null,
+                },
+                eligible_providers: [],
+                outlier_providers: [],
+                threshold_percent: 10,
+                policy_version: "p",
+                source_result_ids: ["source-1"],
+                audit_evidence: { fingerprint: "fp" },
+                algorithm_version: "p",
+            },
+            provider_results: [],
+            item_canonicals: [],
+            external_sync: "not_authorized",
+        };
+        const correctionFields = {
+            prior_version: 1,
+            correction_reason: "portion clarified",
+            correction_author: "hermes",
+        };
+        // A valid correction output parses and carries all three fields.
         expect(
             CALCULATION_CORRECTION_OUTPUT_SCHEMA.parse({
-                event_id: "00000000-0000-4000-8000-000000000001",
-                version: 2,
-                fingerprint: "fp",
-                deduplicated: false,
-                provenance_status: "ready",
-                compatibility: false,
-                is_current: true,
-                canonical: {
-                    status: "ready",
-                    consensus_status: "all_agree",
-                    nutrients: {
-                        calories: 1,
-                        protein_g: null,
-                        carbs_g: null,
-                        fat_g: null,
-                        fiber_g: null,
-                        sugar_g: null,
-                        alcohol_g: null,
-                    },
-                    eligible_providers: [],
-                    outlier_providers: [],
-                    threshold_percent: 10,
-                    policy_version: "p",
-                    source_result_ids: ["source-1"],
-                    audit_evidence: { fingerprint: "fp" },
-                    algorithm_version: "p",
-                },
-                provider_results: [],
-                item_canonicals: [],
-                external_sync: "not_authorized",
+                ...bundleFields,
+                ...correctionFields,
             }),
-        ).toMatchObject({ version: 2 });
-        expect(() => CALCULATION_CORRECTION_OUTPUT_SCHEMA.parse({})).toThrow();
+        ).toMatchObject({ version: 2, ...correctionFields });
+        // Correction metadata is required: the bare bundle shape fails.
+        expect(() =>
+            CALCULATION_CORRECTION_OUTPUT_SCHEMA.parse(bundleFields),
+        ).toThrow();
+        // Each correction field is individually required.
+        for (const key of Object.keys(correctionFields)) {
+            const partial: Record<string, unknown> = { ...correctionFields };
+            delete partial[key];
+            expect(() =>
+                CALCULATION_CORRECTION_OUTPUT_SCHEMA.parse({
+                    ...bundleFields,
+                    ...partial,
+                }),
+            ).toThrow();
+        }
+        // Field constraints: prior_version is a positive integer; reason and
+        // author are non-empty strings.
+        expect(() =>
+            CALCULATION_CORRECTION_OUTPUT_SCHEMA.parse({
+                ...bundleFields,
+                ...correctionFields,
+                prior_version: 0,
+            }),
+        ).toThrow();
+        expect(() =>
+            CALCULATION_CORRECTION_OUTPUT_SCHEMA.parse({
+                ...bundleFields,
+                ...correctionFields,
+                correction_reason: "",
+            }),
+        ).toThrow();
+        // Strict: unexpected keys are rejected.
+        expect(() =>
+            CALCULATION_CORRECTION_OUTPUT_SCHEMA.parse({
+                ...bundleFields,
+                ...correctionFields,
+                surprise: true,
+            }),
+        ).toThrow();
+        // The bundle schema stays clean: correction metadata does not leak
+        // into the base contract.
+        expect(() =>
+            CALCULATION_BUNDLE_OUTPUT_SCHEMA.parse({
+                ...bundleFields,
+                ...correctionFields,
+            }),
+        ).toThrow();
     });
     test("discovers additive commit tool and rejects malformed bundles", async () => {
         const server = new McpServer(

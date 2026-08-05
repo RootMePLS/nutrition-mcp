@@ -1527,6 +1527,9 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                     deduplicated: false,
                     external_sync: "pending",
                     provenance_status: "unavailable",
+                    prior_version: 1,
+                    correction_reason: "portion corrected",
+                    correction_author: "hermes",
                 });
                 const replay = await call("commit_calculation_correction", {
                     bundle: corrected,
@@ -1544,6 +1547,9 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                 ).toMatchObject({
                     version: 2,
                     deduplicated: true,
+                    prior_version: 1,
+                    correction_reason: "portion corrected",
+                    correction_author: "hermes",
                 });
                 const beforeConflict = await calculationCounts(pool, eventId);
                 const conflict = await call("commit_calculation_correction", {

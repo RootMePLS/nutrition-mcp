@@ -132,7 +132,11 @@ export const CALCULATION_BUNDLE_OUTPUT_SCHEMA = z
     .strict();
 
 export const CALCULATION_CORRECTION_OUTPUT_SCHEMA =
-    CALCULATION_BUNDLE_OUTPUT_SCHEMA;
+    CALCULATION_BUNDLE_OUTPUT_SCHEMA.extend({
+        prior_version: z.number().int().min(1),
+        correction_reason: z.string().min(1),
+        correction_author: z.string().min(1),
+    }).strict();
 
 export const CALCULATION_PROVENANCE_OUTPUT_SCHEMA = z
     .object({

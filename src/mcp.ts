@@ -197,6 +197,33 @@ export function buildCalculationBundleOutput(
     });
 }
 
+// Correction commits return the full bundle contract plus the correction
+// metadata accepted with the request (D7). prior_version is the actual
+// pre-correction version: the domain enforces bundle.version ===
+// current_version + 1 on a fresh commit and verifies the persisted version
+// identity on idempotent replay, so version - 1 IS the persisted prior
+// version on both fresh and replayed responses. reason/author are the
+// accepted correction request values (replay verifies they match the
+// persisted correction identity before this builder runs).
+export function buildCalculationCorrectionOutput(
+    result: Awaited<ReturnType<typeof commitCalculationCorrection>>,
+    readback: {
+        aggregate: MealEventAggregate;
+        provenance_status: "ready" | "pending" | "unavailable" | "missing";
+        compatibility: boolean;
+        is_current: boolean;
+    },
+    correction: { correction_reason: string; correction_author: string },
+    external_sync: "not_authorized" | "pending" = "not_authorized",
+) {
+    return CALCULATION_CORRECTION_OUTPUT_SCHEMA.parse({
+        ...buildCalculationBundleOutput(result, readback, external_sync),
+        prior_version: result.version - 1,
+        correction_reason: correction.correction_reason,
+        correction_author: correction.correction_author,
+    });
+}
+
 import type {
     CreateMealEventCommand,
     MealEventItemInput,
@@ -5446,9 +5473,10 @@ export function registerTools(
                     "committed calculation correction readback missing",
                 );
             }
-            const structuredContent = buildCalculationBundleOutput(
+            const structuredContent = buildCalculationCorrectionOutput(
                 result,
                 readback,
+                { correction_reason, correction_author },
                 external_write_authorized ? "pending" : "not_authorized",
             );
             return {
