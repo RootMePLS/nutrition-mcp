@@ -33,6 +33,9 @@
         "format": "bunx prettier --write .",
         "format:check": "bunx prettier --check .",
         "typecheck": "bun run scripts/typecheck.ts",
+        "test:unit": "bun run scripts/test-unit-gate.ts",
+        "test:db": "bun run scripts/test-db-gate.ts",
+        "test:acceptance": "bun run test:unit && bun run test:db",
         "depersonalize": "bun run scripts/depersonalize.ts"
     },
     "dependencies": {

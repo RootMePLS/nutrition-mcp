@@ -74,6 +74,77 @@ const migrations = [
     "005_calculation_corrections.sql",
 ];
 
+async function seedProjectionEvent(
+    pool: Pool,
+    opts: {
+        userId: string;
+        idempotencyKey: string;
+        consumedAt: string;
+        currentVersion?: number;
+        status?: "active" | "deleted";
+        description: string;
+        calories: number | null;
+        protein_g?: number | null;
+    },
+): Promise<string> {
+    const currentVersion = opts.currentVersion ?? 2;
+    const { rows } = await pool.query(
+        `INSERT INTO meal_events
+            (user_id, reported_at, consumed_at, meal_type, status, current_version, idempotency_key)
+         VALUES ($1, $2, $2, 'lunch', $3, $4, $5) RETURNING id`,
+        [
+            opts.userId,
+            opts.consumedAt,
+            opts.status ?? "active",
+            currentVersion,
+            opts.idempotencyKey,
+        ],
+    );
+    const eventId = rows[0]!.id as string;
+    for (let version = 1; version <= currentVersion; version++) {
+        await pool.query(
+            `INSERT INTO meal_event_versions
+                (event_id, version, raw_text_snapshot, parser_policy_version, created_by)
+             VALUES ($1, $2, $3, 'fixture', 'terra-test')`,
+            [eventId, version, `${opts.description} v${version}`],
+        );
+        await pool.query(
+            `INSERT INTO meal_event_items
+                (event_id, version, ordinal, raw_item_text, normalized_name, notes)
+             VALUES ($1, $2, 0, $3, $3, $4)`,
+            [
+                eventId,
+                version,
+                version === currentVersion
+                    ? opts.description
+                    : `${opts.description} stale`,
+                version === currentVersion ? null : "stale note",
+            ],
+        );
+        await pool.query(
+            `INSERT INTO meal_event_canonical_results
+                (event_id, version, ordinal, status, consensus_status, calories, protein_g,
+                 carbs_g, fat_g, fiber_g, sugar_g, alcohol_g, policy_version)
+             VALUES ($1, $2, NULL, 'ready', 'all_agree', $3, $4, 10, 5, NULL, NULL, NULL, 'fixture')`,
+            [
+                eventId,
+                version,
+                version === currentVersion ? opts.calories : 9999,
+                version === currentVersion ? (opts.protein_g ?? 20) : 999,
+            ],
+        );
+    }
+    // An item-scope canonical row must not be mistaken for the event total.
+    await pool.query(
+        `INSERT INTO meal_event_canonical_results
+            (event_id, version, ordinal, status, consensus_status, calories, protein_g,
+             carbs_g, fat_g, policy_version)
+         VALUES ($1, $2, 0, 'ready', 'all_agree', 777, 777, 777, 777, 'fixture')`,
+        [eventId, currentVersion],
+    );
+    return eventId;
+}
+
 describeDb("legacy meal MCP tools use the event projection", () => {
     let pool: Pool;
 
@@ -305,33 +376,256 @@ describeDb("legacy meal MCP tools use the event projection", () => {
         expect(unchanged.rows[0]!.count).toBe(1);
     });
 
-    test("account cleanup removes all event children for one user only", async () => {
-        await callTools(async (call) => {
-            const result = await call("log_meal", {
-                description: "cleanup me",
-                meal_type: "snack",
-                idempotency_key: "cleanup-u1",
-            });
-            expect(result.isError).not.toBe(true);
+    test("projection reads only current event scope, excludes deleted rows, preserves nulls, and respects timezone boundaries", async () => {
+        await pool.query(
+            "INSERT INTO profiles (user_id, timezone) VALUES ('u1', 'America/New_York')",
+        );
+        const currentId = await seedProjectionEvent(pool, {
+            userId: "u1",
+            idempotencyKey: "projection-current",
+            consumedAt: "2026-08-05T04:00:00.000Z",
+            description: "current oatmeal",
+            calories: 250,
+            protein_g: 20,
+        });
+        await seedProjectionEvent(pool, {
+            userId: "u1",
+            idempotencyKey: "projection-deleted",
+            consumedAt: "2026-08-05T05:00:00.000Z",
+            description: "deleted oatmeal",
+            calories: 900,
+            status: "deleted",
+        });
+        await seedProjectionEvent(pool, {
+            userId: "u2",
+            idempotencyKey: "projection-other-user",
+            consumedAt: "2026-08-05T04:00:00.000Z",
+            description: "private oatmeal",
+            calories: 700,
         });
         await callTools(async (call) => {
-            const result = await call("log_meal", {
-                description: "keep me",
-                meal_type: "snack",
-                idempotency_key: "cleanup-u2",
+            const onBoundary = await call("get_meals_by_date", {
+                date: "2026-08-05",
             });
-            expect(result.isError).not.toBe(true);
+            expect(onBoundary.isError).not.toBe(true);
+            expect(onBoundary.content[0]!.text).toContain("current oatmeal");
+            expect(onBoundary.content[0]!.text).not.toContain(
+                "deleted oatmeal",
+            );
+            expect(onBoundary.content[0]!.text).toContain("Calories: 250");
+            expect(onBoundary.content[0]!.text).not.toContain("9999");
+
+            const summary = await call("get_nutrition_summary", {
+                start_date: "2026-08-04",
+                end_date: "2026-08-05",
+            });
+            expect(summary.content[0]!.text).toContain("250 kcal");
+            expect(summary.content[0]!.text).not.toContain("9999");
+
+            const search = await call("search_meals", {
+                queries: ["oatmeal"],
+                days: 3650,
+                limit: 10,
+            });
+            expect(search.content[0]!.text).toContain("current oatmeal");
+            expect(search.content[0]!.text).not.toContain("deleted oatmeal");
+
+            const exported = await call("export_meals");
+            expect(exported.content[0]!.text).toContain("1 meal");
+            const csv = await Bun.file("./exports/u1/meals.csv").text();
+            expect(csv).toContain("current oatmeal");
+            expect(csv).toContain(",250,20,");
+            expect(csv).not.toContain("deleted oatmeal");
+        });
+        await callTools(async (call) => {
+            const foreignDate = await call("get_meals_by_date", {
+                date: "2026-08-05",
+            });
+            expect(foreignDate.content[0]!.text).toContain("private oatmeal");
+            expect(foreignDate.content[0]!.text).not.toContain(
+                "current oatmeal",
+            );
+            expect(foreignDate.content[0]!.text).not.toContain(
+                "deleted oatmeal",
+            );
+            const foreignSearch = await call("search_meals", {
+                queries: ["oatmeal"],
+                days: 3650,
+                limit: 10,
+            });
+            expect(foreignSearch.content[0]!.text).toContain("private oatmeal");
+            expect(foreignSearch.content[0]!.text).not.toContain(
+                "current oatmeal",
+            );
+            const foreignExport = await call("export_meals");
+            expect(foreignExport.content[0]!.text).toContain("1 meal");
+            expect(foreignExport.content[0]!.text).not.toContain(
+                "current oatmeal",
+            );
+            expect(
+                (await call("update_meal", { id: currentId, calories: 1 }))
+                    .isError,
+            ).toBe(true);
+            expect(
+                (await call("delete_meal", { id: currentId })).isError,
+            ).not.toBe(true);
         }, "u2");
+        const unchanged = await pool.query(
+            "SELECT status, current_version FROM meal_events WHERE id = $1",
+            [currentId],
+        );
+        expect(unchanged.rows[0]).toMatchObject({
+            status: "active",
+            current_version: 2,
+        });
+    });
+
+    test("bulk import covers multi-row control totals and duplicate retry idempotency", async () => {
+        const rows = [
+            {
+                source_line: 10,
+                description: "bulk one",
+                meal_type: "breakfast",
+                logged_at: "2026-08-05T08:00:00.000Z",
+                calories: 101,
+            },
+            {
+                source_line: 11,
+                description: "bulk two",
+                meal_type: "dinner",
+                logged_at: "2026-08-05T19:00:00.000Z",
+                calories: 202,
+            },
+        ];
+        await callTools(async (call) => {
+            const imported = await call("bulk_import_meals", {
+                meals: rows,
+                expected_row_count: 2,
+                expected_total_kcal: 303,
+                dry_run: false,
+            });
+            expect(imported.structuredContent?.summary).toMatchObject({
+                total: 2,
+                created: 2,
+                deduplicated: 0,
+            });
+            const retry = await call("bulk_import_meals", {
+                meals: rows,
+                expected_row_count: 2,
+                expected_total_kcal: 303,
+                dry_run: false,
+            });
+            expect(retry.structuredContent?.summary).toMatchObject({
+                total: 2,
+                created: 0,
+                deduplicated: 2,
+            });
+            const rejected = await call("bulk_import_meals", {
+                meals: rows,
+                expected_row_count: 2,
+                expected_total_kcal: 400,
+                dry_run: false,
+            });
+            expect(rejected.structuredContent?.status).toBe("failed");
+            expect(rejected.structuredContent?.summary).toMatchObject({
+                created: 0,
+            });
+        });
+        const count = await pool.query(
+            "SELECT count(*)::int AS count FROM meal_events WHERE user_id = 'u1' AND status = 'active'",
+        );
+        expect(count.rows[0]!.count).toBe(2);
+    });
+
+    test("account cleanup removes every event child and preserves unrelated user data", async () => {
+        const u1 = await seedProjectionEvent(pool, {
+            userId: "u1",
+            idempotencyKey: "cleanup-all-u1",
+            consumedAt: "2026-08-05T12:00:00.000Z",
+            description: "cleanup root",
+            calories: 100,
+        });
+        const u2 = await seedProjectionEvent(pool, {
+            userId: "u2",
+            idempotencyKey: "cleanup-all-u2",
+            consumedAt: "2026-08-05T12:00:00.000Z",
+            description: "preserve root",
+            calories: 200,
+        });
+        const childRows: Record<string, string>[] = [
+            {
+                table: "meal_event_inputs",
+                columns:
+                    "event_id, version, source_kind, content, content_hash, precedence",
+                values: `'${u1}', 1, 'user_text', 'fixture', 'cleanup-hash', 10`,
+            },
+            {
+                table: "meal_event_media",
+                columns:
+                    "event_id, version, kind, storage_key, mime_type, byte_size, sha256",
+                values: `'${u1}', 1, 'photo', 'cleanup.jpg', 'image/jpeg', 1, 'cleanup-sha'`,
+            },
+            {
+                table: "meal_event_nutrition_results",
+                columns:
+                    "event_id, version, provider, source_id, status, request_fingerprint, algorithm_version",
+                values: `'${u1}', 1, 'own', 'cleanup-source', 'unavailable', 'cleanup-fp', 'fixture'`,
+            },
+            {
+                table: "meal_event_sync_journal",
+                columns:
+                    "event_id, version, system, operation, request_fingerprint, authorization_source",
+                values: `'${u1}', 1, 'cleanup', 'delete', 'cleanup-journal', 'user'`,
+            },
+        ];
+        for (const row of childRows) {
+            await pool.query(
+                `INSERT INTO ${row.table} (${row.columns}) VALUES (${row.values})`,
+            );
+        }
+        await pool.query(
+            "INSERT INTO tool_analytics (user_id, tool_name, success, duration_ms) VALUES ('u1', 'fixture', true, 1), ('u2', 'fixture', true, 1)",
+        );
+        await pool.query(
+            "INSERT INTO profiles (user_id, timezone) VALUES ('u1', 'UTC'), ('u2', 'UTC')",
+        );
+        await pool.query(
+            "INSERT INTO nutrition_goals (user_id, daily_calories) VALUES ('u1', 1), ('u2', 2)",
+        );
+        await pool.query(
+            "INSERT INTO water_log (user_id, amount_ml) VALUES ('u1', 1), ('u2', 2)",
+        );
+        await pool.query(
+            "INSERT INTO weight_log (user_id, weight_g) VALUES ('u1', 1), ('u2', 2)",
+        );
         const { deleteAllUserData } = await import("./db.js");
         await deleteAllUserData("u1");
-        const remaining = await pool.query(
-            "SELECT user_id FROM meal_events ORDER BY user_id",
+        const counts = await pool.query(
+            `SELECT
+                (SELECT count(*) FROM meal_events WHERE user_id = 'u1') AS roots,
+                (SELECT count(*) FROM meal_event_items WHERE event_id = $1) AS items,
+                (SELECT count(*) FROM meal_event_inputs WHERE event_id = $1) AS inputs,
+                (SELECT count(*) FROM meal_event_media WHERE event_id = $1) AS media,
+                (SELECT count(*) FROM meal_event_nutrition_results WHERE event_id = $1) AS nutrition,
+                (SELECT count(*) FROM meal_event_canonical_results WHERE event_id = $1) AS canonical,
+                (SELECT count(*) FROM meal_event_sync_journal WHERE event_id = $1) AS journal,
+                (SELECT count(*) FROM meal_event_versions WHERE event_id = $1) AS versions`,
+            [u1],
         );
-        expect(remaining.rows.map((r) => r.user_id)).toEqual(["u2"]);
-        const children = await pool.query(
-            `SELECT count(*)::int AS count FROM meal_event_items
-             WHERE event_id NOT IN (SELECT id FROM meal_events)`,
+        expect(Object.values(counts.rows[0]!).map(Number)).toEqual([
+            0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        const preserved = await pool.query(
+            `SELECT
+                (SELECT count(*) FROM meal_events WHERE user_id = 'u2') AS roots,
+                (SELECT count(*) FROM profiles WHERE user_id = 'u2') AS profile,
+                (SELECT count(*) FROM nutrition_goals WHERE user_id = 'u2') AS goals,
+                (SELECT count(*) FROM water_log WHERE user_id = 'u2') AS water,
+                (SELECT count(*) FROM weight_log WHERE user_id = 'u2') AS weight,
+                (SELECT count(*) FROM tool_analytics WHERE user_id = 'u2') AS analytics`,
         );
-        expect(children.rows[0]!.count).toBe(0);
+        expect(Object.values(preserved.rows[0]!).map(Number)).toEqual([
+            1, 1, 1, 1, 1, 1,
+        ]);
     });
 });
