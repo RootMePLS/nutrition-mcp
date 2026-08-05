@@ -28,10 +28,7 @@ export interface RateLimitResult {
     limit: number;
 }
 
-function slidingWindow(
-    key: string,
-    limit: number,
-): RateLimitResult {
+function slidingWindow(key: string, limit: number): RateLimitResult {
     const now = Date.now();
     const cutoff = now - WINDOW_MS;
     const existing = buckets.get(key) ?? [];

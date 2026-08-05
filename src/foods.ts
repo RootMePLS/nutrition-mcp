@@ -274,7 +274,12 @@ async function putCachedFood(
             `INSERT INTO food_cache (source, source_id, payload, fetched_at)
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (source, source_id) DO UPDATE SET payload = $3, fetched_at = $4`,
-            [source, sourceId, JSON.stringify(payload), new Date().toISOString()],
+            [
+                source,
+                sourceId,
+                JSON.stringify(payload),
+                new Date().toISOString(),
+            ],
         );
     } catch {
         // best-effort; ignore
