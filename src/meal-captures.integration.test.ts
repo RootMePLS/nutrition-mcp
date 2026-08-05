@@ -354,6 +354,40 @@ function poolFailingMediaInsert(pool: Pool): Pool {
     return proxy;
 }
 
+// Pool wrapper whose client rejects the media identity SELECT once armed —
+// injects a transactional failure into a duplicate attach after the original
+// row has committed, without touching production code.
+function poolFailingMediaIdentityCheck(pool: Pool): Pool {
+    const proxy = Object.create(pool) as Pool;
+    proxy.connect = async () => {
+        const client = await pool.connect();
+        const realQuery = client.query.bind(client);
+        return new Proxy(client, {
+            get(target, prop, receiver) {
+                if (prop === "query") {
+                    return (text: unknown, ...rest: unknown[]) => {
+                        if (
+                            typeof text === "string" &&
+                            text.includes(
+                                "FROM meal_capture_media WHERE capture_id=$1 AND sha256=$2",
+                            )
+                        ) {
+                            return Promise.reject(
+                                new Error(
+                                    "injected media identity check failure",
+                                ),
+                            );
+                        }
+                        return (realQuery as any)(text, ...rest);
+                    };
+                }
+                return Reflect.get(target, prop, receiver);
+            },
+        });
+    };
+    return proxy;
+}
+
 async function mediaRootFiles(root: string): Promise<string[]> {
     try {
         const entries = await readdir(root, { recursive: true });
@@ -569,3 +603,223 @@ describeDb("capture media byte lifecycle (attachCaptureMediaBytes)", () => {
         expect(await mediaRootFiles(mediaRoot)).toEqual(filesBefore);
     });
 });
+
+// ---------------------------------------------------------------------------
+// S5 F1 adversarial durability: every case FIRST attaches valid bytes and
+// commits the meal_capture_media row, then proves that a rejected, failed,
+// duplicate, or concurrent invocation can neither delete nor overwrite the
+// committed file. Assertions read real filesystem bytes and recompute the
+// committed SHA-256 — never DB metadata alone.
+// ---------------------------------------------------------------------------
+
+describeDb(
+    "capture media durability under rejected and duplicate retries (S5 F1)",
+    () => {
+        let pool: Pool;
+        let mediaRoot: string;
+        let mediaStore: MediaStore;
+        beforeAll(async () => {
+            pool = new Pool({ connectionString: url, max: 8 });
+            const client = await pool.connect();
+            try {
+                await migrate(client);
+            } finally {
+                client.release();
+            }
+            mediaRoot = await mkdtemp(join(tmpdir(), "capture-media-f1-test-"));
+            mediaStore = createMediaStore(mediaRoot);
+        });
+        afterAll(async () => {
+            await pool.end();
+            await rm(mediaRoot, { recursive: true, force: true });
+        });
+
+        const OWNER = "durability-user";
+        const startCapture = (key: string) =>
+            startMealCapture(pool, {
+                user_id: OWNER,
+                conversation_key: key,
+                idempotency_key: key,
+            });
+        const attachPng = (
+            captureId: string,
+            userId: string,
+            targetPool: Pool = pool,
+        ) =>
+            attachCaptureMediaBytes(targetPool, mediaStore, captureId, userId, {
+                kind: "photo",
+                mime_type: "image/png",
+                bytes_base64: PNG_BASE64,
+            });
+
+        // The committed row, the file bytes, and the recomputed SHA-256 must all
+        // survive any rejected/failed/duplicate later attempt.
+        async function expectCommittedMediaIntact(
+            captureId: string,
+            mediaId: string,
+            storageKey: string,
+            expectedSha: string,
+        ) {
+            const { rows } = await pool.query(
+                `SELECT id, storage_key, sha256 FROM meal_capture_media WHERE capture_id=$1`,
+                [captureId],
+            );
+            expect(rows).toHaveLength(1);
+            expect(rows[0]).toMatchObject({
+                id: mediaId,
+                storage_key: storageKey,
+                sha256: expectedSha,
+            });
+            const path = join(mediaRoot, storageKey);
+            expect(await Bun.file(path).exists()).toBe(true);
+            const onDisk = new Uint8Array(await Bun.file(path).arrayBuffer());
+            expect(onDisk).toEqual(PNG_BYTES);
+            expect(sha256HexOf(onDisk)).toBe(expectedSha);
+        }
+
+        test("wrong-user retry of committed bytes preserves the original row and file", async () => {
+            const capture = await startCapture("f1-wrong-user");
+            const first = await attachPng(capture.capture_id, OWNER);
+            await expect(
+                attachPng(capture.capture_id, "intruder"),
+            ).rejects.toThrow("capture not found");
+            await expectCommittedMediaIntact(
+                capture.capture_id,
+                first.media_id,
+                first.storage_key,
+                first.sha256,
+            );
+        });
+
+        test("same-owner retry after cancel preserves the original row and file", async () => {
+            const capture = await startCapture("f1-cancelled");
+            const first = await attachPng(capture.capture_id, OWNER);
+            await cancelMealCapture(pool, capture.capture_id, OWNER);
+            await expect(attachPng(capture.capture_id, OWNER)).rejects.toThrow(
+                "capture is no longer editable",
+            );
+            await expectCommittedMediaIntact(
+                capture.capture_id,
+                first.media_id,
+                first.storage_key,
+                first.sha256,
+            );
+        });
+
+        test("same-owner retry after confirmation preserves the original row, file, and event reference", async () => {
+            const capture = await startCapture("f1-confirmed");
+            const first = await attachPng(capture.capture_id, OWNER);
+            await savePreparedDraft(pool, capture.capture_id, OWNER, {
+                ...draft,
+                media: [
+                    {
+                        kind: "photo",
+                        storage_key: first.storage_key,
+                        mime_type: "image/png",
+                        byte_size: first.byte_size,
+                        sha256: first.sha256,
+                        metadata: {},
+                    },
+                ],
+            });
+            const confirmed = await confirmMealCapture(
+                pool,
+                { capture_id: capture.capture_id, confirmation: "add" },
+                OWNER,
+            );
+            expect(confirmed.state).toBe("confirmed");
+            const eventMedia = await pool.query(
+                `SELECT count(*) AS n FROM meal_event_media WHERE event_id=$1 AND storage_key=$2`,
+                [confirmed.event_id, first.storage_key],
+            );
+            expect(Number(eventMedia.rows[0]!.n)).toBe(1);
+            await expect(attachPng(capture.capture_id, OWNER)).rejects.toThrow(
+                "capture is no longer editable",
+            );
+            await expectCommittedMediaIntact(
+                capture.capture_id,
+                first.media_id,
+                first.storage_key,
+                first.sha256,
+            );
+        });
+
+        test("injected transactional failure on a duplicate attempt preserves the original row and file", async () => {
+            const capture = await startCapture("f1-injected");
+            const first = await attachPng(capture.capture_id, OWNER);
+            await expect(
+                attachPng(
+                    capture.capture_id,
+                    OWNER,
+                    poolFailingMediaIdentityCheck(pool),
+                ),
+            ).rejects.toThrow("injected media identity check failure");
+            await expectCommittedMediaIntact(
+                capture.capture_id,
+                first.media_id,
+                first.storage_key,
+                first.sha256,
+            );
+        });
+
+        test("coordinated concurrent duplicate success and rejected/failing attempts preserve the original row and file", async () => {
+            const capture = await startCapture("f1-concurrent");
+            const first = await attachPng(capture.capture_id, OWNER);
+            const results = await Promise.allSettled([
+                attachPng(capture.capture_id, OWNER),
+                attachPng(capture.capture_id, OWNER),
+                attachPng(capture.capture_id, "intruder"),
+                attachPng(
+                    capture.capture_id,
+                    OWNER,
+                    poolFailingMediaIdentityCheck(pool),
+                ),
+            ]);
+            expect(results.map((r) => r.status)).toEqual([
+                "fulfilled",
+                "fulfilled",
+                "rejected",
+                "rejected",
+            ]);
+            for (const r of results.slice(0, 2)) {
+                const value = (
+                    r as PromiseFulfilledResult<
+                        Awaited<ReturnType<typeof attachPng>>
+                    >
+                ).value;
+                expect(value.deduplicated).toBe(true);
+                expect(value.media_id).toBe(first.media_id);
+                expect(value.storage_key).toBe(first.storage_key);
+            }
+            expect(
+                (results[2] as PromiseRejectedResult).reason.message,
+            ).toMatch(/capture not found/);
+            expect(
+                (results[3] as PromiseRejectedResult).reason.message,
+            ).toMatch(/injected media identity check failure/);
+            await expectCommittedMediaIntact(
+                capture.capture_id,
+                first.media_id,
+                first.storage_key,
+                first.sha256,
+            );
+        });
+
+        test("dedup retry heals a missing committed file with identical bytes", async () => {
+            const capture = await startCapture("f1-heal");
+            const first = await attachPng(capture.capture_id, OWNER);
+            const path = join(mediaRoot, first.storage_key);
+            await Bun.file(path).delete();
+            expect(await Bun.file(path).exists()).toBe(false);
+            const second = await attachPng(capture.capture_id, OWNER);
+            expect(second.deduplicated).toBe(true);
+            expect(second.media_id).toBe(first.media_id);
+            await expectCommittedMediaIntact(
+                capture.capture_id,
+                first.media_id,
+                first.storage_key,
+                first.sha256,
+            );
+        });
+    },
+);

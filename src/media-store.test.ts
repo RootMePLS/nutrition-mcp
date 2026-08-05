@@ -128,4 +128,36 @@ describe("media store", () => {
         // Second delete is a no-op, not an error.
         await store.delete(meta.storage_key);
     });
+
+    test("restore rewrites verified bytes at an already-referenced key", async () => {
+        const store = createMediaStore(root);
+        const meta = await store.put({
+            event_id: "evt-6",
+            version: 1,
+            kind: "photo",
+            bytes: BYTES,
+            mime_type: "image/jpeg",
+        });
+        await store.delete(meta.storage_key);
+        expect(existsSync(join(root, meta.storage_key))).toBe(false);
+        const restored = await store.restore({
+            storage_key: meta.storage_key,
+            bytes: BYTES,
+            mime_type: "image/jpeg",
+        });
+        expect(restored).toEqual(meta);
+        const reread = await store.read(meta.storage_key, meta.sha256);
+        expect(reread).toEqual(BYTES);
+    });
+
+    test("restore rejects unsafe keys before any I/O", async () => {
+        const store = createMediaStore(root);
+        await expect(
+            store.restore({
+                storage_key: "../outside",
+                bytes: BYTES,
+                mime_type: "image/jpeg",
+            }),
+        ).rejects.toBeInstanceOf(UnsafeStorageKeyError);
+    });
 });

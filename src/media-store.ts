@@ -61,6 +61,17 @@ export interface MediaStore {
         bytes: Uint8Array;
         mime_type: string;
     }): Promise<StoredMediaMetadata>;
+    // Restore bytes at a key already referenced by a committed DB row whose
+    // file went missing or corrupt (capture attach dedup heal path). The key
+    // comes from a committed, server-generated row — never caller input — and
+    // passes the same safety/containment checks as every other entry point.
+    // Bytes are content-addressed, so restoring can only repair, never
+    // destroy, referenced data.
+    restore(args: {
+        storage_key: string;
+        bytes: Uint8Array;
+        mime_type: string;
+    }): Promise<StoredMediaMetadata>;
     read(storageKey: string, expectedSha256: string): Promise<Uint8Array>;
     delete(storageKey: string): Promise<void>;
 }
@@ -187,6 +198,10 @@ export function createMediaStore(root: string): MediaStore {
                 bytes,
                 mime_type,
             );
+        },
+
+        async restore({ storage_key, bytes, mime_type }) {
+            return writeAndVerify(storage_key, bytes, mime_type);
         },
 
         async read(storageKey, expectedSha256) {
