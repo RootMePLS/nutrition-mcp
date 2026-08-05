@@ -10,8 +10,8 @@ import {
 } from "./db.js";
 import { rowContentDigest } from "./import.js";
 
-// Every export exercised here is pure: no test in this file constructs a
-// Supabase client, and none touches the network or the database.
+// Every export exercised here is pure: no test in this file opens a database
+// connection, and none touches the network.
 
 const USER = "11111111-1111-4111-8111-111111111111";
 const LOGGED_AT = "2026-03-14T12:00:00.000Z";
@@ -261,7 +261,7 @@ describe("no-profile defaults, together", () => {
 });
 
 // ---------- fetchAllPages (issue #66: export_meals silently truncated at
-// PostgREST's default db-max-rows of 1000, since getAllMeals had no .range()
+// the default 1000-row page size, since getAllMeals had no LIMIT/OFFSET
 // pagination) ----------
 
 /** An in-memory paged source, standing in for a `LIMIT/OFFSET` query. */

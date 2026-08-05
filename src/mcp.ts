@@ -607,12 +607,12 @@ export function rangeAverages(
     };
 }
 
-// insights.ts is deliberately free of Supabase, so it cannot know about the
-// per-user opt-in: it renders an alcohol line whenever the data contains any
-// (see hasAlcohol there). Zeroing the series is how the flag reaches it — both
-// computeTrends and computeWeeklyDigest suppress alcohol on an all-zero series,
-// and neither derives anything else from it. Cheap: the buckets are per-request
-// and at most 365 shallow copies.
+// insights.ts is deliberately free of database access, so it cannot know
+// about the per-user opt-in: it renders an alcohol line whenever the data
+// contains any (see hasAlcohol there). Zeroing the series is how the flag
+// reaches it — both computeTrends and computeWeeklyDigest suppress alcohol on
+// an all-zero series, and neither derives anything else from it. Cheap: the
+// buckets are per-request and at most 365 shallow copies.
 export function gateAlcohol(
     buckets: DailyBucket[],
     alcohol: AlcoholDisplay,

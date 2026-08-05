@@ -1,6 +1,5 @@
 // Derive the public base URL of the server from the request, honoring the
-// reverse-proxy forwarding headers used in production. Shared by the HTTP entry
-// point and the OAuth router (which builds the Google callback URL from it).
+// reverse-proxy forwarding headers used in production.
 export function getBaseUrl(c: {
     req: { header: (name: string) => string | undefined; url: string };
 }): string {

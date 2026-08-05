@@ -25,10 +25,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .env.production.local
 .env.local
 
-# supabase (local CLI state only — track config.toml and migrations)
-supabase/.temp/
-supabase/.branches/
-
 # caches
 .eslintcache
 .cache

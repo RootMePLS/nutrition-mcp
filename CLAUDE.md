@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-nutrition-mcp is a Model Context Protocol (MCP) server for nutrition-related functionality, built with Bun and TypeScript. Entry point is `src/index.ts`. Server version must be updated in three places: `package.json`, `src/mcp.ts` (McpServer constructor), and `server.json`. The server icon is at `public/favicon.ico`. Tool call analytics (duration, success/failure, error category) are tracked via `src/analytics.ts` and persisted to a `tool_analytics` Supabase table.
+nutrition-mcp is a Model Context Protocol (MCP) server for nutrition-related functionality, built with Bun and TypeScript. Entry point is `src/index.ts`. Server version must be updated in three places: `package.json`, `src/mcp.ts` (McpServer constructor), and `server.json`. The server icon is at `public/favicon.ico`. Tool call analytics (duration, success/failure, error category) are tracked via `src/analytics.ts` and persisted to the `tool_analytics` table in the local PostgreSQL database.
 
 ## Deploying
 
@@ -109,7 +109,7 @@ Two entry points, one write path.
 - **`start_meal_import`** returns the `import-meals` widget. Prefer it whenever the user has an actual file: the widget parses and maps the export **in the browser**, so rows never pass through the model and cannot be mistranscribed. Its `outputSchema` is load-bearing — with no `structuredContent` the bridge never paints and the iframe sits on its loading state — and it carries `tz` so the widget's preview matches what the server will store.
 - **`bulk_import_meals`** is the universal fallback, callable by the model _and_ by the widget (default `_meta.ui.visibility` is `["model", "app"]`, so one tool serves both; `["app"]` would hide it from the model and break users who have widgets disabled).
 
-`src/import.ts` holds the logic, free of Supabase so it unit-tests with fixtures; `src/mcp.ts` is a thin adapter supplying `insert` and `existingKeys`. `src/csv.ts` is the parser, inlined into the widget via `@inlinets`.
+`src/import.ts` holds the logic, free of database access so it unit-tests with fixtures; `src/mcp.ts` is a thin adapter supplying `insert` and `existingKeys`. `src/csv.ts` is the parser, inlined into the widget via `@inlinets`.
 
 Non-obvious invariants, each of which was a real bug or nearly one:
 

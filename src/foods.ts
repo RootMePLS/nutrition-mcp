@@ -227,7 +227,7 @@ export async function fetchProductFromOFF(
 }
 
 // ---------- Cache ----------
-// All cache access is best-effort: any failure (missing table, no Supabase
+// All cache access is best-effort: any failure (missing table, no database
 // config, transient error) is swallowed and treated as a miss so a cache
 // problem can never break a lookup.
 

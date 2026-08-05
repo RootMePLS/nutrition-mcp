@@ -22,7 +22,8 @@
 
 import { getWidgetHtml, WIDGET_TEMPLATES } from "../src/widgets.js";
 import { runImport } from "../src/import.js";
-import type { MealInput, MealInsertResult } from "../src/supabase.js";
+import { writeProvenanceFields } from "../src/meal-events.js";
+import type { MealInput, MealInsertResult } from "../src/db.js";
 
 // In-memory stand-in for insertMeal, mirroring its dedup contract, so the harness
 // can execute the REAL bulk_import_meals logic instead of returning canned data.
@@ -30,13 +31,28 @@ import type { MealInput, MealInsertResult } from "../src/supabase.js";
 // idempotency keys and per-row report a client would get.
 const store = new Map<string, MealInput & { id: string }>();
 let mealSeq = 0;
+// Legacy-path writes are compatibility writes: no calculation bundle exists.
+const HARNESS_PROVENANCE = writeProvenanceFields({
+    version: 1,
+    provenance_status: "pending",
+    compatibility: true,
+});
 async function fakeInsert(input: MealInput): Promise<MealInsertResult> {
     const key = input.idempotency_key!;
     const existing = store.get(key);
-    if (existing) return { meal: existing as never, deduplicated: true };
+    if (existing)
+        return {
+            meal: existing as never,
+            deduplicated: true,
+            provenance: HARNESS_PROVENANCE,
+        };
     const meal = { id: `harness-${++mealSeq}`, ...input };
     store.set(key, meal);
-    return { meal: meal as never, deduplicated: false };
+    return {
+        meal: meal as never,
+        deduplicated: false,
+        provenance: HARNESS_PROVENANCE,
+    };
 }
 
 const PORT = Number(process.env.HARNESS_PORT ?? 8787);
