@@ -7,7 +7,8 @@ import { getLandingStats, type LandingStats } from "./db.js";
 import { maskIp } from "./net.js";
 import { warmWidgets } from "./widgets.js";
 import { checkRateLimit } from "./rate-limit.js";
-import { SINGLE_USER_ID, closePool } from "./db.js";
+import { SINGLE_USER_ID, closePool, getPool } from "./db.js";
+import { checkDatabaseReadiness } from "./readiness.js";
 
 const app = new Hono();
 
@@ -16,11 +17,12 @@ const app = new Hono();
 // — and is therefore invisible to tool analytics — is still attributable in the
 // runtime logs: unauthenticated /mcp probes, rate-limited hits (429),
 // discovery crawls, vuln scanners. Registered first so it runs outermost
-// and observes the final response status. /health is skipped to keep the
-// platform's frequent health checks from evicting real traffic from the buffer.
+// and observes the final response status. /health and /ready are skipped to
+// keep the platform's frequent health/readiness checks from evicting real
+// traffic from the buffer.
 app.use("*", async (c, next) => {
     const path = new URL(c.req.url).pathname;
-    if (path === "/health") return next();
+    if (path === "/health" || path === "/ready") return next();
     const start = performance.now();
     await next();
     const ms = Math.round(performance.now() - start);
@@ -264,8 +266,20 @@ app.get("/favicon.ico", async (c) => {
     }
 });
 
-// Health check
+// Health check — pure process liveness: the HTTP stack is up. Says nothing
+// about the database; that is /ready's job.
 app.get("/health", (c) => c.text("ok"));
+
+// Readiness check — proves the shared PostgreSQL pool can actually run a
+// query. Returns 200 only after a real SELECT 1 succeeds (hard 2s ceiling);
+// otherwise 503 with a redacted host:port/database target so the failure is
+// actionable without exposing credentials. Never blocks startup and never
+// retries — the orchestrator polls again.
+app.get("/ready", async (c) => {
+    const result = await checkDatabaseReadiness(getPool());
+    if (result.ok) return c.text("ok");
+    return c.json({ error: result.error }, 503);
+});
 
 // Error handler
 app.onError((_err, c) => {

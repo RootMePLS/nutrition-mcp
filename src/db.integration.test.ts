@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Pool, type PoolClient } from "pg";
 import { createMealEvent } from "./meal-events.js";
+import { checkDatabaseReadiness } from "./readiness.js";
 
 // Opt-in integration suite against a real disposable PostgreSQL database.
 // Skipped loudly unless DATABASE_URL_TEST points at a scratch database the
@@ -233,5 +234,59 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         expect(Number(stats.total_carbs_g)).toBe(20);
         expect(Number(stats.total_fat_g)).toBe(30);
         expect(Array.isArray(stats.timezone_list)).toBe(true);
+    });
+});
+
+describeDb("database readiness probe (requires DATABASE_URL_TEST)", () => {
+    test("readiness succeeds against the live test database", async () => {
+        const pool = new Pool({ connectionString: DATABASE_URL_TEST, max: 1 });
+        try {
+            const result = await checkDatabaseReadiness(pool, {
+                databaseUrl: DATABASE_URL_TEST,
+            });
+            expect(result).toEqual({ ok: true });
+        } finally {
+            await pool.end();
+        }
+    });
+
+    test("readiness fails in bounded time against a wrong port, redacted", async () => {
+        const badUrl =
+            "postgres://wrong_port_user:wrong_port_pw@localhost:5439/nope";
+        const pool = new Pool({
+            connectionString: badUrl,
+            max: 1,
+            connectionTimeoutMillis: 500,
+        });
+        const started = Date.now();
+        try {
+            const result = await checkDatabaseReadiness(pool, {
+                databaseUrl: badUrl,
+                timeoutMs: 1500,
+            });
+            expect(Date.now() - started).toBeLessThan(5000);
+            expect(result.ok).toBe(false);
+            if (!result.ok) {
+                expect(result.error).toContain("localhost:5439/nope");
+                expect(result.error).not.toContain("wrong_port_user");
+                expect(result.error).not.toContain("wrong_port_pw");
+            }
+        } finally {
+            await pool.end();
+        }
+    });
+
+    test("routes: /ready is 200 with a reachable database, /health stays ok", async () => {
+        // Importing index.js exercises the real route wiring and the shared
+        // pool (pointed at DATABASE_URL by the DB gate) without listening.
+        const server = (await import("./index.js")).default;
+        const ready = await server.fetch(new Request("http://localhost/ready"));
+        expect(ready.status).toBe(200);
+        expect(await ready.text()).toBe("ok");
+        const health = await server.fetch(
+            new Request("http://localhost/health"),
+        );
+        expect(health.status).toBe(200);
+        expect(await health.text()).toBe("ok");
     });
 });

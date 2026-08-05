@@ -173,7 +173,17 @@ bun run dev             # starts with hot reload on http://localhost:8080
 ```
 
 Run the actual MCP server with `bun run start` (or `bun run src/index.ts`).
-`GET /health` returns `ok`; MCP clients must use `POST /mcp`.
+`GET /health` returns `ok` — it is pure process liveness (the HTTP stack is
+up) and says nothing about the database. `GET /ready` is the database
+readiness probe: it runs a real `SELECT 1` through the shared PostgreSQL pool
+with a hard 2-second ceiling and returns `200 ok` only on success. On failure
+it returns `503` with a JSON body naming a redacted `host:port/database`
+target (credentials, query string, and fragment are never exposed), e.g.
+`{"error":"database not ready: connection failed (target localhost:5432/nutrition_mcp)"}`.
+Troubleshooting a 503: check that PostgreSQL is running and reachable at the
+redacted target, that `DATABASE_URL` points at the right host/port/database,
+and that the database exists (create it and apply the migrations per above).
+MCP clients must use `POST /mcp`.
 
 For the full test suite, point integration tests at a disposable database:
 
@@ -194,7 +204,8 @@ bun run format:check
 
 | Endpoint           | Description                      |
 | ------------------ | -------------------------------- |
-| `GET /health`      | Health check                     |
+| `GET /health`      | Process liveness check           |
+| `GET /ready`       | Database readiness probe         |
 | `POST /mcp`        | Stateless MCP endpoint (no auth) |
 | `GET /favicon.ico` | Server icon                      |
 
