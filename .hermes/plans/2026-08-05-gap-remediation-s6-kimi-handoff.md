@@ -15,21 +15,21 @@ time; S5 added the attach tool's). After this slice: **26**.
 
 Per-tool state at base HEAD (inspected registrations in `src/mcp.ts`):
 
-| Tool | outputSchema at HEAD | structuredContent at HEAD |
-| --- | --- | --- |
-| get_water_by_date | missing | missing |
-| log_water | missing | missing |
-| delete_water | missing | missing |
-| get_weight_today | missing | missing |
-| get_weight_by_date | missing | missing |
-| get_weight_by_date_range | missing | missing |
-| log_weight | missing | missing |
-| update_weight | missing | missing |
-| delete_weight | missing | missing |
-| get_weight_trends | present (inline, not exported) | present (widget contract) |
-| start_meal_import | present (`START_IMPORT_OUTPUT_SCHEMA`) | present |
-| get_widget_display | missing | missing |
-| set_widget_display | missing | missing |
+| Tool                     | outputSchema at HEAD                   | structuredContent at HEAD |
+| ------------------------ | -------------------------------------- | ------------------------- |
+| get_water_by_date        | missing                                | missing                   |
+| log_water                | missing                                | missing                   |
+| delete_water             | missing                                | missing                   |
+| get_weight_today         | missing                                | missing                   |
+| get_weight_by_date       | missing                                | missing                   |
+| get_weight_by_date_range | missing                                | missing                   |
+| log_weight               | missing                                | missing                   |
+| update_weight            | missing                                | missing                   |
+| delete_weight            | missing                                | missing                   |
+| get_weight_trends        | present (inline, not exported)         | present (widget contract) |
+| start_meal_import        | present (`START_IMPORT_OUTPUT_SCHEMA`) | present                   |
+| get_widget_display       | missing                                | missing                   |
+| set_widget_display       | missing                                | missing                   |
 
 So 11 tools needed the full contract; get_weight_trends needed its inline
 schema hoisted to an exported declaration; start_meal_import already satisfied
@@ -153,7 +153,7 @@ contract sweep of exactly the 13 remaining named tools, and only that was
 executed. State of the plan-S6 items at this HEAD:
 
 - Capture lifecycle tools (`start/append/answer/draft/get/cancel/expire/
-  confirm_meal_capture`, `attach_meal_capture_media`): NOT given outputSchema
+confirm_meal_capture`, `attach_meal_capture_media`): NOT given outputSchema
   in this slice — the dispatch limited the sweep to the 13 named tools. Of the
   capture family, `confirm_meal_capture` and `attach_meal_capture_media`
   already declare outputSchema + structuredContent from S5/S0 work; the other
