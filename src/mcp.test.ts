@@ -33,6 +33,10 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import * as actualSupabase from "./db.js";
 import { formatFoodResult, type FoodResult } from "./foods.js";
 import {
+    CALCULATION_BUNDLE_OUTPUT_SCHEMA,
+    CALCULATION_PROVENANCE_OUTPUT_SCHEMA,
+} from "./calculation-bundles.js";
+import {
     buildDailyBuckets,
     computeTrends,
     computeWeeklyDigest,
@@ -1433,5 +1437,83 @@ describe("bulk_import_meals surfaces hidden alcohol", () => {
             expect(text).not.toContain("Alcohol saved with these meals");
             expect(text).toContain("set_alcohol_tracking");
         });
+    });
+});
+
+describe("calculation bundle output contracts", () => {
+    const canonicalRow = {
+        status: "ready",
+        consensus_status: "all_agree",
+        nutrients: {
+            calories: 505,
+            protein_g: null,
+            carbs_g: null,
+            fat_g: null,
+            fiber_g: null,
+            sugar_g: null,
+            alcohol_g: null,
+        },
+        eligible_providers: ["nutrition-local", "own"],
+        outlier_providers: [],
+        threshold_percent: 10,
+        policy_version: "consensus-10pct-v1",
+        source_result_ids: ["a", "b"],
+        audit_evidence: { fingerprint: "fp" },
+        algorithm_version: "consensus-10pct-v1",
+    };
+    const bundlePayload = {
+        event_id: "00000000-0000-4000-8000-000000000001",
+        version: 1,
+        fingerprint: "fp",
+        deduplicated: false,
+        provenance_status: "ready",
+        compatibility: false,
+        is_current: true,
+        provider_results: [],
+        canonical: canonicalRow,
+        external_sync: "not_authorized",
+    };
+
+    test("bundle output carries one canonical per item scope", () => {
+        const parsed = CALCULATION_BUNDLE_OUTPUT_SCHEMA.parse({
+            ...bundlePayload,
+            item_canonicals: [
+                { ...canonicalRow, ordinal: 0 },
+                { ...canonicalRow, ordinal: 1 },
+            ],
+        });
+        expect(parsed.item_canonicals.map((c) => c.ordinal)).toEqual([0, 1]);
+        // Strict: unknown keys are still rejected.
+        expect(() =>
+            CALCULATION_BUNDLE_OUTPUT_SCHEMA.parse({
+                ...bundlePayload,
+                item_canonicals: [],
+                surprise: true,
+            }),
+        ).toThrow();
+        // Item canonicals require a non-negative integer ordinal.
+        expect(() =>
+            CALCULATION_BUNDLE_OUTPUT_SCHEMA.parse({
+                ...bundlePayload,
+                item_canonicals: [{ ...canonicalRow, ordinal: -1 }],
+            }),
+        ).toThrow();
+    });
+
+    test("provenance output carries one canonical per item scope", () => {
+        const parsed = CALCULATION_PROVENANCE_OUTPUT_SCHEMA.parse({
+            event_id: "00000000-0000-4000-8000-000000000001",
+            version: 1,
+            current_version: 1,
+            is_current: true,
+            provenance_status: "ready",
+            compatibility: false,
+            bundle_fingerprint: "fp",
+            providers: [],
+            canonical: canonicalRow,
+            item_canonicals: [{ ...canonicalRow, ordinal: 0 }],
+        });
+        expect(parsed.item_canonicals).toHaveLength(1);
+        expect(parsed.item_canonicals[0]!.ordinal).toBe(0);
     });
 });

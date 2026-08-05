@@ -14,6 +14,11 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerTools } from "./mcp.js";
 import { startMealCapture } from "./meal-captures.js";
 import { flushAnalytics } from "./analytics.js";
+import { stableBundleFingerprint } from "./nutrition-bundle-types.js";
+import {
+    CALCULATION_BUNDLE_OUTPUT_SCHEMA,
+    CALCULATION_PROVENANCE_OUTPUT_SCHEMA,
+} from "./calculation-bundles.js";
 
 // ---------------------------------------------------------------------------
 // Bounded MCP tool: log_meal_event. The caller supplies already-prepared
@@ -310,6 +315,116 @@ describeDb("log_meal_event MCP tool (requires DATABASE_URL_TEST)", () => {
             );
             expect(Number(rows[0]!.n)).toBe(0);
         });
+    });
+    test("commits an event+item bundle and reads item canonicals back through public provenance", async () => {
+        // Seed an owned event + version so the bundle commit has a target.
+        await pool.query(
+            `INSERT INTO meal_events (id, user_id, reported_at, consumed_at, idempotency_key)
+             VALUES ($1, 'u1', now(), now(), 'mcp-scoped-bundle-event')`,
+            ["00000000-0000-4000-8000-000000000101"],
+        );
+        await pool.query(
+            `INSERT INTO meal_event_versions (event_id, version, parser_policy_version, created_by)
+             VALUES ($1, 1, 'mcp-test', 'mcp-test')`,
+            ["00000000-0000-4000-8000-000000000101"],
+        );
+        const scopedResult = (
+            provider: "nutrition-local" | "own",
+            ordinal: number | null,
+            calories: number,
+        ) => ({
+            provider,
+            status: "succeeded" as const,
+            scope: { ordinal },
+            source_id: `${provider}-${ordinal ?? "event"}-source`,
+            request_fingerprint: `${provider}-request-${ordinal ?? "event"}`,
+            algorithm_version: "v1",
+            basis: "per_meal" as const,
+            units: "g_and_kcal" as const,
+            nutrients: { calories },
+            raw_payload: { provider, ordinal, calories },
+            provenance: { provider, retrieved_at: "2026-08-05T12:00:00Z" },
+        });
+        const bundleInput = {
+            event_id: "00000000-0000-4000-8000-000000000101",
+            version: 1,
+            resolved_input: {
+                items: [
+                    { ordinal: 0, raw_item_text: "oatmeal 80g" },
+                    { ordinal: 1, raw_item_text: "banana" },
+                ],
+                inputs: [],
+            },
+            results: [
+                scopedResult("nutrition-local", null, 500),
+                scopedResult("own", null, 510),
+                scopedResult("nutrition-local", 0, 300),
+                scopedResult("own", 0, 306),
+                scopedResult("nutrition-local", 1, 200),
+                scopedResult("own", 1, 202),
+            ],
+        };
+        const bundle = {
+            ...bundleInput,
+            fingerprint: stableBundleFingerprint(bundleInput),
+        };
+        await withTools(pool, async (call) => {
+            const committed = await call("commit_calculation_bundle", {
+                bundle,
+            });
+            expect(committed.isError).not.toBe(true);
+            const bundleOutput = CALCULATION_BUNDLE_OUTPUT_SCHEMA.parse(
+                committed.structuredContent,
+            );
+            expect(bundleOutput.canonical?.nutrients.calories).toBe(505);
+            expect(bundleOutput.item_canonicals.map((c) => c.ordinal)).toEqual([
+                0, 1,
+            ]);
+            expect(bundleOutput.item_canonicals[0]!.nutrients.calories).toBe(
+                303,
+            );
+            expect(bundleOutput.item_canonicals[1]!.nutrients.calories).toBe(
+                201,
+            );
+
+            const provenance = await call("get_calculation_provenance", {
+                event_id: bundle.event_id,
+            });
+            expect(provenance.isError).not.toBe(true);
+            const provenanceOutput = CALCULATION_PROVENANCE_OUTPUT_SCHEMA.parse(
+                provenance.structuredContent,
+            );
+            expect(provenanceOutput.canonical?.nutrients.calories).toBe(505);
+            expect(
+                provenanceOutput.item_canonicals.map((c) => c.ordinal),
+            ).toEqual([0, 1]);
+            expect(
+                provenanceOutput.item_canonicals.map(
+                    (c) => c.nutrients.calories,
+                ),
+            ).toEqual([303, 201]);
+            // Scope-local sources: each item canonical references only its
+            // own scope's provider rows.
+            for (const item of provenanceOutput.item_canonicals) {
+                const scoped = provenanceOutput.providers.filter(
+                    (p) => p.ordinal === item.ordinal,
+                );
+                expect(item.source_result_ids?.sort()).toEqual(
+                    scoped.map((p) => p.id).sort(),
+                );
+            }
+        });
+        // DB-level cross-check in the same test: three canonical rows.
+        const rows = await pool.query(
+            `SELECT scope_key FROM meal_event_canonical_results
+              WHERE event_id = $1 AND version = 1 ORDER BY scope_key`,
+            [bundle.event_id],
+        );
+        expect(rows.rows.map((r) => r.scope_key)).toEqual([
+            "event",
+            "item:0",
+            "item:1",
+        ]);
     });
 });
 

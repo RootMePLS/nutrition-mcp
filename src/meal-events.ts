@@ -66,6 +66,9 @@ export async function readPersistedWriteStatus(
     provenance_status: ProvenanceStatus;
     fingerprint: string | null;
     canonical: ReturnType<typeof computeConsensus>;
+    item_canonicals: Array<
+        ReturnType<typeof computeConsensus> & { ordinal: number }
+    >;
     compatibility: boolean;
 }> {
     // PoolClient does not support concurrent queries. More importantly, this
@@ -83,36 +86,60 @@ export async function readPersistedWriteStatus(
           WHERE event_id = $1 AND version = $2 AND ordinal IS NULL`,
         [eventId, version],
     );
+    // All canonical rows for the version: the event scope (ordinal IS NULL)
+    // plus one row per item scope.
     const canonicalResult = await client.query(
-        `SELECT status, consensus_status, ${NUTRIENT_FIELDS.join(", ")},
+        `SELECT ordinal, status, consensus_status, ${NUTRIENT_FIELDS.join(", ")},
                 eligible_providers, outlier_providers, threshold_percent,
                 policy_version, source_result_ids, audit_evidence,
                 algorithm_version
            FROM meal_event_canonical_results
-          WHERE event_id = $1 AND version = $2 AND ordinal IS NULL`,
+          WHERE event_id = $1 AND version = $2`,
+        [eventId, version],
+    );
+    // Item scopes that produced at least one succeeded provider row must each
+    // have a persisted canonical row; fail closed otherwise.
+    const itemScopesResult = await client.query(
+        `SELECT DISTINCT ordinal FROM meal_event_nutrition_results
+          WHERE event_id = $1 AND version = $2
+            AND ordinal IS NOT NULL AND status = 'succeeded'`,
         [eventId, version],
     );
     const v = versionResult.rows[0];
-    const c = canonicalResult.rows[0];
-    if (!v || !c) throw new Error("persisted aggregate readback missing");
-    const canonical = {
-        status: c.status,
-        consensus_status: c.consensus_status,
-        nutrients: Object.fromEntries(
-            NUTRIENT_FIELDS.map((field) => [
-                field,
-                c[field] === null ? null : Number(c[field]),
-            ]),
-        ),
-        per_nutrient: {},
-        eligible_providers: c.eligible_providers,
-        outlier_providers: c.outlier_providers,
-        threshold_percent: Number(c.threshold_percent),
-        policy_version: c.policy_version,
-        source_result_ids: c.source_result_ids,
-        audit_evidence: c.audit_evidence,
-        algorithm_version: c.algorithm_version,
-    } as unknown as ReturnType<typeof computeConsensus>;
+    const eventRow = canonicalResult.rows.find((row) => row.ordinal == null);
+    if (!v || !eventRow)
+        throw new Error("persisted aggregate readback missing");
+    const itemRows = canonicalResult.rows
+        .filter((row) => typeof row.ordinal === "number")
+        .sort((a, b) => Number(a.ordinal) - Number(b.ordinal));
+    for (const scopeRow of itemScopesResult.rows) {
+        const ordinal = Number(scopeRow.ordinal);
+        if (!itemRows.some((row) => Number(row.ordinal) === ordinal))
+            throw new Error("persisted aggregate readback missing");
+    }
+    const mapCanonicalRow = (
+        row: typeof eventRow,
+    ): ReturnType<typeof computeConsensus> =>
+        ({
+            status: row.status,
+            consensus_status: row.consensus_status,
+            nutrients: Object.fromEntries(
+                NUTRIENT_FIELDS.map((field) => [
+                    field,
+                    row[field] === null ? null : Number(row[field]),
+                ]),
+            ),
+            per_nutrient: {},
+            eligible_providers: row.eligible_providers,
+            outlier_providers: row.outlier_providers,
+            threshold_percent: Number(row.threshold_percent),
+            policy_version: row.policy_version,
+            source_result_ids: row.source_result_ids,
+            audit_evidence: row.audit_evidence,
+            algorithm_version: row.algorithm_version,
+        }) as unknown as ReturnType<typeof computeConsensus>;
+    const c = eventRow;
+    const canonical = mapCanonicalRow(c);
     const providers = providersResult.rows;
     const complete =
         providers.length === 3 &&
@@ -157,6 +184,10 @@ export async function readPersistedWriteStatus(
         }),
         fingerprint: v.calculation_bundle_fingerprint ?? null,
         canonical,
+        item_canonicals: itemRows.map((row) => ({
+            ...mapCanonicalRow(row),
+            ordinal: Number(row.ordinal),
+        })),
         compatibility: v.calculation_bundle_fingerprint == null,
     };
 }
@@ -295,6 +326,25 @@ export function deriveWriteProvenance(
     };
 }
 
+export interface MealEventCanonical {
+    status: string;
+    consensus_status: string;
+    calories: number | null;
+    protein_g: number | null;
+    carbs_g: number | null;
+    fat_g: number | null;
+    fiber_g: number | null;
+    sugar_g: number | null;
+    alcohol_g: number | null;
+    eligible_providers: string[] | null;
+    outlier_providers: string[] | null;
+    threshold_percent: number;
+    policy_version: string;
+    source_result_ids: string[] | null;
+    audit_evidence: Record<string, unknown> | null;
+    algorithm_version: string | null;
+}
+
 export interface MealEventAggregate {
     event: {
         id: string;
@@ -362,24 +412,8 @@ export interface MealEventAggregate {
         units: string | null;
         nutrients: Partial<Nutrients>;
     }[];
-    canonical: {
-        status: string;
-        consensus_status: string;
-        calories: number | null;
-        protein_g: number | null;
-        carbs_g: number | null;
-        fat_g: number | null;
-        fiber_g: number | null;
-        sugar_g: number | null;
-        alcohol_g: number | null;
-        eligible_providers: string[] | null;
-        outlier_providers: string[] | null;
-        threshold_percent: number;
-        policy_version: string;
-        source_result_ids: string[] | null;
-        audit_evidence: Record<string, unknown> | null;
-        algorithm_version: string | null;
-    } | null;
+    canonical: MealEventCanonical | null;
+    item_canonicals: Array<MealEventCanonical & { ordinal: number }>;
     journal: {
         id: string;
         system: string;
@@ -1014,7 +1048,7 @@ export async function getMealEvent(
             ),
             pool.query(
                 `SELECT * FROM meal_event_canonical_results
-                 WHERE event_id = $1 AND version = $2 AND ordinal IS NULL`,
+                 WHERE event_id = $1 AND version = $2`,
                 [eventId, resolvedVersion],
             ),
             pool.query(
@@ -1024,7 +1058,32 @@ export async function getMealEvent(
             ),
         ]);
 
-    const canonicalRow = canonical.rows[0];
+    const mapCanonicalRow = (row: {
+        [key: string]: unknown;
+    }): MealEventCanonical => ({
+        status: row.status as string,
+        consensus_status: row.consensus_status as string,
+        calories: numOrNull(row.calories),
+        protein_g: numOrNull(row.protein_g),
+        carbs_g: numOrNull(row.carbs_g),
+        fat_g: numOrNull(row.fat_g),
+        fiber_g: numOrNull(row.fiber_g),
+        sugar_g: numOrNull(row.sugar_g),
+        alcohol_g: numOrNull(row.alcohol_g),
+        eligible_providers: row.eligible_providers as string[] | null,
+        outlier_providers: row.outlier_providers as string[] | null,
+        threshold_percent: Number(row.threshold_percent),
+        policy_version: row.policy_version as string,
+        source_result_ids: row.source_result_ids as string[] | null,
+        audit_evidence: row.audit_evidence as Record<string, unknown> | null,
+        algorithm_version: (row.algorithm_version as string | null) ?? null,
+    });
+    const eventCanonicalRow = canonical.rows.find(
+        (row) => row.ordinal === null,
+    );
+    const itemCanonicalRows = canonical.rows
+        .filter((row) => typeof row.ordinal === "number")
+        .sort((a, b) => Number(a.ordinal) - Number(b.ordinal));
 
     return {
         event: {
@@ -1098,33 +1157,13 @@ export async function getMealEvent(
                 NUTRIENT_FIELDS.map((f) => [f, numOrNull(r[f])]),
             ) as Partial<Nutrients>,
         })),
-        canonical: canonicalRow
-            ? {
-                  status: canonicalRow.status as string,
-                  consensus_status: canonicalRow.consensus_status as string,
-                  calories: numOrNull(canonicalRow.calories),
-                  protein_g: numOrNull(canonicalRow.protein_g),
-                  carbs_g: numOrNull(canonicalRow.carbs_g),
-                  fat_g: numOrNull(canonicalRow.fat_g),
-                  fiber_g: numOrNull(canonicalRow.fiber_g),
-                  sugar_g: numOrNull(canonicalRow.sugar_g),
-                  alcohol_g: numOrNull(canonicalRow.alcohol_g),
-                  eligible_providers: canonicalRow.eligible_providers as
-                      string[] | null,
-                  outlier_providers: canonicalRow.outlier_providers as
-                      string[] | null,
-                  threshold_percent: Number(canonicalRow.threshold_percent),
-                  policy_version: canonicalRow.policy_version as string,
-                  source_result_ids: canonicalRow.source_result_ids as
-                      string[] | null,
-                  audit_evidence: canonicalRow.audit_evidence as Record<
-                      string,
-                      unknown
-                  > | null,
-                  algorithm_version:
-                      (canonicalRow.algorithm_version as string | null) ?? null,
-              }
+        canonical: eventCanonicalRow
+            ? mapCanonicalRow(eventCanonicalRow)
             : null,
+        item_canonicals: itemCanonicalRows.map((row) => ({
+            ...mapCanonicalRow(row),
+            ordinal: Number(row.ordinal),
+        })),
         journal: journal.rows.map((r) => ({
             id: r.id as string,
             system: r.system as string,

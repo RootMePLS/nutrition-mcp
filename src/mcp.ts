@@ -137,6 +137,13 @@ function canonicalOutput(canonical: MealEventAggregate["canonical"]) {
     };
 }
 
+function itemCanonicalsOutput(aggregate: MealEventAggregate) {
+    return aggregate.item_canonicals.map((item) => ({
+        ...canonicalOutput(item)!,
+        ordinal: item.ordinal,
+    }));
+}
+
 export function buildCalculationBundleOutput(
     result: Awaited<ReturnType<typeof commitCalculationBundle>>,
     readback: {
@@ -180,6 +187,7 @@ export function buildCalculationBundleOutput(
             error_message: r.error_message,
         })),
         canonical,
+        item_canonicals: itemCanonicalsOutput(aggregate),
         external_sync,
     });
 }
@@ -4470,6 +4478,7 @@ export function registerTools(
                     error_message: r.error_message,
                 })),
                 canonical: canonicalOutput(aggregate.canonical),
+                item_canonicals: itemCanonicalsOutput(aggregate),
             });
             const pendingNote =
                 found.provenance_status === "ready"

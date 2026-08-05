@@ -406,6 +406,237 @@ describeDb("calculation bundle PostgreSQL integration", () => {
         expect(second.deduplicated).toBe(true);
         expect(await correctionRows(pool)).toEqual(before);
     });
+
+    // ------------------------------------------------------------------
+    // S1: per-scope canonical materialization matrix
+    // ------------------------------------------------------------------
+
+    test("materializes one canonical row per scope with scope-local source IDs", async () => {
+        const bundle = makeScopedBundle();
+        await commitCalculationBundle(pool, bundle);
+
+        const canonical = await pool.query(
+            `SELECT scope_key, calories, status, consensus_status, source_result_ids
+               FROM meal_event_canonical_results
+              WHERE event_id = $1 AND version = $2 ORDER BY scope_key`,
+            [bundle.event_id, bundle.version],
+        );
+        expect(canonical.rows.map((r) => r.scope_key)).toEqual([
+            "event",
+            "item:0",
+            "item:1",
+        ]);
+        // Each scope's consensus is computed from its own providers alone.
+        expect(Number(canonical.rows[0].calories)).toBe(505);
+        expect(Number(canonical.rows[1].calories)).toBe(303);
+        expect(Number(canonical.rows[2].calories)).toBe(201);
+        // Every scope references exactly its own two succeeded provider rows.
+        for (const row of canonical.rows) {
+            expect(row.source_result_ids).toHaveLength(2);
+        }
+        // SQL join proof: no source_result_id crosses a scope boundary.
+        const crossScope = await pool.query(
+            `SELECT c.scope_key, count(*)::int AS bad
+               FROM meal_event_canonical_results c
+               JOIN LATERAL unnest(c.source_result_ids) AS sid ON true
+               JOIN meal_event_nutrition_results r ON r.id = sid
+              WHERE c.event_id = $1 AND c.version = $2
+                AND r.scope_key <> c.scope_key
+              GROUP BY c.scope_key`,
+            [bundle.event_id, bundle.version],
+        );
+        expect(crossScope.rows).toEqual([]);
+        // And each referenced provider row really belongs to that scope.
+        const inScope = await pool.query(
+            `SELECT c.scope_key, count(*)::int AS refs
+               FROM meal_event_canonical_results c
+               JOIN LATERAL unnest(c.source_result_ids) AS sid ON true
+               JOIN meal_event_nutrition_results r ON r.id = sid
+              WHERE c.event_id = $1 AND c.version = $2
+                AND r.scope_key = c.scope_key
+              GROUP BY c.scope_key ORDER BY c.scope_key`,
+            [bundle.event_id, bundle.version],
+        );
+        expect(inScope.rows).toEqual([
+            { scope_key: "event", refs: 2 },
+            { scope_key: "item:0", refs: 2 },
+            { scope_key: "item:1", refs: 2 },
+        ]);
+    });
+
+    test("isolates extreme item-scope values from the event canonical", async () => {
+        const bundle = makeScopedBundle();
+        // Extreme item-scoped calories must not move the event consensus.
+        for (const result of bundle.results) {
+            if (result.scope.ordinal === 0) {
+                result.nutrients = { calories: 9000 };
+                result.raw_payload = { calories: 9000 };
+            }
+        }
+        bundle.fingerprint = stableBundleFingerprint(bundle);
+        await commitCalculationBundle(pool, bundle);
+
+        const event = await pool.query(
+            `SELECT calories, consensus_status FROM meal_event_canonical_results
+              WHERE event_id = $1 AND version = $2 AND scope_key = 'event'`,
+            [bundle.event_id, bundle.version],
+        );
+        // Consensus of the event-scope providers alone (500, 510).
+        expect(Number(event.rows[0].calories)).toBe(505);
+        expect(event.rows[0].consensus_status).toBe("all_agree");
+        const item0 = await pool.query(
+            `SELECT calories FROM meal_event_canonical_results
+              WHERE event_id = $1 AND version = $2 AND scope_key = 'item:0'`,
+            [bundle.event_id, bundle.version],
+        );
+        expect(Number(item0.rows[0].calories)).toBe(9000);
+    });
+
+    test("marks item scopes without usable provider data as pending, siblings unaffected", async () => {
+        const bundle = makeScopedBundle();
+        bundle.results = bundle.results.map((result) =>
+            result.scope.ordinal === 1
+                ? {
+                      ...result,
+                      status: "failed" as const,
+                      nutrients: {},
+                      error_code: "provider_timeout",
+                      error_message: "timed out",
+                  }
+                : result,
+        );
+        bundle.fingerprint = stableBundleFingerprint(bundle);
+        await commitCalculationBundle(pool, bundle);
+
+        const rows = await pool.query(
+            `SELECT scope_key, status, consensus_status, calories, source_result_ids
+               FROM meal_event_canonical_results
+              WHERE event_id = $1 AND version = $2 ORDER BY scope_key`,
+            [bundle.event_id, bundle.version],
+        );
+        expect(rows.rows).toHaveLength(3);
+        const byScope = Object.fromEntries(
+            rows.rows.map((r) => [r.scope_key, r]),
+        );
+        expect(byScope["item:1"].status).toBe("pending");
+        expect(byScope["item:1"].consensus_status).toBe("insufficient_data");
+        expect(byScope["item:1"].calories).toBeNull();
+        expect(Number(byScope["event"].calories)).toBe(505);
+        expect(Number(byScope["item:0"].calories)).toBe(303);
+        // Failed providers are never referenced as canonical sources.
+        expect(byScope["item:1"].source_result_ids ?? []).toEqual([]);
+    });
+
+    test("retry with the same fingerprint keeps exactly one canonical row per scope", async () => {
+        const bundle = makeScopedBundle();
+        const first = await commitCalculationBundle(pool, bundle);
+        const second = await commitCalculationBundle(pool, bundle);
+        expect(first.deduplicated).toBe(false);
+        expect(second.deduplicated).toBe(true);
+        const counts = await pool.query(
+            `SELECT scope_key, count(*)::int AS n
+               FROM meal_event_canonical_results
+              WHERE event_id = $1 AND version = $2
+              GROUP BY scope_key ORDER BY scope_key`,
+            [bundle.event_id, bundle.version],
+        );
+        expect(counts.rows).toEqual([
+            { scope_key: "event", n: 1 },
+            { scope_key: "item:0", n: 1 },
+            { scope_key: "item:1", n: 1 },
+        ]);
+        expect(
+            (
+                await pool.query(
+                    "SELECT count(*) FROM meal_event_nutrition_results",
+                )
+            ).rows[0].count,
+        ).toBe("6");
+    });
+
+    test("correction materializes per-scope canonicals and leaves the prior version immutable", async () => {
+        const original = makeScopedBundle();
+        await commitCalculationBundle(pool, original);
+        const priorRows = await pool.query(
+            `SELECT scope_key, calories, status, consensus_status, source_result_ids
+               FROM meal_event_canonical_results
+              WHERE event_id = $1 AND version = 1 ORDER BY scope_key`,
+            [original.event_id],
+        );
+        expect(priorRows.rows).toHaveLength(3);
+
+        const correction = makeScopedBundle();
+        correction.version = 2;
+        for (const result of correction.results) {
+            if (
+                result.scope.ordinal === null &&
+                result.status === "succeeded"
+            ) {
+                result.nutrients = { calories: 600 };
+                result.raw_payload = { calories: 600 };
+            }
+        }
+        correction.fingerprint = stableBundleFingerprint(correction);
+        const metadata: CalculationCorrectionMetadata = {
+            correction_idempotency_key: "correction-scoped-1",
+            correction_reason: "item portions clarified",
+            correction_author: "hermes",
+            source_timestamp: "2026-08-05T12:00:00.000Z",
+            confirmed: true,
+            external_write_authorized: false,
+            user_id: "integration-test",
+        };
+        const result = await commitCalculationCorrection(
+            pool,
+            correction,
+            metadata,
+        );
+        expect(result.version).toBe(2);
+        expect(result.canonical.nutrients.calories).toBe(600);
+
+        const corrected = await pool.query(
+            `SELECT scope_key, calories FROM meal_event_canonical_results
+              WHERE event_id = $1 AND version = 2 ORDER BY scope_key`,
+            [correction.event_id],
+        );
+        expect(corrected.rows.map((r) => r.scope_key)).toEqual([
+            "event",
+            "item:0",
+            "item:1",
+        ]);
+        expect(Number(corrected.rows[0].calories)).toBe(600);
+        expect(Number(corrected.rows[1].calories)).toBe(303);
+        expect(Number(corrected.rows[2].calories)).toBe(201);
+
+        // Prior-version immutability: version 1 rows are byte-identical.
+        const priorAfter = await pool.query(
+            `SELECT scope_key, calories, status, consensus_status, source_result_ids
+               FROM meal_event_canonical_results
+              WHERE event_id = $1 AND version = 1 ORDER BY scope_key`,
+            [original.event_id],
+        );
+        expect(priorAfter.rows).toEqual(priorRows.rows);
+    });
+
+    test("rolls back every per-scope row when the transaction hook fails", async () => {
+        const bundle = makeScopedBundle();
+        await expect(
+            commitCalculationBundle(pool, bundle, {
+                beforeCommit: async () => {
+                    throw new Error("injected scoped transaction failure");
+                },
+            }),
+        ).rejects.toThrow("injected scoped transaction failure");
+        for (const table of [
+            "meal_event_nutrition_results",
+            "meal_event_canonical_results",
+        ]) {
+            expect(
+                (await pool.query(`SELECT count(*) FROM ${table}`)).rows[0]
+                    .count,
+            ).toBe("0");
+        }
+    });
 });
 
 async function correctionRows(pool: Pool) {
@@ -489,4 +720,50 @@ function provider(
         nutrients: { calories },
         raw_payload: { provider, calories },
     };
+}
+
+function scopedProvider(
+    provider: "nutrition-local" | "own",
+    source_id: string,
+    ordinal: number | null,
+    calories: number,
+) {
+    return {
+        provider,
+        status: "succeeded" as const,
+        scope: { ordinal },
+        source_id,
+        request_fingerprint: `${provider}-request-${ordinal ?? "event"}`,
+        algorithm_version: "v1",
+        basis: "per_meal" as const,
+        units: "g_and_kcal" as const,
+        nutrients: { calories },
+        raw_payload: { provider, source_id, calories },
+    };
+}
+
+/** Event scope + item scopes 0 and 1, two succeeded providers per scope. */
+function makeScopedBundle(): CalculationBundleInput {
+    const input = {
+        event_id: "00000000-0000-4000-8000-000000000001",
+        version: 1,
+        capture_id: "capture-1",
+        resolved_input: {
+            items: [
+                { ordinal: 0, raw_item_text: "oatmeal 80g" },
+                { ordinal: 1, raw_item_text: "banana" },
+            ],
+            inputs: [],
+        },
+        results: [
+            scopedProvider("nutrition-local", "local-event", null, 500),
+            scopedProvider("own", "own-event", null, 510),
+            scopedProvider("nutrition-local", "local-item0", 0, 300),
+            scopedProvider("own", "own-item0", 0, 306),
+            scopedProvider("nutrition-local", "local-item1", 1, 200),
+            scopedProvider("own", "own-item1", 1, 202),
+        ],
+        canonical_proposal: { calories: 9999 },
+    } satisfies Omit<CalculationBundleInput, "fingerprint">;
+    return { ...input, fingerprint: stableBundleFingerprint(input) };
 }

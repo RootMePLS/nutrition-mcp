@@ -1,13 +1,14 @@
 import type { Pool, PoolClient } from "pg";
 import { z } from "zod";
 import { withTransaction } from "./db.js";
-import { computeConsensus } from "./meal-consensus.js";
+import { computeConsensus, type ConsensusOutcome } from "./meal-consensus.js";
 import { readPersistedWriteStatus } from "./meal-events.js";
 import { NUTRIENT_FIELDS, type NutrientField } from "./meal-types.js";
 import {
     stableBundleFingerprint,
     validateCalculationBundle,
     type CalculationBundleInput,
+    type ProviderCalculationResult,
 } from "./nutrition-bundle-types.js";
 
 export class CalculationBundleValidationError extends Error {
@@ -105,6 +106,10 @@ const CANONICAL_OUTPUT_SCHEMA = z
     })
     .strict();
 
+const ITEM_CANONICAL_OUTPUT_SCHEMA = CANONICAL_OUTPUT_SCHEMA.extend({
+    ordinal: z.number().int().min(0),
+});
+
 export const CALCULATION_BUNDLE_OUTPUT_SCHEMA = z
     .object({
         event_id: z.string().uuid(),
@@ -121,6 +126,7 @@ export const CALCULATION_BUNDLE_OUTPUT_SCHEMA = z
         is_current: z.boolean(),
         provider_results: z.array(PROVIDER_OUTPUT_SCHEMA),
         canonical: CANONICAL_OUTPUT_SCHEMA.nullable(),
+        item_canonicals: z.array(ITEM_CANONICAL_OUTPUT_SCHEMA),
         external_sync: z.enum(["not_authorized", "pending"]),
     })
     .strict();
@@ -146,6 +152,7 @@ export const CALCULATION_PROVENANCE_OUTPUT_SCHEMA = z
             CALCULATION_BUNDLE_OUTPUT_SCHEMA.shape.provider_results.element,
         ),
         canonical: CANONICAL_OUTPUT_SCHEMA.nullable(),
+        item_canonicals: z.array(ITEM_CANONICAL_OUTPUT_SCHEMA),
     })
     .strict();
 
@@ -180,14 +187,98 @@ function nutrientValues(
     return NUTRIENT_FIELDS.map((field) => nutrients[field] ?? null);
 }
 
-export function recomputeCalculationBundle(bundle: CalculationBundleInput) {
-    return computeConsensus(
-        bundle.results.map((result) => ({
-            provider: result.provider,
-            status: result.status,
-            nutrients: result.nutrients,
-        })),
-    );
+export interface PerScopeConsensus {
+    /** Consensus over event-scope (ordinal NULL) provider results only. */
+    event: ConsensusOutcome;
+    /** One consensus per item ordinal present in the bundle results. */
+    items: Map<number, ConsensusOutcome>;
+}
+
+/**
+ * Compute consensus independently for the event scope and each item ordinal.
+ * Item values never enter the event consensus and vice versa.
+ */
+export function recomputeCalculationBundle(
+    bundle: CalculationBundleInput,
+): PerScopeConsensus {
+    const scopes = new Map<number | null, ProviderCalculationResult[]>();
+    for (const result of bundle.results) {
+        const scope = result.scope.ordinal ?? null;
+        const group = scopes.get(scope) ?? [];
+        group.push(result);
+        scopes.set(scope, group);
+    }
+    const toConsensus = (
+        results: ProviderCalculationResult[] | undefined,
+    ): ConsensusOutcome =>
+        computeConsensus(
+            (results ?? []).map((result) => ({
+                provider: result.provider,
+                status: result.status,
+                nutrients: result.nutrients,
+            })),
+        );
+    const items = new Map<number, ConsensusOutcome>();
+    for (const [scope, results] of scopes) {
+        if (scope !== null) items.set(scope, toConsensus(results));
+    }
+    return { event: toConsensus(scopes.get(null)), items };
+}
+
+/**
+ * Persist one canonical row per scope (event + each item ordinal). Each row's
+ * source_result_ids are selected only from succeeded provider rows of the
+ * SAME scope (`ordinal IS NOT DISTINCT FROM $3`).
+ */
+async function persistCanonicalPerScope(
+    client: PoolClient,
+    eventId: string,
+    version: number,
+    perScope: PerScopeConsensus,
+    auditEvidence: (
+        scope: number | null,
+        consensus: ConsensusOutcome,
+        sourceResultIds: string[],
+    ) => Record<string, unknown>,
+): Promise<void> {
+    const scopes: Array<[number | null, ConsensusOutcome]> = [
+        [null, perScope.event],
+        ...[...perScope.items.entries()].sort(([a], [b]) => a - b),
+    ];
+    for (const [scope, consensus] of scopes) {
+        const ids = await client.query(
+            `SELECT id FROM meal_event_nutrition_results
+              WHERE event_id = $1 AND version = $2
+                AND ordinal IS NOT DISTINCT FROM $3
+                AND status = 'succeeded'
+              ORDER BY provider`,
+            [eventId, version, scope],
+        );
+        const sourceResultIds = ids.rows.map((row) => row.id as string);
+        await client.query(
+            `INSERT INTO meal_event_canonical_results
+                (event_id, version, ordinal, status, consensus_status, ${NUTRIENT_FIELDS.join(", ")},
+                 eligible_providers, outlier_providers, threshold_percent, policy_version, source_result_ids, audit_evidence, algorithm_version)
+             VALUES ($1,$2,$3,$4,$5,${NUTRIENT_FIELDS.map((_, i) => `$${6 + i}`).join(",")},$${6 + NUTRIENT_FIELDS.length},$${7 + NUTRIENT_FIELDS.length},$${8 + NUTRIENT_FIELDS.length},$${9 + NUTRIENT_FIELDS.length},$${10 + NUTRIENT_FIELDS.length},$${11 + NUTRIENT_FIELDS.length},$${12 + NUTRIENT_FIELDS.length})`,
+            [
+                eventId,
+                version,
+                scope,
+                consensus.status,
+                consensus.consensus_status,
+                ...nutrientValues(consensus.nutrients),
+                consensus.eligible_providers,
+                consensus.outlier_providers,
+                consensus.threshold_percent,
+                consensus.policy_version,
+                sourceResultIds,
+                JSON.stringify(
+                    auditEvidence(scope, consensus, sourceResultIds),
+                ),
+                consensus.policy_version,
+            ],
+        );
+    }
 }
 
 async function readCanonical(
@@ -244,7 +335,7 @@ export async function commitCalculationBundle(
         throw new CalculationBundleValidationError([
             "bundle fingerprint mismatch",
         ]);
-    const canonical = recomputeCalculationBundle(bundle);
+    const perScope = recomputeCalculationBundle(bundle);
 
     return withTransaction(pool, async (client) => {
         const version = await client.query(
@@ -313,33 +404,16 @@ export async function commitCalculationBundle(
                 ],
             );
         }
-        const ids = await client.query(
-            `SELECT id FROM meal_event_nutrition_results WHERE event_id = $1 AND version = $2 AND ordinal IS NULL AND status = 'succeeded' ORDER BY provider`,
-            [bundle.event_id, bundle.version],
-        );
-        await client.query(
-            `INSERT INTO meal_event_canonical_results
-                (event_id, version, ordinal, status, consensus_status, ${NUTRIENT_FIELDS.join(", ")},
-                 eligible_providers, outlier_providers, threshold_percent, policy_version, source_result_ids, audit_evidence, algorithm_version)
-             VALUES ($1,$2,NULL,$3,$4,${NUTRIENT_FIELDS.map((_, i) => `$${5 + i}`).join(",")},$${5 + NUTRIENT_FIELDS.length},$${6 + NUTRIENT_FIELDS.length},$${7 + NUTRIENT_FIELDS.length},$${8 + NUTRIENT_FIELDS.length},$${9 + NUTRIENT_FIELDS.length},$${10 + NUTRIENT_FIELDS.length},$${11 + NUTRIENT_FIELDS.length})`,
-            [
-                bundle.event_id,
-                bundle.version,
-                canonical.status,
-                canonical.consensus_status,
-                ...nutrientValues(canonical.nutrients),
-                canonical.eligible_providers,
-                canonical.outlier_providers,
-                canonical.threshold_percent,
-                canonical.policy_version,
-                ids.rows.map((row) => row.id),
-                JSON.stringify({
-                    source_result_ids: ids.rows.map((row) => row.id),
-                    policy_version: canonical.policy_version,
-                    fingerprint: bundle.fingerprint,
-                }),
-                canonical.policy_version,
-            ],
+        await persistCanonicalPerScope(
+            client,
+            bundle.event_id,
+            bundle.version,
+            perScope,
+            (_scope, consensus, sourceResultIds) => ({
+                source_result_ids: sourceResultIds,
+                policy_version: consensus.policy_version,
+                fingerprint: bundle.fingerprint,
+            }),
         );
         await client.query(
             `UPDATE meal_event_versions SET calculation_bundle_fingerprint = $3 WHERE event_id = $1 AND version = $2`,
@@ -381,7 +455,7 @@ export async function commitCalculationCorrection(
         throw new CalculationBundleValidationError([
             "bundle fingerprint mismatch",
         ]);
-    const canonical = recomputeCalculationBundle(bundle);
+    const perScope = recomputeCalculationBundle(bundle);
     return withTransaction(pool, async (client) => {
         const root = await client.query(
             `SELECT user_id, current_version FROM meal_events WHERE id = $1 AND status = 'active' FOR UPDATE`,
@@ -461,18 +535,17 @@ export async function commitCalculationCorrection(
                 metadata.confirmed,
                 metadata.external_write_authorized,
                 prior,
-                canonical.policy_version,
+                perScope.event.policy_version,
                 metadata.correction_author,
                 bundle.fingerprint,
             ],
         );
-        const ids: string[] = [];
         for (const result of bundle.results) {
             const sourceId = result.source_id;
-            const inserted = await client.query(
+            await client.query(
                 `INSERT INTO meal_event_nutrition_results
                  (event_id,version,ordinal,provider,source_id,status,request_fingerprint,algorithm_version,raw_payload,provenance,basis,units,${NUTRIENT_FIELDS.join(",")},error_code,error_message)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,${NUTRIENT_FIELDS.map((_, i) => `$${13 + i}`).join(",")},$${13 + NUTRIENT_FIELDS.length},$${14 + NUTRIENT_FIELDS.length}) RETURNING id`,
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,${NUTRIENT_FIELDS.map((_, i) => `$${13 + i}`).join(",")},$${13 + NUTRIENT_FIELDS.length},$${14 + NUTRIENT_FIELDS.length})`,
                 [
                     bundle.event_id,
                     bundle.version,
@@ -493,35 +566,22 @@ export async function commitCalculationCorrection(
                     result.error_message ?? null,
                 ],
             );
-            if (result.status === "succeeded")
-                ids.push(inserted.rows[0].id as string);
         }
-        await client.query(
-            `INSERT INTO meal_event_canonical_results
-             (event_id,version,ordinal,status,consensus_status,${NUTRIENT_FIELDS.join(",")},eligible_providers,outlier_providers,threshold_percent,policy_version,source_result_ids,audit_evidence,algorithm_version)
-             VALUES ($1,$2,NULL,$3,$4,${NUTRIENT_FIELDS.map((_, i) => `$${5 + i}`).join(",")},$${5 + NUTRIENT_FIELDS.length},$${6 + NUTRIENT_FIELDS.length},$${7 + NUTRIENT_FIELDS.length},$${8 + NUTRIENT_FIELDS.length},$${9 + NUTRIENT_FIELDS.length},$${10 + NUTRIENT_FIELDS.length},$${11 + NUTRIENT_FIELDS.length})`,
-            [
-                bundle.event_id,
-                bundle.version,
-                canonical.status,
-                canonical.consensus_status,
-                ...nutrientValues(canonical.nutrients),
-                canonical.eligible_providers,
-                canonical.outlier_providers,
-                canonical.threshold_percent,
-                canonical.policy_version,
-                ids,
-                JSON.stringify({
-                    correction_reason: metadata.correction_reason,
-                    prior_version: prior,
-                    consensus_status: canonical.consensus_status,
-                    outlier_providers: canonical.outlier_providers,
-                    insufficient_provider:
-                        canonical.consensus_status === "insufficient_data",
-                    fingerprint: bundle.fingerprint,
-                }),
-                canonical.policy_version,
-            ],
+        await persistCanonicalPerScope(
+            client,
+            bundle.event_id,
+            bundle.version,
+            perScope,
+            (_scope, consensus, sourceResultIds) => ({
+                correction_reason: metadata.correction_reason,
+                prior_version: prior,
+                consensus_status: consensus.consensus_status,
+                outlier_providers: consensus.outlier_providers,
+                insufficient_provider:
+                    consensus.consensus_status === "insufficient_data",
+                source_result_ids: sourceResultIds,
+                fingerprint: bundle.fingerprint,
+            }),
         );
         await client.query(
             `UPDATE meal_events SET current_version = $2, external_write_authorized = external_write_authorized OR $3, updated_at = now() WHERE id = $1`,

@@ -8,7 +8,10 @@ import {
     validateCalculationBundle,
     type CalculationBundleInput,
 } from "./nutrition-bundle-types.js";
-import { commitCalculationBundle } from "./calculation-bundles.js";
+import {
+    commitCalculationBundle,
+    recomputeCalculationBundle,
+} from "./calculation-bundles.js";
 import {
     validateCalculationCorrection,
     CALCULATION_CORRECTION_OUTPUT_SCHEMA,
@@ -84,6 +87,7 @@ describe("calculation bundle commit seam", () => {
                     algorithm_version: "p",
                 },
                 provider_results: [],
+                item_canonicals: [],
                 external_sync: "not_authorized",
             }),
         ).toMatchObject({ version: 2 });
@@ -206,7 +210,7 @@ describe("calculation bundle commit seam", () => {
                             },
                         ],
                     };
-                if (sql.includes("SELECT status, consensus_status"))
+                if (sql.includes("status, consensus_status"))
                     return {
                         rows: [
                             {
@@ -320,7 +324,7 @@ describe("calculation bundle commit seam", () => {
                     };
                 if (sql.includes("SELECT id FROM meal_event_nutrition_results"))
                     return { rows: [] };
-                if (sql.includes("SELECT status, consensus_status"))
+                if (sql.includes("status, consensus_status"))
                     return {
                         rows: [
                             {
@@ -351,6 +355,33 @@ describe("calculation bundle commit seam", () => {
         expect(result.canonical.nutrients.calories).not.toBe(9999);
     });
 
+    test("recomputeCalculationBundle groups consensus per scope", () => {
+        const input = {
+            event_id: "00000000-0000-4000-8000-000000000001",
+            version: 1,
+            resolved_input: { items: [], inputs: [] },
+            results: [
+                provider("nutrition-local", "local-event", 500),
+                provider("own", "own-event", 510),
+                scopedProvider("nutrition-local", "local-item0", 0, 300),
+                scopedProvider("own", "own-item0", 0, 306),
+                scopedProvider("nutrition-local", "local-item1", 1, 200),
+            ],
+        } satisfies Omit<CalculationBundleInput, "fingerprint">;
+        const bundle: CalculationBundleInput = {
+            ...input,
+            fingerprint: stableBundleFingerprint(input),
+        };
+        const out = recomputeCalculationBundle(bundle);
+        // Event scope is computed from event-scope providers only.
+        expect(out.event.nutrients.calories).toBe(505);
+        expect(out.items.get(0)!.nutrients.calories).toBe(303);
+        expect(out.items.get(1)!.nutrients.calories).toBe(200);
+        // Item scopes never leak into the event scope and vice versa.
+        expect(out.event.eligible_providers).not.toContain("myfitnesspal");
+        expect(out.items.size).toBe(2);
+    });
+
     test("rejects tampered content before persistence", async () => {
         const calls: string[] = [];
         let persistedFingerprint: string | null = null;
@@ -372,7 +403,7 @@ describe("calculation bundle commit seam", () => {
                     };
                 if (sql.includes("SELECT id FROM meal_event_nutrition_results"))
                     return { rows: [] };
-                if (sql.includes("SELECT status, consensus_status"))
+                if (sql.includes("status, consensus_status"))
                     return {
                         rows: [
                             {
@@ -430,6 +461,26 @@ function provider(
         scope: { ordinal: null },
         source_id,
         request_fingerprint: `${provider}-request`,
+        algorithm_version: "v1",
+        basis: "per_meal" as const,
+        units: "g_and_kcal" as const,
+        nutrients: { calories },
+        raw_payload: { source_id, calories },
+    };
+}
+
+function scopedProvider(
+    provider: "nutrition-local" | "own",
+    source_id: string,
+    ordinal: number | null,
+    calories: number,
+) {
+    return {
+        provider,
+        status: "succeeded" as const,
+        scope: { ordinal },
+        source_id,
+        request_fingerprint: `${provider}-request-${ordinal ?? "event"}`,
         algorithm_version: "v1",
         basis: "per_meal" as const,
         units: "g_and_kcal" as const,
