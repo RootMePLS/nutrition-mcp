@@ -41,7 +41,7 @@ export interface MealVariation {
  * fuzzy matching would merge exactly the variations this feature exists to
  * distinguish ("oatmeal with raisins" vs "oatmeal with banana").
  */
-function normalizeDescription(description: string): string {
+export function normalizeDescription(description: string): string {
     return description
         .toLowerCase()
         .trim()
