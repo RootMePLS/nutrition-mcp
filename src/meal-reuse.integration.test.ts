@@ -1393,3 +1393,135 @@ describeDb(
         });
     },
 );
+
+
+// ---------------------------------------------------------------------------
+// Slice 4 concurrency + injected rollback: DB-serialized same-key racers
+// converge on exactly one graph; a post-child/pre-commit failure leaves zero
+// operation-owned rows and an intact, reusable source.
+// ---------------------------------------------------------------------------
+
+describeDb(
+    "reuse_meal_calculation concurrency and rollback (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await pool.end();
+        });
+
+        beforeEach(async () => {
+            await resetSchema(pool);
+        });
+
+        afterEach(async () => {
+            await flushAnalytics();
+        });
+
+        test("concurrent same-key reuse from two separate Pools converges on one graph", async () => {
+            const sourceId = await seedMealEvent(pool, "u1", {
+                idempotencyKey: "race-src",
+                consumedAt: daysAgo(2),
+                items: [{ ordinal: 0, raw_item_text: "raced oats" }],
+            });
+            await commitBundle(pool, "u1", readyBundle(sourceId, 1));
+            const baseline = await domainTableCounts(pool);
+            const command = reuseCommand({
+                source_event_id: sourceId,
+                idempotency_key: "race-key",
+            });
+
+            const poolB = new Pool({ connectionString: DATABASE_URL_TEST });
+            try {
+                const [a, b] = await Promise.all([
+                    reuseMealCalculation(pool, command),
+                    reuseMealCalculation(poolB, command),
+                ]);
+                expect(a.event_id).toBe(b.event_id);
+                expect([a.deduplicated, b.deduplicated].sort()).toEqual([
+                    false,
+                    true,
+                ]);
+            } finally {
+                await poolB.end();
+            }
+
+            const after = await domainTableCounts(pool);
+            expect(after.meal_events! - baseline.meal_events!).toBe(1);
+            expect(
+                after.meal_event_versions! - baseline.meal_event_versions!,
+            ).toBe(1);
+            expect(after.meal_event_items! - baseline.meal_event_items!).toBe(
+                1,
+            );
+            expect(
+                after.meal_event_nutrition_results! -
+                    baseline.meal_event_nutrition_results!,
+            ).toBe(3);
+            expect(
+                after.meal_event_canonical_results! -
+                    baseline.meal_event_canonical_results!,
+            ).toBe(1);
+            expect(
+                after.meal_event_reuse_sources! -
+                    baseline.meal_event_reuse_sources!,
+            ).toBe(1);
+            expect(
+                after.meal_event_reuse_provider_sources! -
+                    baseline.meal_event_reuse_provider_sources!,
+            ).toBe(3);
+            for (const table of Object.keys(after)) {
+                if (
+                    table.startsWith("supplement_") ||
+                    table === "meal_event_inputs"
+                ) {
+                    expect(after[table]).toBe(baseline[table]);
+                }
+            }
+        });
+
+        test("injected post-child/pre-commit failure leaves zero operation-owned rows, source intact, key reusable", async () => {
+            const sourceId = await seedMealEvent(pool, "u1", {
+                idempotencyKey: "rb-src",
+                consumedAt: daysAgo(2),
+                items: [{ ordinal: 0, raw_item_text: "rollback oats" }],
+            });
+            await commitBundle(pool, "u1", readyBundle(sourceId, 1));
+            const sourceBefore = await snapshotAggregate(pool, sourceId, 1);
+            const baseline = await domainTableCounts(pool);
+            const command = reuseCommand({
+                source_event_id: sourceId,
+                idempotency_key: "rollback-key",
+            });
+
+            const err = await catchReuseError(
+                reuseMealCalculation(pool, command, {
+                    beforeCommit: async () => {
+                        throw new Error("injected pre-commit failure");
+                    },
+                }),
+            );
+            expect(err.message).toContain("injected pre-commit failure");
+            // All-or-nothing: the lineage row, mapping rows, and every target
+            // graph row aborted with the transaction.
+            expect(await domainTableCounts(pool)).toEqual(baseline);
+            expect(await snapshotAggregate(pool, sourceId, 1)).toEqual(
+                sourceBefore,
+            );
+
+            // The key stays usable: a clean retry succeeds.
+            const retry = await reuseMealCalculation(pool, command);
+            expect(retry.deduplicated).toBe(false);
+            const readback = await getMealEventProvenance(
+                pool,
+                "u1",
+                retry.event_id,
+            );
+            expect(readback!.provenance_status).toBe("ready");
+        });
+    },
+);
