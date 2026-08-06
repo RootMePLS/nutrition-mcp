@@ -10,10 +10,16 @@ import {
 import { Pool } from "pg";
 import { flushAnalytics } from "./analytics.js";
 import { searchMealProjections } from "./meal-event-projection.js";
+import { searchReuseCandidates } from "./meal-reuse.js";
 import {
+    commitBundle,
+    correctMeal,
     deleteMealEvent,
+    domainTableCounts,
+    readyBundle,
     seedMealEvent,
     seedVariationCorpus,
+    unavailableBundle,
 } from "./meal-reuse.fixtures.js";
 
 // ---------------------------------------------------------------------------
@@ -141,6 +147,419 @@ describeDb(
                 expect(matches[0]!.logged_at).toBe(daysAgo(3));
                 expect(matches.map((m) => m.id)).not.toContain(otherUser);
                 expect(matches.map((m) => m.id)).not.toContain(deleted);
+            });
+        });
+
+        describe("searchReuseCandidates", () => {
+            test("90-day window: exactly -90d included, -91d excluded", async () => {
+                await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "b89",
+                    consumedAt: daysAgo(89),
+                    items: [{ ordinal: 0, raw_item_text: "boundary oats" }],
+                });
+                await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "b90",
+                    consumedAt: daysAgo(90),
+                    items: [{ ordinal: 0, raw_item_text: "boundary oats" }],
+                });
+                const excluded = await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "b91",
+                    consumedAt: daysAgo(91),
+                    items: [{ ordinal: 0, raw_item_text: "boundary oats" }],
+                });
+
+                const res = await searchReuseCandidates(pool, "u1", ["oats"], {
+                    now: NOW,
+                });
+                expect(res.match_mode).toBe("lexical");
+                expect(res.window_days).toBe(90);
+                expect(res.total_matches_90d).toBe(2);
+                expect(res.variations).toHaveLength(1);
+                expect(res.variations[0]!.occurrences_90d).toBe(2);
+                expect(JSON.stringify(res)).not.toContain(excluded);
+            });
+
+            test("ranking counts the full 90d set (no pre-grouping cap misranks 55 vs 8)", async () => {
+                await seedVariationCorpus(pool, "u1", {
+                    keyPrefix: "cap-a",
+                    itemText: "oat porridge alpha",
+                    count: 55,
+                    now: NOW,
+                    dayStart: 5,
+                    dayEnd: 85,
+                });
+                await seedVariationCorpus(pool, "u1", {
+                    keyPrefix: "cap-b",
+                    itemText: "oat porridge beta",
+                    count: 8,
+                    now: NOW,
+                    dayStart: 0,
+                    dayEnd: 4,
+                });
+
+                const res = await searchReuseCandidates(pool, "u1", ["oat"], {
+                    now: NOW,
+                });
+                expect(res.total_matches_90d).toBe(63);
+                expect(
+                    res.variations.map((v) => [
+                        v.variation_key,
+                        v.occurrences_90d,
+                    ]),
+                ).toEqual([
+                    ["oat porridge alpha", 55],
+                    ["oat porridge beta", 8],
+                ]);
+            });
+
+            test("equal frequency tie-breaks by newest last occurrence", async () => {
+                for (const [key, text, days] of [
+                    ["tie-a1", "tie variation alpha", 10],
+                    ["tie-a2", "tie variation alpha", 5],
+                    ["tie-b1", "tie variation beta", 8],
+                    ["tie-b2", "tie variation beta", 1],
+                ] as const) {
+                    await seedMealEvent(pool, "u1", {
+                        idempotencyKey: key,
+                        consumedAt: daysAgo(days),
+                        items: [{ ordinal: 0, raw_item_text: text }],
+                    });
+                }
+                const res = await searchReuseCandidates(pool, "u1", ["tie"], {
+                    now: NOW,
+                });
+                expect(res.variations.map((v) => v.variation_key)).toEqual([
+                    "tie variation beta",
+                    "tie variation alpha",
+                ]);
+            });
+
+            test("at most two candidates per variation, newest first", async () => {
+                for (let i = 1; i <= 5; i++) {
+                    await seedMealEvent(pool, "u1", {
+                        idempotencyKey: `cap-${i}`,
+                        consumedAt: daysAgo(i),
+                        items: [{ ordinal: 0, raw_item_text: "capped oats" }],
+                    });
+                }
+                const res = await searchReuseCandidates(
+                    pool,
+                    "u1",
+                    ["capped"],
+                    {
+                        now: NOW,
+                    },
+                );
+                const variation = res.variations[0]!;
+                expect(variation.occurrences_90d).toBe(5);
+                expect(variation.candidates).toHaveLength(2);
+                expect(variation.candidates[0]!.consumed_at).toBe(daysAgo(1));
+                expect(variation.candidates[1]!.consumed_at).toBe(daysAgo(2));
+                expect(variation.last_consumed_at).toBe(
+                    variation.candidates[0]!.consumed_at,
+                );
+            });
+
+            test("lexical semantics: case-insensitive, escaped literals, AND tokens, OR alternatives", async () => {
+                await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "lex-1",
+                    consumedAt: daysAgo(1),
+                    items: [
+                        { ordinal: 0, raw_item_text: "oat porridge with milk" },
+                    ],
+                });
+                await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "lex-2",
+                    consumedAt: daysAgo(2),
+                    items: [
+                        { ordinal: 0, raw_item_text: "oat porridge plain" },
+                    ],
+                });
+                await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "lex-3",
+                    consumedAt: daysAgo(3),
+                    items: [
+                        { ordinal: 0, raw_item_text: "50%_off\\ bar special" },
+                    ],
+                });
+                await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "lex-4",
+                    consumedAt: daysAgo(4),
+                    items: [{ ordinal: 0, raw_item_text: "beetroot salad" }],
+                });
+
+                // Case-insensitive.
+                const upper = await searchReuseCandidates(pool, "u1", ["OAT"], {
+                    now: NOW,
+                });
+                expect(upper.total_matches_90d).toBe(2);
+
+                // Tokens within one alternative are AND'd.
+                const anded = await searchReuseCandidates(
+                    pool,
+                    "u1",
+                    ["oat milk"],
+                    { now: NOW },
+                );
+                expect(anded.total_matches_90d).toBe(1);
+                expect(anded.variations[0]!.variation_key).toBe(
+                    "oat porridge with milk",
+                );
+
+                // LIKE metacharacters match literally after escaping.
+                const escaped = await searchReuseCandidates(
+                    pool,
+                    "u1",
+                    ["50%_off\\"],
+                    { now: NOW },
+                );
+                expect(escaped.total_matches_90d).toBe(1);
+                const unescaped = await searchReuseCandidates(
+                    pool,
+                    "u1",
+                    ["500off"],
+                    { now: NOW },
+                );
+                expect(unescaped.total_matches_90d).toBe(0);
+
+                // Alternatives are OR'd.
+                const alternatives = await searchReuseCandidates(
+                    pool,
+                    "u1",
+                    ["beetroot", "milk"],
+                    { now: NOW },
+                );
+                expect(alternatives.total_matches_90d).toBe(2);
+            });
+
+            test("ready candidate echoes committed bundle consensus and provenance", async () => {
+                const id = await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "ready-1",
+                    consumedAt: daysAgo(2),
+                    items: [{ ordinal: 0, raw_item_text: "ready oats" }],
+                });
+                await commitBundle(pool, "u1", readyBundle(id, 1));
+
+                const res = await searchReuseCandidates(pool, "u1", ["ready"], {
+                    now: NOW,
+                });
+                const candidate = res.variations[0]!.candidates[0]!;
+                expect(candidate.source_event_id).toBe(id);
+                expect(candidate.provenance_status).toBe("ready");
+                expect(candidate.compatibility).toBe(false);
+                expect(candidate.bundle_fingerprint).not.toBeNull();
+                expect(candidate.canonical).not.toBeNull();
+                expect(candidate.canonical!.status).toBe("ready");
+                expect(candidate.canonical!.consensus_status).toBe("all_agree");
+                expect(candidate.canonical!.calories).toBe(500);
+                expect(candidate.canonical!.protein_g).toBe(20);
+                expect(candidate.canonical!.carbs_g).toBe(60);
+                expect(candidate.canonical!.fat_g).toBe(15);
+            });
+
+            test("pending and unavailable candidates never fabricate zero nutrients", async () => {
+                await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "pending-1",
+                    consumedAt: daysAgo(1),
+                    items: [{ ordinal: 0, raw_item_text: "pending oats" }],
+                });
+                const unavailableId = await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "unavailable-1",
+                    consumedAt: daysAgo(2),
+                    items: [{ ordinal: 0, raw_item_text: "unavailable oats" }],
+                });
+                await commitBundle(
+                    pool,
+                    "u1",
+                    unavailableBundle(unavailableId, 1),
+                );
+
+                const res = await searchReuseCandidates(pool, "u1", ["oats"], {
+                    now: NOW,
+                });
+                const pending = res.variations.find(
+                    (v) => v.variation_key === "pending oats",
+                )!.candidates[0]!;
+                expect(pending.provenance_status).toBe("pending");
+                expect(pending.bundle_fingerprint).toBeNull();
+                expect(pending.canonical).not.toBeNull();
+                expect(pending.canonical!.calories).toBeNull();
+                expect(pending.canonical!.calories).not.toBe(0);
+                expect(pending.canonical!.protein_g).toBeNull();
+                const unavailable = res.variations.find(
+                    (v) => v.variation_key === "unavailable oats",
+                )!.candidates[0]!;
+                expect(unavailable.provenance_status).toBe("unavailable");
+            });
+
+            test("corrected events surface only current-version components", async () => {
+                const id = await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "corr-1",
+                    consumedAt: daysAgo(3),
+                    items: [
+                        {
+                            ordinal: 0,
+                            raw_item_text: "oatmeal with raisins",
+                            normalized_name: "oatmeal with raisins",
+                        },
+                    ],
+                });
+                await correctMeal(pool, "u1", id, {
+                    correctionKey: "corr-1-v2",
+                    items: [
+                        {
+                            ordinal: 0,
+                            raw_item_text: "oatmeal with banana",
+                            normalized_name: "oatmeal with banana",
+                        },
+                    ],
+                });
+
+                const res = await searchReuseCandidates(
+                    pool,
+                    "u1",
+                    ["oatmeal"],
+                    { now: NOW },
+                );
+                expect(res.variations).toHaveLength(1);
+                expect(res.variations[0]!.variation_key).toBe(
+                    "oatmeal with banana",
+                );
+                const candidate = res.variations[0]!.candidates[0]!;
+                expect(candidate.source_version).toBe(2);
+                expect(candidate.current_version).toBe(2);
+                expect(candidate.is_current).toBe(true);
+                expect(JSON.stringify(res)).not.toContain("raisins");
+            });
+
+            test("user isolation: no cross-user ids or item text, empty not error", async () => {
+                await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "iso-u1",
+                    consumedAt: daysAgo(1),
+                    items: [{ ordinal: 0, raw_item_text: "u1 secret oats" }],
+                });
+                await seedMealEvent(pool, "u2", {
+                    idempotencyKey: "iso-u2",
+                    consumedAt: daysAgo(1),
+                    items: [{ ordinal: 0, raw_item_text: "u2 hidden oats" }],
+                });
+
+                const resU1 = await searchReuseCandidates(
+                    pool,
+                    "u1",
+                    ["oats"],
+                    {
+                        now: NOW,
+                    },
+                );
+                expect(resU1.total_matches_90d).toBe(1);
+                expect(JSON.stringify(resU1)).not.toContain("u2");
+
+                const resU2 = await searchReuseCandidates(
+                    pool,
+                    "u2",
+                    ["secret"],
+                    { now: NOW },
+                );
+                expect(resU2.total_matches_90d).toBe(0);
+                expect(resU2.variations).toEqual([]);
+            });
+
+            test("deleted events leave counts and candidates", async () => {
+                const ids: string[] = [];
+                for (let i = 1; i <= 3; i++) {
+                    ids.push(
+                        await seedMealEvent(pool, "u1", {
+                            idempotencyKey: `del-${i}`,
+                            consumedAt: daysAgo(i),
+                            items: [
+                                { ordinal: 0, raw_item_text: "deleted oats" },
+                            ],
+                        }),
+                    );
+                }
+                await deleteMealEvent(pool, "u1", ids[0]!);
+
+                const res = await searchReuseCandidates(
+                    pool,
+                    "u1",
+                    ["deleted"],
+                    { now: NOW },
+                );
+                expect(res.total_matches_90d).toBe(2);
+                const variation = res.variations[0]!;
+                expect(variation.occurrences_90d).toBe(2);
+                expect(
+                    variation.candidates.map((c) => c.source_event_id),
+                ).not.toContain(ids[0]);
+            });
+
+            test("read-only: domain table counts identical across calls", async () => {
+                const id = await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "ro-1",
+                    consumedAt: daysAgo(1),
+                    items: [{ ordinal: 0, raw_item_text: "readonly oats" }],
+                });
+                await commitBundle(pool, "u1", readyBundle(id, 1));
+
+                const before = await domainTableCounts(pool);
+                await searchReuseCandidates(pool, "u1", ["readonly"], {
+                    now: NOW,
+                });
+                await searchReuseCandidates(pool, "u1", ["oats"], { now: NOW });
+                await searchReuseCandidates(pool, "u1", ["nothing-matches"], {
+                    now: NOW,
+                });
+                expect(await domainTableCounts(pool)).toEqual(before);
+            });
+
+            test("components are ordinal-ordered with seeded fields populated", async () => {
+                await seedMealEvent(pool, "u1", {
+                    idempotencyKey: "comp-1",
+                    consumedAt: daysAgo(1),
+                    mealType: "lunch",
+                    items: [
+                        {
+                            ordinal: 0,
+                            raw_item_text: "chicken salad bowl",
+                            normalized_name: "chicken salad",
+                            quantity: 250,
+                            portion_value: 1,
+                            portion_unit: "bowl",
+                            notes: "extra dressing",
+                        },
+                        {
+                            ordinal: 1,
+                            raw_item_text: "sparkling water",
+                            quantity: null,
+                        },
+                    ],
+                });
+
+                const res = await searchReuseCandidates(
+                    pool,
+                    "u1",
+                    ["chicken"],
+                    { now: NOW },
+                );
+                const candidate = res.variations[0]!.candidates[0]!;
+                expect(candidate.meal_type).toBe("lunch");
+                expect(candidate.components.map((c) => c.ordinal)).toEqual([
+                    0, 1,
+                ]);
+                expect(candidate.components[0]).toEqual({
+                    ordinal: 0,
+                    raw_item_text: "chicken salad bowl",
+                    normalized_name: "chicken salad",
+                    quantity: 250,
+                    portion_value: 1,
+                    portion_unit: "bowl",
+                    notes: "extra dressing",
+                });
+                expect(candidate.components[1]!.raw_item_text).toBe(
+                    "sparkling water",
+                );
+                expect(candidate.components[1]!.notes).toBeNull();
             });
         });
     },

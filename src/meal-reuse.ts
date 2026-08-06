@@ -1,8 +1,16 @@
 // src/meal-reuse.ts — READ-ONLY reusable-meal discovery. Lexical matching
 // only (ILIKE over persisted item text/notes); this module performs no
 // writes, no provider calls, and registers nothing. Slice 4 owns mutation.
+import type { Pool } from "pg";
 import { normalizeDescription } from "./search.js";
-import type { MealEventProjection } from "./meal-event-projection.js";
+import {
+    searchMealProjections,
+    type MealEventProjection,
+} from "./meal-event-projection.js";
+import {
+    getMealEventProvenance,
+    type MealEventCanonical,
+} from "./meal-events.js";
 
 export const REUSE_WINDOW_DAYS = 90;
 export const MAX_REUSE_VARIATIONS = 10;
@@ -128,4 +136,105 @@ export function rankReuseVariations(
             b.lastConsumedAt.localeCompare(a.lastConsumedAt),
     );
     return variations.slice(0, maxVariations);
+}
+
+function reuseCanonical(
+    canonical: MealEventCanonical | null,
+): ReuseCanonical | null {
+    if (!canonical) return null;
+    return {
+        status: canonical.status as ReuseCanonical["status"],
+        consensus_status:
+            canonical.consensus_status as ReuseCanonical["consensus_status"],
+        calories: canonical.calories,
+        protein_g: canonical.protein_g,
+        carbs_g: canonical.carbs_g,
+        fat_g: canonical.fat_g,
+        fiber_g: canonical.fiber_g,
+        sugar_g: canonical.sugar_g,
+        alcohol_g: canonical.alcohol_g,
+    };
+}
+
+/**
+ * DB read: uncapped 90d lexical match -> ranked variations -> at most two
+ * per-variation candidate aggregates read through the same user-scoped
+ * provenance read every public tool uses. No writes, no provider calls.
+ * `opts.now` injects the clock so window-boundary tests are deterministic.
+ */
+export async function searchReuseCandidates(
+    pool: Pool,
+    userId: string,
+    queries: string[],
+    opts: { now?: string } = {},
+): Promise<ReuseDiscovery> {
+    const generatedAt = new Date().toISOString();
+    const now = opts.now ?? generatedAt;
+    const empty: ReuseDiscovery = {
+        match_mode: "lexical",
+        window_days: REUSE_WINDOW_DAYS,
+        generated_at: generatedAt,
+        total_matches_90d: 0,
+        variations: [],
+    };
+    const hasTokens = queries.some((q) => q.trim().length > 0);
+    if (!hasTokens) return empty;
+
+    const sinceIso = new Date(
+        Date.parse(now) - REUSE_WINDOW_DAYS * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const matches = await searchMealProjections(pool, userId, queries, {
+        sinceIso,
+        limit: null,
+    });
+    if (matches.length === 0) return empty;
+
+    const ranked = rankReuseVariations(matches);
+    const variations: ReuseVariation[] = [];
+    for (const variation of ranked) {
+        const candidates: ReuseSourceCandidate[] = [];
+        for (const eventId of variation.candidateIds) {
+            const found = await getMealEventProvenance(pool, userId, eventId);
+            // An event vanishing between the two reads is skipped, never
+            // fabricated.
+            if (!found) continue;
+            const { aggregate } = found;
+            candidates.push({
+                source_event_id: aggregate.event.id,
+                source_version: aggregate.version.version,
+                current_version: aggregate.event.current_version,
+                is_current: found.is_current,
+                consumed_at: aggregate.event.consumed_at,
+                meal_type: aggregate.event.meal_type,
+                components: aggregate.items.map((item) => ({
+                    ordinal: item.ordinal,
+                    raw_item_text: item.raw_item_text,
+                    normalized_name: item.normalized_name,
+                    quantity: item.quantity,
+                    portion_value: item.portion_value,
+                    portion_unit: item.portion_unit,
+                    notes: item.notes,
+                })),
+                canonical: reuseCanonical(aggregate.canonical),
+                provenance_status: found.provenance_status,
+                compatibility: found.compatibility,
+                bundle_fingerprint:
+                    aggregate.version.calculation_bundle_fingerprint,
+            });
+        }
+        variations.push({
+            variation_key: variation.key,
+            label: variation.label,
+            occurrences_90d: variation.count,
+            last_consumed_at: variation.lastConsumedAt,
+            candidates,
+        });
+    }
+    return {
+        match_mode: "lexical",
+        window_days: REUSE_WINDOW_DAYS,
+        generated_at: generatedAt,
+        total_matches_90d: matches.length,
+        variations,
+    };
 }
