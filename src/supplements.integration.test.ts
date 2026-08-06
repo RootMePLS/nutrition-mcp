@@ -17,14 +17,18 @@ import {
     listSupplementRegimens,
     setSupplementRegimenActive,
     resolveSupplementProduct,
+    logSupplementIntake,
+    SupplementAliasAmbiguousError,
     SupplementIdempotencyConflictError,
     SupplementProductInactiveError,
     SupplementProductNotFoundError,
     SupplementProductVersionNotFoundError,
+    SupplementRegimenInactiveError,
     SupplementRegimenNotFoundError,
     SupplementValidationError,
     type CreateSupplementProductCommand,
     type CreateSupplementRegimenCommand,
+    type LogSupplementIntakeCommand,
 } from "./supplements.js";
 
 // ---------------------------------------------------------------------------
@@ -1755,6 +1759,506 @@ describeDb(
                 alias: "no such product",
             });
             expect(await domainTableCounts()).toEqual(before);
+        });
+    },
+);
+
+// ---------------------------------------------------------------------------
+// Slice 5: append-only intake facts with immutable nutrient snapshots.
+// ---------------------------------------------------------------------------
+
+function validIntakeCommand(
+    productId: string,
+    overrides: Record<string, unknown> = {},
+): LogSupplementIntakeCommand {
+    return {
+        user_id: "u1",
+        product_id: productId,
+        servings: 2,
+        occurred_at: "2026-08-05T08:00:00.000Z",
+        state_action: "done",
+        idempotency_key: `intake:${crypto.randomUUID()}`,
+        actor: "test",
+        ...overrides,
+    } as LogSupplementIntakeCommand;
+}
+
+describeDb(
+    "supplement intake logging: facts + snapshots (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await pool.end();
+        });
+
+        beforeEach(async () => {
+            await resetSchema(pool);
+        });
+
+        async function seedProduct(
+            overrides: Record<string, unknown> = {},
+        ): Promise<string> {
+            const result = await createSupplementProduct(
+                pool,
+                validCreateCommand({
+                    idempotency_key: `product:${crypto.randomUUID()}`,
+                    ...overrides,
+                }),
+            );
+            return result.product.product_id;
+        }
+
+        async function seedRegimen(
+            productId: string,
+            overrides: Record<string, unknown> = {},
+        ) {
+            const result = await createSupplementRegimen(
+                pool,
+                validRegimenCommand(productId, overrides),
+            );
+            return result.regimen;
+        }
+
+        async function reviseToV2(productId: string, displayName: string) {
+            return reviseSupplementProductLabel(pool, {
+                user_id: "u1",
+                product_id: productId,
+                display_name: displayName,
+                short_name: "Whey",
+                brand: "MyProtein",
+                form: "powder",
+                serving_amount: 32,
+                serving_unit: "g",
+                serving_description: "1 heaped scoop",
+                aliases: ["impact whey"],
+                nutrients: [
+                    { nutrient_key: "calories", amount: 128, unit: "kcal" },
+                    { nutrient_key: "protein_g", amount: 23, unit: "g" },
+                ],
+                label_evidence: { kind: "label_photo", verified_by: "user" },
+                label_source_kind: "user_verified_label",
+                revision_idempotency_key: `revise:${crypto.randomUUID()}`,
+                created_by: "test",
+            });
+        }
+
+        async function intakeRowJson(intakeId: string): Promise<unknown> {
+            const { rows } = await pool.query(
+                `SELECT row_to_json(t) AS row FROM (
+                     SELECT * FROM supplement_intake_events WHERE id = $1
+                 ) t`,
+                [intakeId],
+            );
+            return rows[0]?.row;
+        }
+
+        test("direct product id logs a done fact with every field and scaled snapshots", async () => {
+            const productId = await seedProduct();
+            const result = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, {
+                    idempotency_key: "intake:done-1",
+                }),
+            );
+            expect(result.deduplicated).toBe(false);
+            const fact = result.intake;
+            expect(typeof fact.intake_id).toBe("string");
+            expect(fact.product_id).toBe(productId);
+            expect(fact.product_version).toBe(1);
+            expect(fact.product_display_name).toBe("Impact Whey Protein");
+            expect(fact.category).toBe("sports_nutrition");
+            expect(fact.regimen_id).toBeNull();
+            expect(fact.servings).toBe(2);
+            expect(fact.occurred_at).toBe("2026-08-05T08:00:00.000Z");
+            expect(fact.state_action).toBe("done");
+            expect(fact.visible_state).toBe("done");
+            expect(fact.reason).toBeNull();
+            expect(fact.actor).toBe("test");
+            expect(fact.supersedes_intake_id).toBeNull();
+            expect(typeof fact.created_at).toBe("string");
+
+            // Every label nutrient of the bound version, scaled by servings:
+            // explicit 0 scales to 0, generic µg keys snapshot fine, and a
+            // nutrient absent from the label has no snapshot row at all.
+            expect(fact.nutrient_snapshots).toEqual([
+                {
+                    nutrient_key: "calories",
+                    unit: "kcal",
+                    original_amount: 120,
+                    scaled_amount: 240,
+                },
+                {
+                    nutrient_key: "fat_g",
+                    unit: "g",
+                    original_amount: 0,
+                    scaled_amount: 0,
+                },
+                {
+                    nutrient_key: "protein_g",
+                    unit: "g",
+                    original_amount: 21,
+                    scaled_amount: 42,
+                },
+                {
+                    nutrient_key: "vitamin_d",
+                    unit: "µg",
+                    original_amount: 5,
+                    scaled_amount: 10,
+                },
+            ]);
+
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(1);
+            expect(
+                await tableCount(pool, "supplement_intake_nutrient_snapshots"),
+            ).toBe(4);
+        });
+
+        test("explicit historical version binds that version's label; current binds current", async () => {
+            const productId = await seedProduct();
+            await reviseToV2(productId, "Impact Whey Protein (new formula)");
+
+            const historical = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, { product_version: 1 }),
+            );
+            expect(historical.intake.product_version).toBe(1);
+            expect(historical.intake.product_display_name).toBe(
+                "Impact Whey Protein",
+            );
+            expect(
+                historical.intake.nutrient_snapshots.find(
+                    (s) => s.nutrient_key === "protein_g",
+                )!.scaled_amount,
+            ).toBe(42);
+
+            const current = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId),
+            );
+            expect(current.intake.product_version).toBe(2);
+            expect(current.intake.product_display_name).toBe(
+                "Impact Whey Protein (new formula)",
+            );
+            expect(
+                current.intake.nutrient_snapshots.find(
+                    (s) => s.nutrient_key === "calories",
+                )!.scaled_amount,
+            ).toBe(256);
+        });
+
+        test("a unique alias logs against the resolved product", async () => {
+            const productId = await seedProduct();
+            const result = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, {
+                    product_id: null,
+                    alias: "mp  WHEY",
+                }),
+            );
+            expect(result.intake.product_id).toBe(productId);
+        });
+
+        test("an ambiguous alias throws supplement_alias_ambiguous with candidates and zero writes", async () => {
+            const first = await seedProduct({ aliases: ["shared whey"] });
+            const second = await seedProduct({
+                display_name: "Other Whey",
+                aliases: ["shared WHEY"],
+            });
+            const before = await sliceFiveWriteTableCounts(pool);
+            try {
+                await logSupplementIntake(
+                    pool,
+                    validIntakeCommand(first, {
+                        product_id: null,
+                        alias: "shared whey",
+                    }),
+                );
+                throw new Error("expected SupplementAliasAmbiguousError");
+            } catch (err) {
+                const ambiguous = err as SupplementAliasAmbiguousError;
+                expect(ambiguous).toBeInstanceOf(SupplementAliasAmbiguousError);
+                expect(ambiguous.code).toBe("supplement_alias_ambiguous");
+                expect(ambiguous.message).toContain(
+                    "supplement_alias_ambiguous",
+                );
+                expect(
+                    ambiguous.candidates.map((c) => c.product_id).sort(),
+                ).toEqual([first, second].sort());
+            }
+            expect(await sliceFiveWriteTableCounts(pool)).toEqual(before);
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(0);
+        });
+
+        test("an unknown alias fails closed as product not found", async () => {
+            await seedProduct();
+            await expect(
+                logSupplementIntake(
+                    pool,
+                    validIntakeCommand("ignored", {
+                        product_id: null,
+                        alias: "no such product",
+                    }),
+                ),
+            ).rejects.toBeInstanceOf(SupplementProductNotFoundError);
+        });
+
+        test("regimen_id path binds the regimen's product and pinned version", async () => {
+            const productId = await seedProduct();
+            const regimen = await seedRegimen(productId);
+            await reviseToV2(productId, "Impact Whey Protein (new formula)");
+
+            const result = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, {
+                    product_id: null,
+                    regimen_id: regimen.regimen_id,
+                }),
+            );
+            expect(result.intake.regimen_id).toBe(regimen.regimen_id);
+            expect(result.intake.product_id).toBe(productId);
+            expect(result.intake.product_version).toBe(1);
+            expect(result.intake.product_display_name).toBe(
+                "Impact Whey Protein",
+            );
+        });
+
+        test("selectors are exclusive: combining or omitting them is a validation error with zero writes", async () => {
+            const productId = await seedProduct();
+            const regimen = await seedRegimen(productId);
+            const combos: Record<string, unknown>[] = [
+                { regimen_id: regimen.regimen_id }, // product_id also set by helper
+                {
+                    product_id: null,
+                    alias: "MP Whey",
+                    regimen_id: regimen.regimen_id,
+                },
+                {
+                    product_id: null,
+                    regimen_id: regimen.regimen_id,
+                    product_version: 1,
+                },
+                { product_id: null }, // no selector at all
+                { product_version: 0 },
+            ];
+            for (const overrides of combos) {
+                await expect(
+                    logSupplementIntake(
+                        pool,
+                        validIntakeCommand(productId, overrides),
+                    ),
+                ).rejects.toBeInstanceOf(SupplementValidationError);
+            }
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(0);
+        });
+
+        test("an inactive regimen fails closed; a cross-user regimen is not found", async () => {
+            const productId = await seedProduct();
+            const regimen = await seedRegimen(productId);
+
+            await expect(
+                logSupplementIntake(
+                    pool,
+                    validIntakeCommand(productId, {
+                        product_id: null,
+                        regimen_id: regimen.regimen_id,
+                        user_id: "u2",
+                    }),
+                ),
+            ).rejects.toBeInstanceOf(SupplementRegimenNotFoundError);
+
+            await setSupplementRegimenActive(
+                pool,
+                "u1",
+                regimen.regimen_id,
+                false,
+            );
+            await expect(
+                logSupplementIntake(
+                    pool,
+                    validIntakeCommand(productId, {
+                        product_id: null,
+                        regimen_id: regimen.regimen_id,
+                    }),
+                ),
+            ).rejects.toBeInstanceOf(SupplementRegimenInactiveError);
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(0);
+        });
+
+        test("cross-user, deleted-product, and unknown-version logging fail closed with zero rows", async () => {
+            const productId = await seedProduct();
+
+            await expect(
+                logSupplementIntake(
+                    pool,
+                    validIntakeCommand(productId, { user_id: "u2" }),
+                ),
+            ).rejects.toBeInstanceOf(SupplementProductNotFoundError);
+            await expect(
+                logSupplementIntake(
+                    pool,
+                    validIntakeCommand(productId, { product_version: 9 }),
+                ),
+            ).rejects.toBeInstanceOf(SupplementProductVersionNotFoundError);
+
+            await pool.query(
+                `UPDATE supplement_products SET status = 'deleted' WHERE id = $1`,
+                [productId],
+            );
+            await expect(
+                logSupplementIntake(pool, validIntakeCommand(productId)),
+            ).rejects.toBeInstanceOf(SupplementProductNotFoundError);
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(0);
+        });
+
+        test("missed and cleared facts persist with zero snapshots and projected visible state", async () => {
+            const productId = await seedProduct();
+            const missed = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, { state_action: "missed" }),
+            );
+            expect(missed.intake.state_action).toBe("missed");
+            expect(missed.intake.visible_state).toBe("missed");
+            expect(missed.intake.nutrient_snapshots).toEqual([]);
+
+            const cleared = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, { state_action: "cleared" }),
+            );
+            expect(cleared.intake.state_action).toBe("cleared");
+            expect(cleared.intake.visible_state).toBe("undefined");
+            expect(cleared.intake.nutrient_snapshots).toEqual([]);
+
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(2);
+            expect(
+                await tableCount(pool, "supplement_intake_nutrient_snapshots"),
+            ).toBe(0);
+        });
+
+        test("a correction appends a fact with reason/actor/supersedes; the original stays byte-identical", async () => {
+            const productId = await seedProduct();
+            const original = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId),
+            );
+            const beforeJson = await intakeRowJson(original.intake.intake_id);
+
+            const correction = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, {
+                    state_action: "cleared",
+                    reason: "logged against the wrong day",
+                    actor: "hermes",
+                    supersedes_intake_id: original.intake.intake_id,
+                }),
+            );
+            expect(correction.intake.supersedes_intake_id).toBe(
+                original.intake.intake_id,
+            );
+            expect(correction.intake.reason).toBe(
+                "logged against the wrong day",
+            );
+            expect(correction.intake.actor).toBe("hermes");
+
+            // Append-only: the original fact row was not mutated in any way.
+            expect(await intakeRowJson(original.intake.intake_id)).toEqual(
+                beforeJson,
+            );
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(2);
+        });
+
+        test("supersedes must reference an existing same-user fact for the same product", async () => {
+            const productId = await seedProduct();
+            const otherProduct = await seedProduct({
+                display_name: "Creatine",
+                aliases: ["creatine"],
+            });
+            const otherFact = await logSupplementIntake(
+                pool,
+                validIntakeCommand(otherProduct),
+            );
+
+            for (const supersedes of [
+                crypto.randomUUID(), // dangling
+                otherFact.intake.intake_id, // different product
+            ]) {
+                await expect(
+                    logSupplementIntake(
+                        pool,
+                        validIntakeCommand(productId, {
+                            supersedes_intake_id: supersedes,
+                        }),
+                    ),
+                ).rejects.toBeInstanceOf(SupplementValidationError);
+            }
+            // u1 cannot reference u2's fact either (same-product rule fails
+            // closed as validation; existence never leaks).
+            await expect(
+                logSupplementIntake(
+                    pool,
+                    validIntakeCommand(productId, {
+                        user_id: "u2",
+                        supersedes_intake_id: otherFact.intake.intake_id,
+                    }),
+                ),
+            ).rejects.toBeInstanceOf(SupplementProductNotFoundError);
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(1);
+        });
+
+        test("strict-timestamp, servings, enum, and key rejections write zero rows", async () => {
+            const productId = await seedProduct();
+            const future = new Date(
+                Date.now() + 48 * 3600 * 1000,
+            ).toISOString();
+            const rejections: Record<string, unknown>[] = [
+                { occurred_at: "2026-08-05T08:00:00" }, // no offset
+                { occurred_at: "2026-08-05T24:00:00.000Z" }, // 24:00 alias
+                { occurred_at: "2026-08-05T08:00:00+15:00" }, // out-of-range offset
+                { occurred_at: future }, // more than 24h ahead
+                { occurred_at: "not-a-timestamp" },
+                { servings: 0 },
+                { servings: -1 },
+                { servings: Number.NaN },
+                { state_action: "skipped" },
+                { idempotency_key: "" },
+                { idempotency_key: "   " },
+            ];
+            for (const overrides of rejections) {
+                await expect(
+                    logSupplementIntake(
+                        pool,
+                        validIntakeCommand(productId, overrides),
+                    ),
+                ).rejects.toBeInstanceOf(SupplementValidationError);
+            }
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(0);
+            expect(
+                await tableCount(pool, "supplement_intake_nutrient_snapshots"),
+            ).toBe(0);
+        });
+
+        test("sports_nutrition and supplement done intakes create zero meal roots and zero links", async () => {
+            const sportsId = await seedProduct();
+            const supplementId = await seedProduct({
+                category: "supplement",
+                display_name: "Creatine",
+                aliases: ["creatine"],
+            });
+
+            await logSupplementIntake(pool, validIntakeCommand(sportsId));
+            await logSupplementIntake(pool, validIntakeCommand(supplementId));
+
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(2);
+            expect(await tableCount(pool, "meal_events")).toBe(0);
+            expect(await tableCount(pool, "meal_event_versions")).toBe(0);
+            expect(await tableCount(pool, "meal_event_items")).toBe(0);
+            expect(await tableCount(pool, "supplement_intake_meal_links")).toBe(
+                0,
+            );
         });
     },
 );

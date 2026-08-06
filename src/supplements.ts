@@ -25,16 +25,20 @@
 
 import { Pool, type PoolClient } from "pg";
 import { withTransaction } from "./db.js";
-import { sha256Hex } from "./meal-types.js";
+import { isStrictIsoTimestamp, sha256Hex } from "./meal-types.js";
 import { escapeLikePattern } from "./search.js";
 import {
+    deriveSupplementIntakeIdempotencyFingerprint,
     deriveSupplementRegimenIdempotencyFingerprint,
     isSupplementProductCategory,
     normalizeSupplementAlias,
+    projectIntakeVisibleState,
     stableStringify,
     validateLabelNutrients,
     validateRegimenSchedule,
     type RegimenSchedule,
+    type SupplementIntakeStateAction,
+    type SupplementIntakeVisibleState,
     type SupplementLabelNutrientInput,
     type SupplementProductCategory,
 } from "./supplement-types.js";
@@ -1555,4 +1559,467 @@ export async function resolveSupplementProduct(
         resolution_status: candidates.length === 1 ? "resolved" : "ambiguous",
         candidates,
     };
+}
+
+// ===========================================================================
+// SUPPLEMENT INTAKE FACTS (Slice 5, append-only)
+// ===========================================================================
+// Facts are inserted, never updated or deleted: a correction appends a new
+// fact carrying reason/actor/supersedes audit metadata. Snapshots — one row
+// per label nutrient of the bound version, scaled by servings — are written
+// only for `done` facts, atomically in the same transaction, and are never
+// updated; a later label revision can never rewrite intake history.
+//
+// This slice performs NO caloric meal linkage: neither sports_nutrition nor
+// supplement intakes touch meal_events or supplement_intake_meal_links (that
+// bridge is Slice 6). Idempotency is serialized by the database on
+// uniq_supplement_intake_user_idem; the unique index, not a lookup, anchors
+// concurrent same-key races.
+
+export interface LogSupplementIntakeCommand {
+    user_id: string;
+    /** Exactly one of product_id / alias / regimen_id. */
+    product_id?: string | null;
+    alias?: string | null;
+    /** Only with product_id/alias; defaults to current at write time. */
+    product_version?: number | null;
+    /** Implies the regimen's bound product/version. */
+    regimen_id?: string | null;
+    servings: number;
+    /** Strict ISO-8601 with explicit offset, at most 24h in the future. */
+    occurred_at: string;
+    state_action: SupplementIntakeStateAction;
+    reason?: string | null;
+    supersedes_intake_id?: string | null;
+    idempotency_key: string;
+    actor: string;
+}
+
+export interface SupplementIntakeSnapshotReadback {
+    nutrient_key: string;
+    unit: string;
+    original_amount: number;
+    scaled_amount: number;
+}
+
+export interface SupplementIntakeFactReadback {
+    intake_id: string;
+    product_id: string;
+    product_version: number;
+    /** Display name of the BOUND version, not the current one. */
+    product_display_name: string;
+    category: SupplementProductCategory;
+    regimen_id: string | null;
+    servings: number;
+    occurred_at: string;
+    /** Raw action (done|missed|cleared) — audit truth. */
+    state_action: SupplementIntakeStateAction;
+    /** Public projection of THIS fact: exactly undefined|done|missed. */
+    visible_state: SupplementIntakeVisibleState;
+    reason: string | null;
+    actor: string;
+    supersedes_intake_id: string | null;
+    created_at: string;
+    /** Empty for missed/cleared facts. */
+    nutrient_snapshots: SupplementIntakeSnapshotReadback[];
+}
+
+export interface LogSupplementIntakeResult {
+    intake: SupplementIntakeFactReadback;
+    deduplicated: boolean;
+}
+
+const INTAKE_STATE_ACTIONS: readonly string[] = ["done", "missed", "cleared"];
+
+/** Future sanity bound for occurred_at (mirrors meal-event conventions). */
+const OCCURRED_AT_MAX_FUTURE_MS = 24 * 3600 * 1000;
+
+interface NormalizedIntakeFields {
+    servings: number;
+    occurred_at: string;
+    state_action: SupplementIntakeStateAction;
+    reason: string | null;
+    supersedes_intake_id: string | null;
+    idempotency_key: string;
+}
+
+function validateIntakeFields(
+    command: LogSupplementIntakeCommand,
+): NormalizedIntakeFields {
+    const errors: string[] = [];
+
+    const productId = optionalText(command.product_id);
+    const alias = optionalText(command.alias);
+    const regimenId = optionalText(command.regimen_id);
+    const selectors = [productId, alias, regimenId].filter(
+        (s) => s !== null,
+    ).length;
+    if (selectors !== 1) {
+        errors.push(
+            "exactly one of product_id, alias, or regimen_id must be supplied",
+        );
+    }
+    if (regimenId !== null && command.product_version != null) {
+        errors.push(
+            "product_version must not be combined with regimen_id (the regimen binds the version)",
+        );
+    }
+    if (command.product_version != null) {
+        if (
+            typeof command.product_version !== "number" ||
+            !Number.isInteger(command.product_version) ||
+            command.product_version < 1
+        ) {
+            errors.push("product_version must be a positive integer");
+        }
+    }
+
+    if (
+        typeof command.servings !== "number" ||
+        !Number.isFinite(command.servings) ||
+        command.servings <= 0
+    ) {
+        errors.push("servings must be a finite positive number");
+    }
+
+    if (!isStrictIsoTimestamp(command.occurred_at)) {
+        errors.push(
+            "occurred_at must be a strict ISO-8601 timestamp with an explicit offset",
+        );
+    } else if (
+        Date.parse(command.occurred_at) >
+        Date.now() + OCCURRED_AT_MAX_FUTURE_MS
+    ) {
+        errors.push("occurred_at must not be more than 24h in the future");
+    }
+
+    if (!INTAKE_STATE_ACTIONS.includes(command.state_action)) {
+        errors.push("state_action must be 'done', 'missed', or 'cleared'");
+    }
+
+    const idempotencyKey = optionalText(command.idempotency_key);
+    if (idempotencyKey === null) {
+        errors.push("idempotency_key must be a non-empty string");
+    }
+    if (optionalText(command.actor) === null) {
+        errors.push("actor must be a non-empty string");
+    }
+
+    if (errors.length > 0) {
+        throw new SupplementValidationError(errors);
+    }
+    return {
+        servings: command.servings,
+        occurred_at: command.occurred_at,
+        state_action: command.state_action,
+        reason: optionalText(command.reason),
+        supersedes_intake_id: optionalText(command.supersedes_intake_id),
+        idempotency_key: idempotencyKey!,
+    };
+}
+
+interface IntakeFactRow {
+    id: string;
+    user_id: string;
+    product_id: string;
+    product_version: number;
+    regimen_id: string | null;
+    servings: string | number;
+    occurred_at: Date | string;
+    state_action: SupplementIntakeStateAction;
+    reason: string | null;
+    actor: string;
+    supersedes_intake_id: string | null;
+    idempotency_key: string;
+    created_at: Date | string;
+}
+
+const INTAKE_SELECT = `
+    SELECT id, user_id, product_id, product_version, regimen_id, servings,
+           occurred_at, state_action, reason, actor, supersedes_intake_id,
+           idempotency_key, created_at
+    FROM supplement_intake_events`;
+
+async function assembleIntakeReadback(
+    q: Queryable,
+    row: IntakeFactRow,
+): Promise<SupplementIntakeFactReadback> {
+    const { rows: productRows } = await q.query(
+        `SELECT v.display_name, p.category
+         FROM supplement_product_versions v
+         JOIN supplement_products p ON p.id = v.product_id
+         WHERE v.product_id = $1 AND v.version = $2`,
+        [row.product_id, row.product_version],
+    );
+    const product = productRows[0] as
+        | { display_name: string; category: SupplementProductCategory }
+        | undefined;
+    if (!product) throw new Error("intake bound version row is missing");
+    const { rows: snapshotRows } = await q.query(
+        `SELECT nutrient_key, unit, original_amount, scaled_amount
+         FROM supplement_intake_nutrient_snapshots
+         WHERE intake_id = $1
+         ORDER BY nutrient_key, unit`,
+        [row.id],
+    );
+    return {
+        intake_id: row.id,
+        product_id: row.product_id,
+        product_version: row.product_version,
+        product_display_name: product.display_name,
+        category: product.category,
+        regimen_id: row.regimen_id,
+        servings: Number(row.servings),
+        occurred_at: iso(row.occurred_at),
+        state_action: row.state_action,
+        visible_state: projectIntakeVisibleState(row.state_action),
+        reason: row.reason,
+        actor: row.actor,
+        supersedes_intake_id: row.supersedes_intake_id,
+        created_at: iso(row.created_at),
+        nutrient_snapshots: snapshotRows.map((s) => ({
+            nutrient_key: s.nutrient_key as string,
+            unit: s.unit as string,
+            original_amount: Number(s.original_amount),
+            scaled_amount: Number(s.scaled_amount),
+        })),
+    };
+}
+
+// Millisecond-normalized occurred_at for fingerprint identity: timestamptz
+// round-trips lose string identity, so identity compares instants.
+function intakeIdentityFingerprint(
+    identity: {
+        user_id: string;
+        idempotency_key: string;
+        product_id: string;
+        product_version: number;
+        servings: number;
+        state_action: SupplementIntakeStateAction;
+    },
+    occurredAt: Date | string,
+): string {
+    const normalized =
+        occurredAt instanceof Date
+            ? occurredAt.toISOString()
+            : new Date(Date.parse(occurredAt)).toISOString();
+    return deriveSupplementIntakeIdempotencyFingerprint({
+        ...identity,
+        occurred_at: normalized,
+    });
+}
+
+export async function logSupplementIntake(
+    pool: Pool,
+    command: LogSupplementIntakeCommand,
+    opts: { beforeCommit?: () => Promise<void> } = {},
+): Promise<LogSupplementIntakeResult> {
+    const fields = validateIntakeFields(command);
+    const regimenId = optionalText(command.regimen_id);
+    const directProductId = optionalText(command.product_id);
+    const alias = optionalText(command.alias);
+
+    // Concurrent same-key logs serialize on uniq_supplement_intake_user_idem:
+    // the loser's fact insert aborts with a unique violation once the winner
+    // commits, and the retry converges on the winner's fact as a deduplicated
+    // readback or a stable idempotency_conflict — never a second fact.
+    const MAX_LOG_ATTEMPTS = 3;
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await withTransaction(pool, async (client) => {
+                // Resolve the product selection: direct id | unique alias |
+                // regimen binding. An ambiguous alias fails before any write.
+                let productId: string;
+                let version: number | null = command.product_version ?? null;
+                if (regimenId !== null) {
+                    const { rows: regimenRows } = await client.query(
+                        `${REGIMEN_SELECT} WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+                        [regimenId, command.user_id],
+                    );
+                    const regimen = regimenRows[0] as RegimenRow | undefined;
+                    if (!regimen) {
+                        throw new SupplementRegimenNotFoundError();
+                    }
+                    if (!regimen.active) {
+                        throw new SupplementRegimenInactiveError();
+                    }
+                    productId = regimen.product_id;
+                    version = regimen.product_version;
+                } else if (directProductId !== null) {
+                    productId = directProductId;
+                } else {
+                    const normalized = normalizeSupplementAlias(alias!);
+                    if (normalized === null) {
+                        throw new SupplementValidationError([
+                            "alias must not be empty",
+                        ]);
+                    }
+                    const candidates = await matchProductsByAlias(
+                        client,
+                        command.user_id,
+                        normalized,
+                    );
+                    if (candidates.length === 0) {
+                        throw new SupplementProductNotFoundError();
+                    }
+                    if (candidates.length > 1) {
+                        throw new SupplementAliasAmbiguousError(candidates);
+                    }
+                    productId = candidates[0]!.product_id;
+                }
+
+                // Lock the product root (user-scoped) and verify active.
+                const { rows: rootRows } = await client.query(
+                    `SELECT id, user_id, category, status, current_version, created_at, updated_at
+                     FROM supplement_products
+                     WHERE id = $1 AND user_id = $2
+                     FOR UPDATE`,
+                    [productId, command.user_id],
+                );
+                const root = rootRows[0] as ProductRootRow | undefined;
+                if (!root || root.status !== "active") {
+                    throw new SupplementProductNotFoundError();
+                }
+
+                const boundVersion = version ?? root.current_version;
+                const { rows: versionRows } = await client.query(
+                    `SELECT 1 FROM supplement_product_versions
+                     WHERE product_id = $1 AND version = $2 AND user_id = $3`,
+                    [root.id, boundVersion, command.user_id],
+                );
+                if (versionRows.length === 0) {
+                    throw new SupplementProductVersionNotFoundError();
+                }
+
+                // Supersession is audit metadata: the target must be an
+                // existing same-user fact for the same product (any version).
+                if (fields.supersedes_intake_id !== null) {
+                    const { rows: targetRows } = await client.query(
+                        `SELECT product_id FROM supplement_intake_events
+                         WHERE id = $1 AND user_id = $2`,
+                        [fields.supersedes_intake_id, command.user_id],
+                    );
+                    const target = targetRows[0] as
+                        { product_id: string } | undefined;
+                    if (!target) {
+                        throw new SupplementValidationError([
+                            "supersedes_intake_id must reference an existing intake fact",
+                        ]);
+                    }
+                    if (target.product_id !== root.id) {
+                        throw new SupplementValidationError([
+                            "supersedes_intake_id must reference a fact for the same product",
+                        ]);
+                    }
+                }
+
+                const identity = {
+                    user_id: command.user_id,
+                    idempotency_key: fields.idempotency_key,
+                    product_id: root.id,
+                    product_version: boundVersion,
+                    servings: fields.servings,
+                    state_action: fields.state_action,
+                };
+                const fingerprint = intakeIdentityFingerprint(
+                    identity,
+                    fields.occurred_at,
+                );
+
+                // Retry convergence on (user_id, idempotency_key).
+                const { rows: existingRows } = await client.query(
+                    `${INTAKE_SELECT} WHERE user_id = $1 AND idempotency_key = $2`,
+                    [command.user_id, fields.idempotency_key],
+                );
+                const existing = existingRows[0] as IntakeFactRow | undefined;
+                if (existing) {
+                    const existingFingerprint = intakeIdentityFingerprint(
+                        {
+                            user_id: existing.user_id,
+                            idempotency_key: existing.idempotency_key,
+                            product_id: existing.product_id,
+                            product_version: existing.product_version,
+                            servings: Number(existing.servings),
+                            state_action: existing.state_action,
+                        },
+                        existing.occurred_at,
+                    );
+                    if (existingFingerprint !== fingerprint) {
+                        throw new SupplementIdempotencyConflictError();
+                    }
+                    return {
+                        intake: await assembleIntakeReadback(client, existing),
+                        deduplicated: true,
+                    };
+                }
+
+                const { rows: inserted } = await client.query(
+                    `INSERT INTO supplement_intake_events
+                        (user_id, product_id, product_version, regimen_id,
+                         servings, occurred_at, state_action, reason, actor,
+                         supersedes_intake_id, idempotency_key)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                     RETURNING id`,
+                    [
+                        command.user_id,
+                        root.id,
+                        boundVersion,
+                        regimenId,
+                        fields.servings,
+                        fields.occurred_at,
+                        fields.state_action,
+                        fields.reason,
+                        optionalText(command.actor),
+                        fields.supersedes_intake_id,
+                        fields.idempotency_key,
+                    ],
+                );
+                const intakeId = (inserted[0] as { id: string }).id;
+
+                // Snapshots pin the consumed label truth: one row per label
+                // nutrient of the bound version, scaled in PostgreSQL
+                // numeric arithmetic, only for `done` facts.
+                if (fields.state_action === "done") {
+                    await client.query(
+                        `INSERT INTO supplement_intake_nutrient_snapshots
+                            (intake_id, user_id, product_id, product_version,
+                             nutrient_key, unit, original_amount, scaled_amount,
+                             source_evidence)
+                         SELECT $1, $2, $3, $4, nutrient_key, unit, amount,
+                                amount * $5::numeric, source_evidence
+                         FROM supplement_product_nutrients
+                         WHERE product_id = $3 AND version = $4`,
+                        [
+                            intakeId,
+                            command.user_id,
+                            root.id,
+                            boundVersion,
+                            fields.servings,
+                        ],
+                    );
+                }
+
+                await opts.beforeCommit?.();
+
+                const { rows: factRows } = await client.query(
+                    `${INTAKE_SELECT} WHERE id = $1`,
+                    [intakeId],
+                );
+                const fact = factRows[0] as IntakeFactRow | undefined;
+                if (!fact) throw new Error("failed to read logged intake");
+                return {
+                    intake: await assembleIntakeReadback(client, fact),
+                    deduplicated: false,
+                };
+            });
+        } catch (err) {
+            if (
+                attempt < MAX_LOG_ATTEMPTS &&
+                isKeyRaceViolation(err, "uniq_supplement_intake_user_idem")
+            ) {
+                continue;
+            }
+            throw err;
+        }
+    }
 }
