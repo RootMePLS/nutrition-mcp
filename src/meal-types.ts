@@ -209,6 +209,36 @@ export function resolveConsumedAt(
     return consumed;
 }
 
+// ---------------------------------------------------------------------------
+// Strict ISO-8601 timestamp gate (Slice 4 remediation).
+//
+// `Date.parse` accepts many non-ISO formats ("August 6, 2026 12:30 UTC"), so
+// public reuse timestamps are gated by shape first: full date, 'T', seconds
+// precision, optional fractional seconds, and a MANDATORY explicit UTC
+// designator ('Z' or ±HH:MM) — storage is timestamptz and reuse idempotency
+// identity compares milliseconds, so ambiguous zoneless instants are unsafe.
+// `Date.parse` then runs as a backstop for impossible times (25:00), and the
+// date components are round-tripped because JSC normalizes impossible
+// calendar dates (2026-02-30 -> 2026-03-02) instead of returning NaN.
+// ---------------------------------------------------------------------------
+const STRICT_ISO_TIMESTAMP_RE =
+    /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+export function isStrictIsoTimestamp(value: unknown): value is string {
+    if (typeof value !== "string") return false;
+    const match = STRICT_ISO_TIMESTAMP_RE.exec(value);
+    if (!match) return false;
+    if (Number.isNaN(Date.parse(value))) return false;
+    const [, year, month, day] = match;
+    const roundTrip = new Date(
+        Date.UTC(Number(year), Number(month) - 1, Number(day)),
+    );
+    return (
+        roundTrip.getUTCMonth() === Number(month) - 1 &&
+        roundTrip.getUTCDate() === Number(day)
+    );
+}
+
 // Returns a new array ordered by documented precedence (text first). Inputs
 // are never filtered out — lower-precedence evidence is retained.
 export function sortInputsByPrecedence(

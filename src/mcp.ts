@@ -39,7 +39,11 @@ import {
     reuseMealCalculation,
     searchReuseCandidates,
 } from "./meal-reuse.js";
-import { NUTRIENT_FIELDS, type NutrientField } from "./meal-types.js";
+import {
+    isStrictIsoTimestamp,
+    NUTRIENT_FIELDS,
+    type NutrientField,
+} from "./meal-types.js";
 import {
     validateCalculationBundle,
     type CalculationBundle,
@@ -2759,18 +2763,14 @@ export function registerTools(
             inputSchema: {
                 source_event_id: z.string().uuid(),
                 source_version: z.number().int().min(1),
-                reported_at: z
-                    .string()
-                    .refine((s) => !Number.isNaN(Date.parse(s)), {
-                        message:
-                            "reported_at must be a valid ISO 8601 timestamp",
-                    }),
-                consumed_at: z
-                    .string()
-                    .refine((s) => !Number.isNaN(Date.parse(s)), {
-                        message:
-                            "consumed_at must be a valid ISO 8601 timestamp",
-                    }),
+                reported_at: z.string().refine(isStrictIsoTimestamp, {
+                    message:
+                        "reported_at must be a strict ISO 8601 timestamp with an explicit UTC offset",
+                }),
+                consumed_at: z.string().refine(isStrictIsoTimestamp, {
+                    message:
+                        "consumed_at must be a strict ISO 8601 timestamp with an explicit UTC offset",
+                }),
                 idempotency_key: z.string().min(1).max(255),
                 confirmation: z.enum(["добавь", "add", "confirm"]),
             },

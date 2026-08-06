@@ -20,6 +20,7 @@ import {
 } from "./meal-events.js";
 import {
     deriveReuseIdempotencyFingerprint,
+    isStrictIsoTimestamp,
     NUTRIENT_FIELDS,
     resolveConsumedAt,
     type Nutrients,
@@ -403,11 +404,15 @@ function validateReuseCommand(command: ReuseMealCalculationCommand): void {
     ) {
         issues.push("source_version must be an integer >= 1");
     }
-    if (Number.isNaN(Date.parse(command.reported_at))) {
-        issues.push("reported_at must be a valid ISO 8601 timestamp");
+    if (!isStrictIsoTimestamp(command.reported_at)) {
+        issues.push(
+            "reported_at must be a strict ISO 8601 timestamp with an explicit UTC offset",
+        );
     }
-    if (Number.isNaN(Date.parse(command.consumed_at))) {
-        issues.push("consumed_at must be a valid ISO 8601 timestamp");
+    if (!isStrictIsoTimestamp(command.consumed_at)) {
+        issues.push(
+            "consumed_at must be a strict ISO 8601 timestamp with an explicit UTC offset",
+        );
     }
     const key = command.idempotency_key?.trim() ?? "";
     if (key.length === 0 || command.idempotency_key.length > 255) {

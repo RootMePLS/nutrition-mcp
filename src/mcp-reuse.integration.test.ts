@@ -521,6 +521,73 @@ describeDb(
             });
         });
 
+        test("parseable non-ISO reported_at and consumed_at are rejected through the real transport with zero writes", async () => {
+            const sourceId = await seedReady("iso-adv-src", "strict iso oats");
+            await withReuseTools(pool, "u1", async ({ call }) => {
+                const before = await domainTableCounts(pool);
+                const cases: Record<string, unknown>[] = [
+                    validArgs(sourceId, {
+                        reported_at: "August 6, 2026 12:30 UTC",
+                        idempotency_key: "iso-adv-1",
+                    }),
+                    validArgs(sourceId, {
+                        consumed_at: "August 6, 2026 12:30 UTC",
+                        idempotency_key: "iso-adv-2",
+                    }),
+                    validArgs(sourceId, {
+                        reported_at: "2026-08-06T13:00:00",
+                        idempotency_key: "iso-adv-3",
+                    }),
+                    validArgs(sourceId, {
+                        consumed_at: "2026-08-06",
+                        idempotency_key: "iso-adv-4",
+                    }),
+                ];
+                for (const args of cases) {
+                    // Every case is Date.parse-parseable — the exact gap in
+                    // the Terra finding; strict validation must reject anyway.
+                    for (const field of ["reported_at", "consumed_at"]) {
+                        const v = args[field];
+                        expect(Number.isNaN(Date.parse(v as string))).toBe(
+                            false,
+                        );
+                    }
+                    const result = await call("reuse_meal_calculation", args);
+                    expect(result.isError).toBe(true);
+                    // Zod boundary rejection, not a repository/domain error.
+                    expect(result.content[0]!.text).toContain(
+                        "Invalid arguments",
+                    );
+                }
+                expect(await domainTableCounts(pool)).toEqual(before);
+            });
+        });
+
+        test("offset-form ISO timestamps (+00:00) remain accepted end-to-end", async () => {
+            const sourceId = await seedReady("iso-ok-src", "offset iso oats");
+            await withReuseTools(pool, "u1", async ({ call }) => {
+                const result = await call(
+                    "reuse_meal_calculation",
+                    validArgs(sourceId, {
+                        reported_at: "2026-08-06T13:00:00.000+00:00",
+                        consumed_at: "2026-08-06T12:30:00+00:00",
+                        idempotency_key: "iso-ok-key",
+                    }),
+                );
+                expect(result.isError).not.toBe(true);
+                const payload = result.structuredContent as {
+                    reported_at: string;
+                    consumed_at: string;
+                    provenance_status: string;
+                };
+                // timestamptz round-trip normalizes to the canonical Z form
+                // at exactly the supplied instants — values preserved.
+                expect(payload.reported_at).toBe("2026-08-06T13:00:00.000Z");
+                expect(payload.consumed_at).toBe("2026-08-06T12:30:00.000Z");
+                expect(payload.provenance_status).toBe("ready");
+            });
+        });
+
         test("forged canonical/provider/fingerprint args are inert: persisted target equals source values", async () => {
             const sourceId = await seedReady("forge-src", "forgery oats");
             await withReuseTools(pool, "u1", async ({ call }) => {

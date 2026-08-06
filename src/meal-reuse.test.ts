@@ -116,6 +116,7 @@ import {
     classifyReuseEligibility,
     reuseIdentityMatches,
 } from "./meal-reuse.js";
+import { isStrictIsoTimestamp } from "./meal-types.js";
 
 describe("slice 4 pure reuse helpers", () => {
     describe("reuseIdentityMatches (millisecond-equal identity)", () => {
@@ -243,6 +244,48 @@ describe("slice 4 pure reuse helpers", () => {
                     compatibility: false,
                 }),
             ).toEqual({ eligible: false, category: "missing" });
+        });
+    });
+
+    describe("isStrictIsoTimestamp (strict reuse timestamp gate)", () => {
+        const accepted = [
+            "2026-08-06T13:00:00.000Z", // canonical toISOString form
+            "2026-08-06T13:00:00Z", // seconds precision, no fraction
+            "2026-08-06T12:30:00+00:00", // offset variant of the same instant
+            "2026-08-06T10:00:00.123456Z", // timestamptz microsecond round-trip
+            "2026-08-06T15:30:00-05:00", // non-UTC explicit offset
+        ];
+        for (const value of accepted) {
+            test(`accepts ${value}`, () => {
+                expect(isStrictIsoTimestamp(value)).toBe(true);
+            });
+        }
+
+        const rejected = [
+            "August 6, 2026 12:30 UTC", // Terra finding: Date.parse-parseable
+            "Wed Aug 06 2026 13:00:00 GMT+0000", // Date#toString form
+            "2026-08-06", // date only
+            "2026-08-06T13:00:00", // no explicit UTC designator
+            "2026-08-06T13:00Z", // minutes precision only
+            "2026-08-06 13:00:00Z", // space instead of 'T'
+            "2026-02-30T10:00:00Z", // impossible calendar date
+            "2026-08-06T25:00:00Z", // impossible time
+            "2026-13-06T10:00:00Z", // impossible month
+            "2026-08-06T13:00:00.Z", // empty fraction
+            "",
+            "not-a-timestamp",
+        ];
+        for (const value of rejected) {
+            test(`rejects ${JSON.stringify(value)}`, () => {
+                expect(isStrictIsoTimestamp(value)).toBe(false);
+            });
+        }
+
+        test("rejects non-string values", () => {
+            expect(isStrictIsoTimestamp(1754485200000)).toBe(false);
+            expect(isStrictIsoTimestamp(new Date())).toBe(false);
+            expect(isStrictIsoTimestamp(null)).toBe(false);
+            expect(isStrictIsoTimestamp(undefined)).toBe(false);
         });
     });
 });

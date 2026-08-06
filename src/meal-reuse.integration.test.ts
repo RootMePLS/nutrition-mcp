@@ -1100,6 +1100,39 @@ describeDb(
             expect(await domainTableCounts(pool)).toEqual(before);
         });
 
+        test("parseable non-ISO reported_at/consumed_at fail strict validation before any query, zero writes", async () => {
+            const sourceId = await seedReadySource(
+                "u1",
+                "iso-src",
+                "strict iso porridge",
+            );
+            const before = await domainTableCounts(pool);
+            const cases = [
+                { field: "reported_at", value: "August 6, 2026 12:30 UTC" },
+                { field: "consumed_at", value: "August 6, 2026 12:30 UTC" },
+                { field: "reported_at", value: "2026-08-06T13:00:00" },
+                { field: "consumed_at", value: "2026-08-06" },
+            ] as const;
+            for (const { field, value } of cases) {
+                // Date.parse accepts each of these; strict validation must not.
+                expect(Number.isNaN(Date.parse(value))).toBe(false);
+                const err = await catchReuseError(
+                    reuseMealCalculation(
+                        pool,
+                        reuseCommand({
+                            source_event_id: sourceId,
+                            idempotency_key: `iso-${field}-${value.length}`,
+                            [field]: value,
+                        }),
+                    ),
+                );
+                expect(err).toBeInstanceOf(MealEventValidationError);
+                expect(err.message).toContain(field);
+                expect(err.message).toContain("ISO 8601");
+            }
+            expect(await domainTableCounts(pool)).toEqual(before);
+        });
+
         test("nonexistent version (current+1) -> version error, never a leak of version existence across users", async () => {
             const sourceId = await seedReadySource(
                 "u1",
