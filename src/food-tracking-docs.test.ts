@@ -27,6 +27,8 @@ const requiredContractPhrases = [
     "append-only",
     "pending",
     "DATABASE_URL_TEST",
+    "undefined → done → missed → undefined",
+    "no scheduler",
 ];
 
 test("agent-driven food-tracking docs state the shipped boundary", () => {

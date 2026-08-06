@@ -211,6 +211,44 @@ accepted, and rejected calls write nothing — never a fabricated zero. An
 identical retry converges on the original event; the same key with a changed
 source, version, or timestamp is a stable `idempotency_conflict`.
 
+## Supplement regimens and append-only intake facts
+
+A supplement regimen is declarative intent, created only by the explicit
+`create_supplement_regimen` mutation: it binds a caller-owned active product
+to one pinned label version (the current version at create time unless an
+explicit historical version is given), a positive dose in servings, a
+validated schedule (IANA timezone, `daily`/`weekly`, local time, ISO weekdays
+for weekly), and a start/end window. `list_supplement_regimens`,
+`set_supplement_regimen_active` (the explicit activate/deactivate operation,
+idempotent when the state already matches), `resolve_supplement_product`,
+`get_supplement_intakes`, and `get_supplement_regimen_status` complete the
+family. This repository ships no scheduler, no reminders, and no automatic
+intake marking: creating or reading a regimen never writes an intake fact, a
+meal event, or a job, and a due occurrence is only ever derived as `undefined`
+in a read result.
+
+Intake facts are append-only: `log_supplement_intake` inserts an immutable
+fact (exactly one selector — direct product id, unique alias, or an active
+regimen id; positive servings; strict ISO-8601 `occurred_at`; state action
+`done`/`missed`/`cleared`; a required idempotency key). Facts are never
+updated or deleted; a correction appends a new fact carrying actor, reason,
+and an optional supersedes link to an earlier same-product fact. The public
+visible state is exactly `undefined`, `done`, or `missed`: an absent mark is
+`undefined` (never `missed`), and `cleared` projects back to `undefined`, so
+the intended cycle is undefined → done → missed → undefined. The raw
+`cleared` action survives only as audit `state_action` in history reads. For a
+`done` fact, the server immutably snapshots every nutrient of the bound label
+version scaled by servings (explicit label zeros scale to zero; unknown
+nutrients stay absent) — a later label revision never rewrites intake history
+or a regimen's pinned version. Alias resolution is exact and read-only:
+ambiguity returns candidates (or fails the log with
+`supplement_alias_ambiguous`) with zero writes, and a direct product id
+removes ambiguity authoritatively. Unknown, cross-user, or deleted products
+and regimens fail closed with the same not-found shape, so existence never
+leaks. Caloric sports-nutrition meal-event linkage is NOT performed by this
+version — it arrives with the sports-snack slice — and reporting, data flags,
+and summaries are not implemented yet.
+
 ## MyFitnessPal sync journal
 
 An explicit add confirmation authorizes a possible MyFitnessPal write and
