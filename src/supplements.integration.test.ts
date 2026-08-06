@@ -24,7 +24,7 @@ import {
 // Slice 2 repository gate: versioned, user-scoped supplement product
 // catalogue against real PostgreSQL. Skipped loudly without
 // DATABASE_URL_TEST; every test resets the public schema and replays the
-// full migration chain 001-007 (the current head).
+// full migration chain 001-008 (the current head).
 // ---------------------------------------------------------------------------
 
 const DATABASE_URL_TEST = process.env.DATABASE_URL_TEST;
@@ -45,6 +45,7 @@ const MIGRATIONS = [
     "db/migrations/005_calculation_corrections.sql",
     "db/migrations/006_meal_reuse_and_supplements.sql",
     "db/migrations/007_ownership_lineage_integrity.sql",
+    "db/migrations/008_supplement_create_idempotency.sql",
 ];
 
 async function resetSchema(pool: Pool): Promise<void> {
@@ -395,6 +396,167 @@ describeDb("supplement product repository (requires DATABASE_URL_TEST)", () => {
                 ),
             ).rejects.toBeInstanceOf(SupplementIdempotencyConflictError);
             expect(await tableCount(pool, "supplement_products")).toBe(1);
+        });
+
+        // Regression coverage for the reviewer-terra race: concurrent
+        // first-time creates used to pass the unlocked lookup together and
+        // each commit a root. Migration 008's partial unique index
+        // (uniq_spv_user_create_idem) serializes the race at the database;
+        // these tests fire truly concurrent calls from separate pg clients
+        // via Promise.all and assert exact child-row counts.
+        describe("concurrent first-time create idempotency", () => {
+            // One pool per caller so every create runs on its own PostgreSQL
+            // connection; max: 1 forbids silent connection reuse.
+            function callerPools(n: number): Pool[] {
+                return Array.from(
+                    { length: n },
+                    () =>
+                        new Pool({
+                            connectionString: DATABASE_URL_TEST,
+                            max: 1,
+                        }),
+                );
+            }
+
+            async function endPools(pools: Pool[]): Promise<void> {
+                await Promise.all(pools.map((p) => p.end()));
+            }
+
+            test("same user/key/payload converges to exactly one root and one version-1 label", async () => {
+                const callers = callerPools(4);
+                try {
+                    const results = await Promise.all(
+                        callers.map((p) =>
+                            createSupplementProduct(p, validCreateCommand()),
+                        ),
+                    );
+                    const ids = new Set(
+                        results.map((r) => r.product.product_id),
+                    );
+                    expect(ids.size).toBe(1);
+                    expect(results.filter((r) => !r.deduplicated).length).toBe(
+                        1,
+                    );
+                    expect(results.filter((r) => r.deduplicated).length).toBe(
+                        3,
+                    );
+                    for (const r of results) {
+                        expect(r.product.current_version).toBe(1);
+                        expect(r.product.version.version).toBe(1);
+                        expect(r.product.version.display_name).toBe(
+                            "Impact Whey Protein",
+                        );
+                    }
+                } finally {
+                    await endPools(callers);
+                }
+                expect(await tableCount(pool, "supplement_products")).toBe(1);
+                expect(
+                    await tableCount(pool, "supplement_product_versions"),
+                ).toBe(1);
+                expect(
+                    await tableCount(pool, "supplement_product_aliases"),
+                ).toBe(2);
+                expect(
+                    await tableCount(pool, "supplement_product_nutrients"),
+                ).toBe(4);
+            });
+
+            test("same user/key with different payloads commits exactly one root and conflicts the loser", async () => {
+                const callers = callerPools(2);
+                let settled: PromiseSettledResult<unknown>[];
+                try {
+                    settled = await Promise.allSettled([
+                        createSupplementProduct(
+                            callers[0]!,
+                            validCreateCommand(),
+                        ),
+                        createSupplementProduct(
+                            callers[1]!,
+                            validCreateCommand({
+                                display_name: "Different Whey",
+                            }),
+                        ),
+                    ]);
+                } finally {
+                    await endPools(callers);
+                }
+                const fulfilled = settled.filter(
+                    (s) => s.status === "fulfilled",
+                );
+                const rejected = settled.filter((s) => s.status === "rejected");
+                expect(fulfilled.length).toBe(1);
+                expect(rejected.length).toBe(1);
+                expect(
+                    (rejected[0] as PromiseRejectedResult).reason,
+                ).toBeInstanceOf(SupplementIdempotencyConflictError);
+                // Exactly one committed root + version-1; the loser left no
+                // child rows behind (whole transaction rolled back).
+                expect(await tableCount(pool, "supplement_products")).toBe(1);
+                expect(
+                    await tableCount(pool, "supplement_product_versions"),
+                ).toBe(1);
+                expect(
+                    await tableCount(pool, "supplement_product_aliases"),
+                ).toBe(2);
+                expect(
+                    await tableCount(pool, "supplement_product_nutrients"),
+                ).toBe(4);
+                expect(
+                    await tableCount(pool, "supplement_product_label_limits"),
+                ).toBe(0);
+            });
+
+            test("different users may reuse the same idempotency key concurrently", async () => {
+                const callers = callerPools(2);
+                try {
+                    const [a, b] = await Promise.all([
+                        createSupplementProduct(
+                            callers[0]!,
+                            validCreateCommand(),
+                        ),
+                        createSupplementProduct(
+                            callers[1]!,
+                            validCreateCommand({ user_id: "u2" }),
+                        ),
+                    ]);
+                    expect(a!.deduplicated).toBe(false);
+                    expect(b!.deduplicated).toBe(false);
+                    expect(a!.product.product_id).not.toBe(
+                        b!.product.product_id,
+                    );
+                } finally {
+                    await endPools(callers);
+                }
+                expect(await tableCount(pool, "supplement_products")).toBe(2);
+                expect(
+                    await tableCount(pool, "supplement_product_versions"),
+                ).toBe(2);
+            });
+
+            test("concurrent creates with a null idempotency key stay independent (never forced unique)", async () => {
+                const callers = callerPools(2);
+                try {
+                    const [a, b] = await Promise.all([
+                        createSupplementProduct(
+                            callers[0]!,
+                            validCreateCommand({ idempotency_key: null }),
+                        ),
+                        createSupplementProduct(
+                            callers[1]!,
+                            validCreateCommand({ idempotency_key: null }),
+                        ),
+                    ]);
+                    expect(a!.deduplicated).toBe(false);
+                    expect(b!.deduplicated).toBe(false);
+                    expect(a!.product.product_id).not.toBe(
+                        b!.product.product_id,
+                    );
+                } finally {
+                    await endPools(callers);
+                }
+                expect(await tableCount(pool, "supplement_products")).toBe(2);
+            });
         });
     });
 

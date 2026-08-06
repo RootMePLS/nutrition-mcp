@@ -225,6 +225,14 @@ Apply the forward-only migrations in this exact order:
    keys that make cross-user reuse lineage, mismatched provider-source
    mappings, cross-user product/regimen/intake rows, and uncorrelated intake
    snapshots/meal links impossible at the database boundary.
+8. `db/migrations/008_supplement_create_idempotency.sql` — additive partial
+   unique index `uniq_spv_user_create_idem` on
+   `supplement_product_versions (user_id, revision_idempotency_key)
+WHERE version = 1 AND revision_idempotency_key IS NOT NULL`, which makes
+   concurrent first-time product creates with the same key serialize at the
+   database: exactly one root/version-1 commits per (user, key); the loser
+   converges as a deduplicated read or a stable `idempotency_conflict`.
+   Null keys stay non-unique and different users never collide.
 
 For a new database:
 
@@ -236,9 +244,10 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/004_calculation_bundles
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/005_calculation_corrections.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/006_meal_reuse_and_supplements.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/007_ownership_lineage_integrity.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/008_supplement_create_idempotency.sql
 ```
 
-`004`, `005`, `006`, and `007` are additive and rerunnable. `002` is forward-only and
+`004`, `005`, `006`, `007`, and `008` are additive and rerunnable. `002` is forward-only and
 irreversible because of the legacy reset. The disposable integration database
 is selected explicitly; do not treat skipped PostgreSQL tests as a pass:
 

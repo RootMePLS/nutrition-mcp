@@ -42,6 +42,7 @@ const MIGRATIONS = [
     "db/migrations/005_calculation_corrections.sql",
     "db/migrations/006_meal_reuse_and_supplements.sql",
     "db/migrations/007_ownership_lineage_integrity.sql",
+    "db/migrations/008_supplement_create_idempotency.sql",
 ];
 
 const SUPPLEMENT_TOOL_NAMES = [
@@ -295,6 +296,70 @@ describeDb("supplement product MCP tools (requires DATABASE_URL_TEST)", () => {
             `SELECT count(*)::int AS n FROM tool_analytics WHERE tool_name = 'create_supplement_product'`,
         );
         expect(rows[0]!.n).toBeGreaterThanOrEqual(3);
+    });
+
+    // Public-path proof of the migration-008 race fix: two concurrent
+    // create_supplement_product calls through independent
+    // McpServer/Client/InMemoryTransport pairs against the same real
+    // PostgreSQL pool must converge to one product, never two roots.
+    test("concurrent create_supplement_product calls with the same key converge to one product through the public transport", async () => {
+        await withSupplementTools(pool, "u1", async (first) => {
+            await withSupplementTools(pool, "u1", async (second) => {
+                const [a, b] = await Promise.all([
+                    first.call("create_supplement_product", validCreateArgs()),
+                    second.call("create_supplement_product", validCreateArgs()),
+                ]);
+                expect(a.isError).toBeFalsy();
+                expect(b.isError).toBeFalsy();
+                const pa = a.structuredContent as {
+                    product: { product_id: string };
+                    deduplicated: boolean;
+                };
+                const pb = b.structuredContent as {
+                    product: { product_id: string };
+                    deduplicated: boolean;
+                };
+                expect(pa.product.product_id).toBe(pb.product.product_id);
+                // Exactly one original; the concurrent twin deduplicated.
+                expect([pa.deduplicated, pb.deduplicated].sort()).toEqual([
+                    false,
+                    true,
+                ]);
+            });
+        });
+        expect(await tableCount(pool, "supplement_products")).toBe(1);
+        expect(await tableCount(pool, "supplement_product_versions")).toBe(1);
+        await flushAnalytics();
+    });
+
+    // Same key, different label identity: exactly one commits, the loser is
+    // a stable idempotency_conflict error response, and no second root or
+    // child rows survive.
+    test("concurrent create_supplement_product calls with different payloads yield one product and one conflict", async () => {
+        await withSupplementTools(pool, "u1", async (first) => {
+            await withSupplementTools(pool, "u1", async (second) => {
+                const [a, b] = await Promise.all([
+                    first.call("create_supplement_product", validCreateArgs()),
+                    second.call(
+                        "create_supplement_product",
+                        validCreateArgs({ display_name: "Different Whey" }),
+                    ),
+                ]);
+                const results = [a, b];
+                const winners = results.filter((r) => !r.isError);
+                const losers = results.filter((r) => r.isError);
+                expect(winners.length).toBe(1);
+                expect(losers.length).toBe(1);
+                expect(losers[0]!.content[0]!.text).toContain(
+                    "idempotency_conflict",
+                );
+            });
+        });
+        expect(await tableCount(pool, "supplement_products")).toBe(1);
+        expect(await tableCount(pool, "supplement_product_versions")).toBe(1);
+        expect(await tableCount(pool, "supplement_product_aliases")).toBe(2);
+        expect(await tableCount(pool, "supplement_product_nutrients")).toBe(4);
+        await flushAnalytics();
     });
 
     test("malformed create payloads fail validation and write nothing", async () => {

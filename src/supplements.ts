@@ -14,10 +14,14 @@
 // - idempotent retries converge on the original readback; the same key with
 //   a differing label identity is a stable conflict, never a second write.
 //
-// Known limitation: product-root creation has no unique idempotency index in
-// the schema, so sequential same-key retries converge via a locked lookup
-// while truly concurrent first-time creates with the same key may produce
-// two roots. Revision idempotency IS fully serialized by the root row lock.
+// Concurrency: first-time create idempotency is enforced by the database,
+// not just by lookup ordering. Migration 008's partial unique index
+// (uniq_spv_user_create_idem) admits exactly one version-1 row per
+// (user_id, idempotency key), so concurrent same-key creates serialize on
+// the index: the winner commits, the loser's transaction aborts with a
+// unique violation, and the loser retries as a deduplicated read or a
+// stable idempotency_conflict. Revision idempotency is serialized by the
+// root row lock.
 
 import { Pool, type PoolClient } from "pg";
 import { withTransaction } from "./db.js";
@@ -594,6 +598,15 @@ async function insertLabelChildren(
 // PUBLIC REPOSITORY API
 // ---------------------------------------------------------------------------
 
+// A pg DatabaseError for a unique violation on migration 008's create-key
+// index (SQLSTATE 23505 on uniq_spv_user_create_idem). Matching the index
+// name keeps unrelated unique violations (duplicate alias/nutrient rows,
+// revision-key collisions) fail-fast instead of silently retried.
+function isCreateKeyRaceViolation(err: unknown): boolean {
+    const e = err as { code?: string; constraint?: string } | null;
+    return e?.code === "23505" && e.constraint === "uniq_spv_user_create_idem";
+}
+
 export async function createSupplementProduct(
     pool: Pool,
     command: CreateSupplementProductCommand,
@@ -610,73 +623,101 @@ export async function createSupplementProduct(
         aliases: label.aliases.map((a) => a.raw),
     });
 
-    return withTransaction(pool, async (client) => {
-        if (idempotencyKey !== null) {
-            // Sequential retry convergence: a version-1 row with this user's
-            // key means the original create already committed. (No root-level
-            // unique index exists — see the module header limitation note.)
-            const { rows } = await client.query(
-                `SELECT product_id FROM supplement_product_versions
+    // Concurrent first-time creates with the same key serialize on migration
+    // 008's uniq_spv_user_create_idem partial unique index: the loser blocks
+    // on the index until the winner commits or aborts. A committed winner
+    // makes the loser's version-1 insert fail with a unique violation; the
+    // loser retries here, finds the winner's row on the convergence lookup
+    // below, and returns the deduplicated readback or a stable conflict —
+    // never a second root. If the winner aborted instead, the retry inserts
+    // cleanly. One retry always suffices after a committed winner; the bound
+    // only guards against repeated aborts under churn.
+    const MAX_CREATE_ATTEMPTS = 3;
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await withTransaction(pool, async (client) => {
+                if (idempotencyKey !== null) {
+                    // Retry convergence: a version-1 row with this user's key means
+                    // the original create already committed. Migration 008's partial
+                    // unique index guarantees at most one such row can ever exist.
+                    const { rows } = await client.query(
+                        `SELECT product_id FROM supplement_product_versions
                  WHERE user_id = $1 AND version = 1 AND revision_idempotency_key = $2`,
-                [command.user_id, idempotencyKey],
-            );
-            const existing = rows[0] as { product_id: string } | undefined;
-            if (existing) {
-                const root = await readProductRoot(client, existing.product_id);
-                const readback = root
-                    ? await assembleReadback(client, root, 1)
-                    : null;
-                if (!readback) {
-                    throw new SupplementIdempotencyConflictError();
+                        [command.user_id, idempotencyKey],
+                    );
+                    const existing = rows[0] as
+                        { product_id: string } | undefined;
+                    if (existing) {
+                        const root = await readProductRoot(
+                            client,
+                            existing.product_id,
+                        );
+                        const readback = root
+                            ? await assembleReadback(client, root, 1)
+                            : null;
+                        if (!readback) {
+                            throw new SupplementIdempotencyConflictError();
+                        }
+                        const existingFingerprint = labelIdentityFingerprint(
+                            readback.category,
+                            readback.version,
+                        );
+                        if (existingFingerprint !== fingerprint) {
+                            throw new SupplementIdempotencyConflictError();
+                        }
+                        return { product: readback, deduplicated: true };
+                    }
                 }
-                const existingFingerprint = labelIdentityFingerprint(
-                    readback.category,
-                    readback.version,
-                );
-                if (existingFingerprint !== fingerprint) {
-                    throw new SupplementIdempotencyConflictError();
-                }
-                return { product: readback, deduplicated: true };
-            }
-        }
 
-        const { rows: rootRows } = await client.query(
-            `INSERT INTO supplement_products (user_id, category)
+                const { rows: rootRows } = await client.query(
+                    `INSERT INTO supplement_products (user_id, category)
              VALUES ($1, $2)
              RETURNING id, user_id, category, status, current_version, created_at, updated_at`,
-            [command.user_id, command.category],
-        );
-        const root = rootRows[0] as ProductRootRow;
+                    [command.user_id, command.category],
+                );
+                const root = rootRows[0] as ProductRootRow;
 
-        await client.query(
-            `INSERT INTO supplement_product_versions
+                await client.query(
+                    `INSERT INTO supplement_product_versions
                 (product_id, version, user_id, revision_idempotency_key,
                  display_name, short_name, brand, form,
                  serving_amount, serving_unit, serving_description,
                  label_evidence, label_source_kind, created_by, prior_version)
              VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NULL)`,
-            [
-                root.id,
-                command.user_id,
-                idempotencyKey,
-                label.display_name,
-                label.short_name,
-                label.brand,
-                label.form,
-                label.serving_amount,
-                label.serving_unit,
-                label.serving_description,
-                JSON.stringify(label.label_evidence),
-                label.label_source_kind,
-                command.created_by,
-            ],
-        );
-        await insertLabelChildren(client, root, 1, label);
+                    [
+                        root.id,
+                        command.user_id,
+                        idempotencyKey,
+                        label.display_name,
+                        label.short_name,
+                        label.brand,
+                        label.form,
+                        label.serving_amount,
+                        label.serving_unit,
+                        label.serving_description,
+                        JSON.stringify(label.label_evidence),
+                        label.label_source_kind,
+                        command.created_by,
+                    ],
+                );
+                await insertLabelChildren(client, root, 1, label);
 
-        const readback = await assembleReadback(client, root, 1);
-        if (!readback) throw new Error("failed to read created product");
-        return { product: readback, deduplicated: false };
-    });
+                const readback = await assembleReadback(client, root, 1);
+                if (!readback)
+                    throw new Error("failed to read created product");
+                return { product: readback, deduplicated: false };
+            });
+        } catch (err) {
+            if (
+                idempotencyKey !== null &&
+                attempt < MAX_CREATE_ATTEMPTS &&
+                isCreateKeyRaceViolation(err)
+            ) {
+                continue;
+            }
+            throw err;
+        }
+    }
 }
 
 export async function reviseSupplementProductLabel(

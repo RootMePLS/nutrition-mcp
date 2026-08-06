@@ -1,0 +1,41 @@
+-- Forward-only migration: PostgreSQL-enforced first-time create idempotency
+-- for the supplement/sports-nutrition product catalogue.
+--
+-- Why a new migration instead of editing 006/007: both are already pushed
+-- and may be applied by existing deployments. Editing them in place would
+-- diverge the applied schema from the shipped files (operators who already
+-- ran them would never receive this constraint). 008 is additive and
+-- forward-safe: it adds one partial unique index, alters or drops nothing,
+-- and stays safe when 006/007 are rerun before it.
+--
+-- Enforcement (reviewer-terra slice 2 finding: concurrent first-time create):
+-- createSupplementProduct stamps the caller's idempotency key on the
+-- version-1 label row. Before this index, two concurrent same-user/same-key
+-- creates both passed the unlocked lookup and each inserted a root + version
+-- (two roots for one key). This partial unique index makes the database
+-- itself serialize the race: exactly one version-1 row can ever exist per
+-- (user_id, revision_idempotency_key); the loser's transaction aborts on
+-- unique_violation and the repository retries as a deduplicated read or a
+-- stable idempotency_conflict.
+--
+-- Scope of the predicate:
+--   * version = 1     — only first-time creates are keyed per user; revision
+--     keys keep their existing per-product uniqueness from 006
+--     (uniq_supplement_product_revision) and can reuse a key another
+--     product's create used without colliding here.
+--   * key IS NOT NULL — empty/null idempotency keys remain explicitly
+--     supported and are never forced unique.
+--   * user_id in the key — different users may reuse the same key
+--     independently.
+--
+-- Existing data is safe: the slice-2 writer is the only writer of these
+-- tables, and any pre-fix duplicates would have been visible corruption;
+-- deployments that only ran shipped code have at most one version-1 row per
+-- (user_id, key). Safe to rerun: CREATE UNIQUE INDEX IF NOT EXISTS, matching
+-- the 003-007 convention.
+--
+-- Run after 007: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/008_supplement_create_idempotency.sql
+
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_spv_user_create_idem
+    ON supplement_product_versions (user_id, revision_idempotency_key)
+    WHERE version = 1 AND revision_idempotency_key IS NOT NULL;

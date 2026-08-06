@@ -15,6 +15,7 @@ const MIGRATION_004 = "db/migrations/004_calculation_bundles.sql";
 const MIGRATION_005 = "db/migrations/005_calculation_corrections.sql";
 const MIGRATION_006 = "db/migrations/006_meal_reuse_and_supplements.sql";
 const MIGRATION_007 = "db/migrations/007_ownership_lineage_integrity.sql";
+const MIGRATION_008 = "db/migrations/008_supplement_create_idempotency.sql";
 
 const MIGRATION_006_TABLES = [
     "meal_event_reuse_sources",
@@ -99,6 +100,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_005);
         await applyMigration(client, MIGRATION_006);
         await applyMigration(client, MIGRATION_007);
+        await applyMigration(client, MIGRATION_008);
 
         const tables = await tableNames(client);
         for (const table of NEW_TABLES) {
@@ -143,6 +145,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_005);
         await applyMigration(client, MIGRATION_006);
         await applyMigration(client, MIGRATION_007);
+        await applyMigration(client, MIGRATION_008);
 
         const tables = await tableNames(client);
         expect(tables).not.toContain(LEGACY_TABLE);
@@ -171,6 +174,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_005);
         await applyMigration(client, MIGRATION_006);
         await applyMigration(client, MIGRATION_007);
+        await applyMigration(client, MIGRATION_008);
 
         const tables = await tableNames(client);
         for (const table of NEW_TABLES) {
@@ -188,6 +192,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_005);
         await applyMigration(client, MIGRATION_006);
         await applyMigration(client, MIGRATION_007);
+        await applyMigration(client, MIGRATION_008);
         const event = await createMealEvent(
             pool,
             {
@@ -265,9 +270,11 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
 
         await applyMigration(client, MIGRATION_006);
         await applyMigration(client, MIGRATION_007);
-        // Rerunning 006 and 007 must be safe (additive/idempotent like 003-005).
+        await applyMigration(client, MIGRATION_008);
+        // Rerunning 006-008 must be safe (additive/idempotent like 003-005).
         await applyMigration(client, MIGRATION_006);
         await applyMigration(client, MIGRATION_007);
+        await applyMigration(client, MIGRATION_008);
 
         // Existing alcohol profile state survives the upgrade untouched.
         const { rows: profiles } = await client.query(
@@ -399,6 +406,7 @@ const INTEGRITY_CHAIN = [
     MIGRATION_005,
     MIGRATION_006,
     MIGRATION_007,
+    MIGRATION_008,
 ];
 
 // Reviewer-terra finding 2: direct persistence must not be able to create
@@ -832,8 +840,113 @@ describeDb(
                 [...expectedConstraints].sort(),
             );
 
-            // Rerunning the head migration must be safe (additive/idempotent).
+            // Rerunning the head migrations must be safe (additive/idempotent).
             await applyMigration(client, MIGRATION_007);
+            await applyMigration(client, MIGRATION_008);
+        });
+    },
+);
+
+// Reviewer-terra slice 2 finding: concurrent first-time product creates with
+// the same idempotency key must serialize at the database. Migration 008's
+// partial unique index is the enforcement boundary; these tests attack it
+// with direct SQL, bypassing every application-level validator.
+describeDb(
+    "migration 008 supplement create idempotency (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+        let client: PoolClient;
+
+        beforeAll(async () => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST, max: 1 });
+            client = await pool.connect();
+        });
+
+        afterAll(async () => {
+            client.release();
+            await pool.end();
+        });
+
+        async function applyChain(): Promise<void> {
+            await resetSchema(client);
+            for (const migration of INTEGRITY_CHAIN) {
+                await applyMigration(client, migration);
+            }
+        }
+
+        async function insertRoot(userId: string): Promise<string> {
+            const { rows } = await client.query(
+                `INSERT INTO supplement_products (user_id, category)
+                 VALUES ($1, 'supplement') RETURNING id`,
+                [userId],
+            );
+            return rows[0].id as string;
+        }
+
+        async function insertVersion(
+            productId: string,
+            userId: string,
+            version: number,
+            key: string | null,
+        ): Promise<void> {
+            await client.query(
+                `INSERT INTO supplement_product_versions
+                    (product_id, version, user_id, revision_idempotency_key,
+                     display_name, label_evidence, created_by)
+                 VALUES ($1, $2, $3, $4, 'Label', '{}', 'test')`,
+                [productId, version, userId, key],
+            );
+        }
+
+        test("partial unique index exists with the version-1/non-null-key predicate", async () => {
+            await applyChain();
+            const { rows } = await client.query(
+                `SELECT indexdef FROM pg_indexes
+                 WHERE schemaname = 'public' AND indexname = 'uniq_spv_user_create_idem'`,
+            );
+            expect(rows.length).toBe(1);
+            const def = rows[0].indexdef as string;
+            expect(def).toContain("UNIQUE");
+            expect(def).toContain("user_id");
+            expect(def).toContain("revision_idempotency_key");
+            expect(def).toContain("version = 1");
+            expect(def).toContain("IS NOT NULL");
+        });
+
+        test("duplicate (user, key) version-1 rows are rejected; cross-user, null-key, and revision keys stay free", async () => {
+            await applyChain();
+
+            const rootA = await insertRoot("u1");
+            await insertVersion(rootA, "u1", 1, "shared-key");
+
+            // Same user, same key, another first-time create: rejected by the
+            // database, never by application code.
+            const rootB = await insertRoot("u1");
+            await expect(
+                insertVersion(rootB, "u1", 1, "shared-key"),
+            ).rejects.toMatchObject({
+                code: "23505",
+                constraint: "uniq_spv_user_create_idem",
+            });
+
+            // Different user, same key: independent.
+            const rootC = await insertRoot("u2");
+            await insertVersion(rootC, "u2", 1, "shared-key");
+
+            // Null/empty-keyed first-time creates are never forced unique.
+            const rootD = await insertRoot("u1");
+            await insertVersion(rootD, "u1", 1, null);
+
+            // Revision keys live in their own per-product namespace: a
+            // version-2 row may reuse ANOTHER product's create key (008's
+            // predicate is version = 1 only; 006's per-product revision index
+            // governs within one product).
+            const rootE = await insertRoot("u1");
+            await insertVersion(rootE, "u1", 1, "other-key");
+            await insertVersion(rootE, "u1", 2, "shared-key");
+
+            // Rerunning 008 must be safe (IF NOT EXISTS).
+            await applyMigration(client, MIGRATION_008);
         });
     },
 );
