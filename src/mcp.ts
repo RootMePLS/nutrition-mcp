@@ -83,7 +83,7 @@ const CALCULATION_BUNDLE_INPUT_SCHEMA = z.object({
             error_message: z.string().nullable().optional(),
         }),
     ),
-    fingerprint: z.string().min(1),
+    fingerprint: z.string().min(1).optional(),
     canonical_proposal: z
         .object({
             calories: z.number().finite().nullable().optional(),

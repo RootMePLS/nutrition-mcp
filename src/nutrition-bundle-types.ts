@@ -34,7 +34,7 @@ export interface CalculationBundleInput {
     capture_id?: string | null;
     resolved_input: { items: unknown[]; inputs: unknown[] };
     results: ProviderCalculationResult[];
-    fingerprint: string;
+    fingerprint?: string;
     canonical_proposal?: Partial<Nutrients> | null;
 }
 
@@ -80,7 +80,6 @@ export function validateCalculationBundle(bundle: CalculationBundle): string[] {
         bundle.version < 1
     )
         errors.push("event identity is required");
-    if (!bundle.fingerprint) errors.push("bundle fingerprint is required");
     if (!Array.isArray(bundle.results))
         return [...errors, "results must be an array"];
     const seen = new Set<string>();
@@ -139,16 +138,18 @@ export function validateCalculationBundle(bundle: CalculationBundle): string[] {
             );
     }
     validateNutrients(bundle.canonical_proposal, errors, "canonical proposal ");
-    const expected = stableBundleFingerprint({
-        event_id: bundle.event_id,
-        version: bundle.version,
-        capture_id: bundle.capture_id,
-        resolved_input: bundle.resolved_input,
-        results: bundle.results,
-        canonical_proposal: bundle.canonical_proposal,
-    });
-    if (bundle.fingerprint !== expected)
-        errors.push("bundle fingerprint mismatch");
+    if (bundle.fingerprint !== undefined) {
+        const expected = stableBundleFingerprint({
+            event_id: bundle.event_id,
+            version: bundle.version,
+            capture_id: bundle.capture_id,
+            resolved_input: bundle.resolved_input,
+            results: bundle.results,
+            canonical_proposal: bundle.canonical_proposal,
+        });
+        if (bundle.fingerprint !== expected)
+            errors.push("bundle fingerprint mismatch");
+    }
     return errors;
 }
 
