@@ -245,9 +245,32 @@ ambiguity returns candidates (or fails the log with
 `supplement_alias_ambiguous`) with zero writes, and a direct product id
 removes ambiguity authoritatively. Unknown, cross-user, or deleted products
 and regimens fail closed with the same not-found shape, so existence never
-leaks. Caloric sports-nutrition meal-event linkage is NOT performed by this
-version — it arrives with the sports-snack slice — and reporting, data flags,
-and summaries are not implemented yet.
+leaks. Caloric sports-nutrition meal-event linkage shipped with the
+sports-snack slice; the reporting boundary and data-flag reads shipped with
+the reporting slice described next.
+
+## Reporting boundary and non-medical data flags
+
+Two read-only tools expose the Release-2 reporting boundary without crossing
+it. `get_supplement_nutrition_summary` returns, for an explicit bounded date
+range (at most 92 inclusive days) in an explicit IANA timezone, the food
+contribution (current canonical facts of active meal events in range,
+excluding supplement-linked snack events so nothing is counted twice — the
+excluded count is disclosed), the correction-aware supplement/sports
+contribution from immutable done-intake label snapshots (disclosing raw fact,
+effective done, and correction-excluded counts), and a combined total grouped
+strictly by exact nutrient key + unit with no unit conversion; absent values
+stay absent and an explicit stored zero stays 0.
+`get_supplement_data_flags` reports transparent data facts only: the same
+nutrient key + unit recorded from two or more distinct products, recorded
+daily totals compared against a product label's own explicitly stored maximum
+where one exists (never a fabricated threshold), and derived past-due
+occurrences of active regimens with no recorded state. Both tools are
+user-scoped and write nothing on any path, including validation errors, and
+neither carries medical, dosage, or interaction advice. This repository only
+exposes the data: composing, scheduling, or delivering any report (for
+example a periodic summary in Hermes Release 2) happens outside this
+repository — no scheduler, no reminders, and no report delivery exist here.
 
 ## MyFitnessPal sync journal
 
