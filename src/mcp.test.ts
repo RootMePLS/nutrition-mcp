@@ -2205,4 +2205,15 @@ describe("MCP tool input schema advertisement", () => {
         // Extra keys (e.g. platform metadata) must stay allowed.
         expect(message.additionalProperties).not.toBe(false);
     });
+
+    test("commit_calculation_bundle documents fingerprint semantics", async () => {
+        const schemas = await listToolSchemas();
+        const schema = schemas.get("commit_calculation_bundle") as any;
+        const fingerprint = schema.properties.bundle.properties.fingerprint;
+        expect(schema.properties.bundle.required ?? []).not.toContain(
+            "fingerprint",
+        );
+        expect(fingerprint.description).toMatch(/omit/i);
+        expect(fingerprint.description).toMatch(/server/i);
+    });
 });

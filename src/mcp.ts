@@ -106,7 +106,13 @@ const CALCULATION_BUNDLE_INPUT_SCHEMA = z.object({
             error_message: z.string().nullable().optional(),
         }),
     ),
-    fingerprint: z.string().min(1).optional(),
+    fingerprint: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+            "Computed by the server; omit to let the server compute it from the bundle content. If provided, it must exactly match the server-computed fingerprint or the commit fails with 'bundle fingerprint mismatch'.",
+        ),
     canonical_proposal: z
         .object({
             calories: z.number().finite().nullable().optional(),
