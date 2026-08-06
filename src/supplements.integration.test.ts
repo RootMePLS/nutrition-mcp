@@ -2980,48 +2980,54 @@ describeDb(
             expect(link.product_id).toBe(productId);
             expect(link.product_version).toBe(1);
 
-            // Verify the nutrition result has the correct scaled values.
-            const { rows: nutRows } = await pool.query(
-                `SELECT nutrient_key, amount::numeric
-                     FROM meal_event_nutrition_results
-                     WHERE event_id = $1 AND version = $2 AND provider = 'own'
-                     ORDER BY nutrient_key`,
+            // Verify the single 'own' provider row has the exact scaled label
+            // values, explicit zero preserved, absent nutrients NULL (never
+            // fabricated as 0), and no non-food key leaked (the table has no
+            // such column at all — the wide schema itself proves vitamin_d
+            // cannot be stored).
+            const { rows: prvRows } = await pool.query(
+                `SELECT provider, status, calories::float8 AS calories,
+                        protein_g::float8 AS protein_g, fat_g::float8 AS fat_g,
+                        carbs_g, fiber_g, sugar_g, alcohol_g
+                   FROM meal_event_nutrition_results
+                  WHERE event_id = $1 AND version = $2`,
                 [link.event_id, link.version],
             );
-            const nutrients = Object.fromEntries(
-                (
-                    nutRows as Array<{
-                        nutrient_key: string;
-                        amount: number;
-                    }>
-                ).map((r) => [r.nutrient_key, Number(r.amount)]),
-            );
-            expect(nutrients.calories).toBe(240);
-            expect(nutrients.protein_g).toBe(42);
-            expect(nutrients.fat_g).toBe(0);
-            expect(nutrients.vitamin_d).toBeUndefined();
+            expect(prvRows).toHaveLength(1);
+            const prv = prvRows[0] as Record<string, unknown>;
+            expect(prv.provider).toBe("own");
+            expect(prv.status).toBe("succeeded");
+            expect(prv.calories).toBe(240);
+            expect(prv.protein_g).toBe(42);
+            expect(prv.fat_g).toBe(0); // explicit numeric zero, not NULL
+            expect(prv.carbs_g).toBeNull(); // absent on the label stays NULL
+            expect(prv.fiber_g).toBeNull();
+            expect(prv.sugar_g).toBeNull();
+            expect(prv.alcohol_g).toBeNull();
 
-            // Verify the canonical results match.
+            // Verify the canonical (consensus) row carries the same values —
+            // this is the assertion that catches the pg-numeric-string
+            // narrowing bug.
             const { rows: canRows } = await pool.query(
-                `SELECT nutrient_key, amount::numeric
-                     FROM meal_event_canonical_results
-                     WHERE event_id = $1 AND version = $2
-                     ORDER BY nutrient_key`,
+                `SELECT status, consensus_status, calories::float8 AS calories,
+                        protein_g::float8 AS protein_g, fat_g::float8 AS fat_g,
+                        carbs_g, eligible_providers
+                   FROM meal_event_canonical_results
+                  WHERE event_id = $1 AND version = $2 AND ordinal IS NULL`,
                 [link.event_id, link.version],
             );
-            expect(canRows).toHaveLength(3);
-            const canonicals = Object.fromEntries(
-                (
-                    canRows as Array<{
-                        nutrient_key: string;
-                        amount: number;
-                    }>
-                ).map((r) => [r.nutrient_key, Number(r.amount)]),
-            );
-            expect(canonicals.calories).toBe(240);
-            expect(canonicals.protein_g).toBe(42);
-            expect(canonicals.fat_g).toBe(0);
-            expect(canonicals.vitamin_d).toBeUndefined();
+            expect(canRows).toHaveLength(1);
+            const can = canRows[0] as Record<string, unknown>;
+            expect(can.calories).toBe(240);
+            expect(can.protein_g).toBe(42);
+            expect(can.fat_g).toBe(0);
+            expect(can.carbs_g).toBeNull();
+            // Single-provider label data: consensus discloses
+            // insufficient_data / low_confidence honestly — it must NOT
+            // pretend multi-provider agreement.
+            expect(can.consensus_status).toBe("insufficient_data");
+            expect(can.status).toBe("low_confidence");
+            expect(can.eligible_providers).toEqual(["own"]);
 
             // The snack item references the product display name.
             const { rows: itemRows } = await pool.query(
