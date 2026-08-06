@@ -16,6 +16,7 @@ import {
     createSupplementRegimen,
     listSupplementRegimens,
     setSupplementRegimenActive,
+    resolveSupplementProduct,
     SupplementIdempotencyConflictError,
     SupplementProductInactiveError,
     SupplementProductNotFoundError,
@@ -1555,6 +1556,205 @@ describeDb(
             const listed = await listSupplementRegimens(pool, "u1");
             expect(listed[0]!.product_version).toBe(1);
             expect(listed[0]!.product_display_name).toBe("Impact Whey Protein");
+        });
+    },
+);
+
+describeDb(
+    "supplement product resolution: read-only direct-id and alias (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await pool.end();
+        });
+
+        beforeEach(async () => {
+            await resetSchema(pool);
+        });
+
+        async function seedProduct(
+            overrides: Record<string, unknown> = {},
+        ): Promise<string> {
+            const result = await createSupplementProduct(
+                pool,
+                validCreateCommand({
+                    idempotency_key: `product:${crypto.randomUUID()}`,
+                    ...overrides,
+                }),
+            );
+            return result.product.product_id;
+        }
+
+        async function domainTableCounts(): Promise<Record<string, number>> {
+            const tables = [
+                "supplement_products",
+                "supplement_product_versions",
+                "supplement_product_aliases",
+                "supplement_product_nutrients",
+                "supplement_product_label_limits",
+                "supplement_regimens",
+                "supplement_intake_events",
+                "supplement_intake_nutrient_snapshots",
+                "supplement_intake_meal_links",
+                "meal_events",
+            ];
+            const counts: Record<string, number> = {};
+            for (const table of tables) {
+                counts[table] = await tableCount(pool, table);
+            }
+            return counts;
+        }
+
+        test("a direct owned active product id resolves", async () => {
+            const productId = await seedProduct();
+            const result = await resolveSupplementProduct(pool, "u1", {
+                product_id: productId,
+            });
+            expect(result.resolution_status).toBe("resolved");
+            expect(result.candidates).toEqual([
+                {
+                    product_id: productId,
+                    category: "sports_nutrition",
+                    display_name: "Impact Whey Protein",
+                    brand: "MyProtein",
+                    form: "powder",
+                    current_version: 1,
+                    matched_alias: "Impact Whey Protein",
+                },
+            ]);
+        });
+
+        test("unknown, cross-user, and deleted ids are indistinguishable not_found", async () => {
+            const productId = await seedProduct();
+            for (const [userId, id] of [
+                ["u1", crypto.randomUUID()],
+                ["u2", productId],
+            ] as const) {
+                const result = await resolveSupplementProduct(pool, userId, {
+                    product_id: id,
+                });
+                expect(result.resolution_status).toBe("not_found");
+                expect(result.candidates).toEqual([]);
+            }
+            await pool.query(
+                `UPDATE supplement_products SET status = 'deleted' WHERE id = $1`,
+                [productId],
+            );
+            const deleted = await resolveSupplementProduct(pool, "u1", {
+                product_id: productId,
+            });
+            expect(deleted.resolution_status).toBe("not_found");
+        });
+
+        test("a unique alias resolves across case, whitespace, and NFKC variants", async () => {
+            const productId = await seedProduct();
+            for (const input of [
+                "MP Whey",
+                "mp whey",
+                "  MP   WHEY  ",
+                "ＭＰ ｗｈｅｙ", // full-width letters fold under NFKC
+            ]) {
+                const result = await resolveSupplementProduct(pool, "u1", {
+                    alias: input,
+                });
+                expect(result.resolution_status).toBe("resolved");
+                expect(result.candidates).toHaveLength(1);
+                expect(result.candidates[0]!.product_id).toBe(productId);
+                expect(result.candidates[0]!.matched_alias).toBe("MP Whey");
+            }
+        });
+
+        test("normalized display-name and short-name equality resolve as a fallback", async () => {
+            const productId = await seedProduct();
+            const byName = await resolveSupplementProduct(pool, "u1", {
+                alias: " impact   WHEY protein ",
+            });
+            expect(byName.resolution_status).toBe("resolved");
+            expect(byName.candidates[0]!.matched_alias).toBe(
+                "Impact Whey Protein",
+            );
+
+            const byShort = await resolveSupplementProduct(pool, "u1", {
+                alias: "WHEY",
+            });
+            expect(byShort.resolution_status).toBe("resolved");
+            expect(byShort.candidates[0]!.matched_alias).toBe("Whey");
+        });
+
+        test("two products sharing a normalized alias are ambiguous with both candidates", async () => {
+            const first = await seedProduct({ aliases: ["shared whey"] });
+            const second = await seedProduct({
+                display_name: "Other Whey",
+                aliases: ["Shared   WHEY"],
+            });
+            const result = await resolveSupplementProduct(pool, "u1", {
+                alias: "shared whey",
+            });
+            expect(result.resolution_status).toBe("ambiguous");
+            expect(result.candidates).toHaveLength(2);
+            const ids = result.candidates.map((c) => c.product_id).sort();
+            expect(ids).toEqual([first, second].sort());
+        });
+
+        test("an alias that only exists on a historical version does not match", async () => {
+            const productId = await seedProduct({ aliases: ["old whey"] });
+            await reviseSupplementProductLabel(pool, {
+                user_id: "u1",
+                product_id: productId,
+                display_name: "Impact Whey Protein (new formula)",
+                short_name: "Whey",
+                brand: "MyProtein",
+                form: "powder",
+                serving_amount: 32,
+                serving_unit: "g",
+                serving_description: "1 heaped scoop",
+                aliases: ["new whey"],
+                nutrients: [
+                    { nutrient_key: "calories", amount: 128, unit: "kcal" },
+                    { nutrient_key: "protein_g", amount: 23, unit: "g" },
+                ],
+                label_evidence: { kind: "label_photo", verified_by: "user" },
+                label_source_kind: "user_verified_label",
+                revision_idempotency_key: `revise:${crypto.randomUUID()}`,
+                created_by: "test",
+            });
+
+            const historical = await resolveSupplementProduct(pool, "u1", {
+                alias: "old whey",
+            });
+            expect(historical.resolution_status).toBe("not_found");
+            const current = await resolveSupplementProduct(pool, "u1", {
+                alias: "new whey",
+            });
+            expect(current.resolution_status).toBe("resolved");
+            expect(current.candidates[0]!.current_version).toBe(2);
+        });
+
+        test("another user's alias never resolves my products", async () => {
+            await seedProduct();
+            const result = await resolveSupplementProduct(pool, "u2", {
+                alias: "MP Whey",
+            });
+            expect(result.resolution_status).toBe("not_found");
+            expect(result.candidates).toEqual([]);
+        });
+
+        test("resolution is a pure read: every domain table count is unchanged", async () => {
+            const productId = await seedProduct();
+            const before = await domainTableCounts();
+            await resolveSupplementProduct(pool, "u1", {
+                product_id: productId,
+            });
+            await resolveSupplementProduct(pool, "u1", { alias: "MP Whey" });
+            await resolveSupplementProduct(pool, "u1", {
+                alias: "no such product",
+            });
+            expect(await domainTableCounts()).toEqual(before);
         });
     },
 );

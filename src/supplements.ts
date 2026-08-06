@@ -1415,3 +1415,144 @@ export async function setSupplementRegimenActive(
         };
     });
 }
+
+// ===========================================================================
+// PRODUCT RESOLUTION (Slice 5, read-only)
+// ===========================================================================
+// Exact, lexical, current-version-only matching: a normalized alias equals a
+// stored normalized_alias, or the caller's normalized input equals the
+// normalized display/short name. Never fuzzy, never a silent pick: zero
+// matches is not_found, one is resolved, more than one is ambiguous with the
+// full candidate list so the agent host can ask the user. Deleted products
+// and other users' products are indistinguishable from nonexistent ones.
+
+export interface ResolveSupplementProductResult {
+    resolution_status: "resolved" | "ambiguous" | "not_found";
+    candidates: ResolvedProductCandidate[];
+}
+
+interface ResolutionRow {
+    id: string;
+    category: SupplementProductCategory;
+    current_version: number;
+    display_name: string;
+    short_name: string | null;
+    brand: string | null;
+    form: string | null;
+    matched_alias: string | null;
+}
+
+async function matchProductsByAlias(
+    q: Queryable,
+    userId: string,
+    normalized: string,
+): Promise<ResolvedProductCandidate[]> {
+    const { rows } = await q.query(
+        `SELECT p.id, p.category, p.current_version,
+                v.display_name, v.short_name, v.brand, v.form,
+                (SELECT a.alias FROM supplement_product_aliases a
+                  WHERE a.product_id = p.id AND a.version = p.current_version
+                    AND a.normalized_alias = $2
+                  ORDER BY lower(a.alias), a.alias LIMIT 1) AS matched_alias
+         FROM supplement_products p
+         JOIN supplement_product_versions v
+           ON v.product_id = p.id AND v.version = p.current_version
+         WHERE p.user_id = $1 AND p.status = 'active'
+         ORDER BY lower(v.display_name), p.id`,
+        [userId, normalized],
+    );
+    const candidates: ResolvedProductCandidate[] = [];
+    for (const row of rows as ResolutionRow[]) {
+        let matched = row.matched_alias;
+        if (matched === null) {
+            // Name fallback: normalized equality against the current
+            // display/short name (NFKC + case folding happens here, not in
+            // SQL, so it matches normalizeSupplementAlias exactly).
+            if (normalizeSupplementAlias(row.display_name) === normalized) {
+                matched = row.display_name;
+            } else if (
+                row.short_name !== null &&
+                normalizeSupplementAlias(row.short_name) === normalized
+            ) {
+                matched = row.short_name;
+            }
+        }
+        if (matched === null) continue;
+        candidates.push({
+            product_id: row.id,
+            category: row.category,
+            display_name: row.display_name,
+            brand: row.brand,
+            form: row.form,
+            current_version: row.current_version,
+            matched_alias: matched,
+        });
+    }
+    return candidates;
+}
+
+export async function resolveSupplementProduct(
+    pool: Queryable,
+    userId: string,
+    query: { product_id?: string; alias?: string },
+): Promise<ResolveSupplementProductResult> {
+    const hasId = query.product_id !== undefined;
+    const hasAlias = query.alias !== undefined;
+    if (hasId === hasAlias) {
+        throw new SupplementValidationError([
+            "exactly one of product_id or alias must be supplied",
+        ]);
+    }
+
+    if (hasId) {
+        const { rows } = await pool.query(
+            `SELECT p.id, p.category, p.current_version,
+                    v.display_name, v.brand, v.form
+             FROM supplement_products p
+             JOIN supplement_product_versions v
+               ON v.product_id = p.id AND v.version = p.current_version
+             WHERE p.id = $1 AND p.user_id = $2 AND p.status = 'active'`,
+            [query.product_id, userId],
+        );
+        const row = rows[0] as
+            | {
+                  id: string;
+                  category: SupplementProductCategory;
+                  current_version: number;
+                  display_name: string;
+                  brand: string | null;
+                  form: string | null;
+              }
+            | undefined;
+        if (!row) {
+            return { resolution_status: "not_found", candidates: [] };
+        }
+        return {
+            resolution_status: "resolved",
+            candidates: [
+                {
+                    product_id: row.id,
+                    category: row.category,
+                    display_name: row.display_name,
+                    brand: row.brand,
+                    form: row.form,
+                    current_version: row.current_version,
+                    matched_alias: row.display_name,
+                },
+            ],
+        };
+    }
+
+    const normalized = normalizeSupplementAlias(query.alias!);
+    if (normalized === null) {
+        return { resolution_status: "not_found", candidates: [] };
+    }
+    const candidates = await matchProductsByAlias(pool, userId, normalized);
+    if (candidates.length === 0) {
+        return { resolution_status: "not_found", candidates: [] };
+    }
+    return {
+        resolution_status: candidates.length === 1 ? "resolved" : "ambiguous",
+        candidates,
+    };
+}
