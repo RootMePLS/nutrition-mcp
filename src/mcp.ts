@@ -464,9 +464,20 @@ import {
     listSupplementProducts,
     reviseSupplementProductLabel,
     searchSupplementProducts,
+    createSupplementRegimen,
+    listSupplementRegimens,
+    setSupplementRegimenActive,
+    resolveSupplementProduct,
+    logSupplementIntake,
+    getSupplementIntakes,
+    getSupplementRegimenStatus,
+    SupplementAliasAmbiguousError,
     SupplementIdempotencyConflictError,
     SupplementProductInactiveError,
     SupplementProductNotFoundError,
+    SupplementProductVersionNotFoundError,
+    SupplementRegimenInactiveError,
+    SupplementRegimenNotFoundError,
     SupplementValidationError,
 } from "./supplements.js";
 import {
@@ -1976,6 +1987,100 @@ const SUPPLEMENT_LABEL_INPUT_SCHEMA = {
         .optional(),
     label_evidence: z.record(z.string(), z.unknown()),
     label_source_kind: z.string().nullable().optional(),
+};
+
+// ---------------------------------------------------------------------------
+// Supplement regimen / intake schemas (Slice 5)
+// ---------------------------------------------------------------------------
+// Output shapes mirror the supplements.ts readbacks exactly. The public
+// visible-state vocabulary is exactly undefined|done|missed; the internal
+// `cleared` action appears only as audit state_action, never as a visible
+// state.
+
+const REGIMEN_SCHEDULE_INPUT_SCHEMA = z
+    .object({
+        timezone: z.string().min(1),
+        frequency: z.enum(["daily", "weekly"]),
+        local_time: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/),
+        weekdays: z.array(z.number().int().min(1).max(7)).optional(),
+    })
+    .strict(); // full semantic validation stays in validateRegimenSchedule
+
+const REGIMEN_SCHEDULE_OUTPUT_SCHEMA = z.object({
+    timezone: z.string(),
+    frequency: z.enum(["daily", "weekly"]),
+    local_time: z.string(),
+    weekdays: z.array(z.number()).nullable().optional(),
+});
+
+const SUPPLEMENT_REGIMEN_OUTPUT_SCHEMA = {
+    regimen_id: z.string(),
+    product_id: z.string(),
+    product_version: z.number().int(),
+    product_display_name: z.string(),
+    category: z.enum(["supplement", "sports_nutrition"]),
+    dose_servings: z.number(),
+    schedule: REGIMEN_SCHEDULE_OUTPUT_SCHEMA,
+    starts_on: z.string(),
+    ends_on: z.string().nullable(),
+    active: z.boolean(),
+    created_at: z.string(),
+    updated_at: z.string(),
+    deactivated_at: z.string().nullable(),
+};
+
+const SUPPLEMENT_INTAKE_SNAPSHOT_OUTPUT_SCHEMA = {
+    nutrient_key: z.string(),
+    unit: z.string(),
+    original_amount: z.number(),
+    scaled_amount: z.number(),
+};
+
+const SUPPLEMENT_INTAKE_FACT_OUTPUT_SCHEMA = {
+    intake_id: z.string(),
+    product_id: z.string(),
+    product_version: z.number().int(),
+    product_display_name: z.string(),
+    category: z.enum(["supplement", "sports_nutrition"]),
+    regimen_id: z.string().nullable(),
+    servings: z.number(),
+    occurred_at: z.string(),
+    state_action: z.enum(["done", "missed", "cleared"]),
+    visible_state: z.enum(["undefined", "done", "missed"]),
+    reason: z.string().nullable(),
+    actor: z.string(),
+    supersedes_intake_id: z.string().nullable(),
+    created_at: z.string(),
+    nutrient_snapshots: z.array(
+        z.object(SUPPLEMENT_INTAKE_SNAPSHOT_OUTPUT_SCHEMA),
+    ),
+};
+
+const RESOLVE_PRODUCT_OUTPUT_SCHEMA = {
+    resolution_status: z.enum(["resolved", "ambiguous", "not_found"]),
+    candidates: z.array(
+        z.object({
+            product_id: z.string(),
+            category: z.enum(["supplement", "sports_nutrition"]),
+            display_name: z.string(),
+            brand: z.string().nullable(),
+            form: z.string().nullable(),
+            current_version: z.number().int(),
+            matched_alias: z.string(),
+        }),
+    ),
+};
+
+const REGIMEN_STATUS_OUTPUT_SCHEMA = {
+    regimen: z.object(SUPPLEMENT_REGIMEN_OUTPUT_SCHEMA),
+    occurrences: z.array(
+        z.object({
+            local_date: z.string(),
+            local_time: z.string(),
+            visible_state: z.enum(["undefined", "done", "missed"]),
+            latest_intake_id: z.string().nullable(),
+        }),
+    ),
 };
 
 // One media store per process. MEDIA_ROOT is resolved lazily so tests that
@@ -5971,6 +6076,20 @@ export function registerTools(
         if (error instanceof SupplementProductInactiveError) {
             throw new Error("supplement_product_inactive");
         }
+        if (error instanceof SupplementProductVersionNotFoundError) {
+            throw new Error("supplement_product_version_not_found");
+        }
+        if (error instanceof SupplementRegimenNotFoundError) {
+            throw new Error("supplement_regimen_not_found");
+        }
+        if (error instanceof SupplementRegimenInactiveError) {
+            throw new Error("supplement_regimen_inactive");
+        }
+        if (error instanceof SupplementAliasAmbiguousError) {
+            // The message carries the stable code plus the candidate names
+            // and ids so the agent host can ask the user to pick.
+            throw new Error(error.message);
+        }
         if (error instanceof SupplementIdempotencyConflictError) {
             throw new Error("idempotency_conflict");
         }
@@ -6249,6 +6368,464 @@ export function registerTools(
                         product: result.product,
                         previous_version: result.previous_version,
                         deduplicated: result.deduplicated,
+                    };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    // ----------------------------------------------------------------------
+    // Supplement regimens and append-only intake facts (Slice 5)
+    // ----------------------------------------------------------------------
+    // A regimen is declarative intent only: these tools never create an
+    // intake, a meal event, a scheduler job, or a reminder. Intake facts are
+    // append-only; the public visible-state vocabulary is exactly
+    // undefined|done|missed.
+
+    server.registerTool(
+        "create_supplement_regimen",
+        {
+            title: "Create Supplement Regimen",
+            description:
+                "Record declarative supplement intent: a caller-owned active product, a pinned label version (current version when omitted), a positive dose in servings, a validated schedule (timezone, daily|weekly, local time, ISO weekdays for weekly), and a start/end window. Creates intent only — no intake fact, no meal event, no scheduler job, and no reminder is created, and due occurrences are never marked automatically. Replaying the same idempotency_key with the same regimen returns the original; a different regimen with the same key is a conflict.",
+            annotations: {
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                product_id: z.string().uuid(),
+                product_version: z.number().int().min(1).nullable().optional(),
+                dose_servings: z.number().positive().finite(),
+                schedule: REGIMEN_SCHEDULE_INPUT_SCHEMA,
+                starts_on: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+                ends_on: z
+                    .string()
+                    .regex(/^\d{4}-\d{2}-\d{2}$/)
+                    .nullable()
+                    .optional(),
+                idempotency_key: z
+                    .string()
+                    .min(1)
+                    .max(255)
+                    .nullable()
+                    .optional(),
+            },
+            outputSchema: {
+                regimen: z.object(SUPPLEMENT_REGIMEN_OUTPUT_SCHEMA),
+                deduplicated: z.boolean(),
+            },
+        },
+        async ({
+            product_id,
+            product_version,
+            dose_servings,
+            schedule,
+            starts_on,
+            ends_on,
+            idempotency_key,
+        }) => {
+            return withAnalytics(
+                "create_supplement_regimen",
+                async () => {
+                    const result = await createSupplementRegimen(
+                        mealEventsPool,
+                        {
+                            user_id: userId,
+                            product_id,
+                            product_version: product_version ?? null,
+                            dose_servings,
+                            schedule,
+                            starts_on,
+                            ends_on: ends_on ?? null,
+                            idempotency_key: idempotency_key ?? null,
+                            created_by: "create_supplement_regimen",
+                        },
+                    ).catch(supplementToolError);
+                    const structuredContent = {
+                        regimen: result.regimen,
+                        deduplicated: result.deduplicated,
+                    };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "list_supplement_regimens",
+        {
+            title: "List Supplement Regimens",
+            description:
+                "List the user's supplement regimens, newest first. Inactive regimens are excluded unless include_inactive is set. Read-only: lists intent records, never derives or marks intake state.",
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                include_inactive: z.boolean().optional(),
+                product_id: z.string().uuid().optional(),
+                limit: z.number().int().min(1).max(200).optional(),
+            },
+            outputSchema: {
+                regimens: z.array(z.object(SUPPLEMENT_REGIMEN_OUTPUT_SCHEMA)),
+            },
+        },
+        async ({ include_inactive, product_id, limit }) => {
+            return withAnalytics(
+                "list_supplement_regimens",
+                async () => {
+                    const regimens = await listSupplementRegimens(
+                        mealEventsPool,
+                        userId,
+                        {
+                            includeInactive: include_inactive ?? false,
+                            productId: product_id,
+                            limit,
+                        },
+                    );
+                    const structuredContent = { regimens };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "set_supplement_regimen_active",
+        {
+            title: "Set Supplement Regimen Active",
+            description:
+                "Explicitly deactivate or reactivate one of the user's supplement regimens. Deactivation stamps deactivated_at; reactivation clears it and requires the bound product to still be active. Repeating the current state is an idempotent no-op (changed: false). Never creates or marks intake facts.",
+            annotations: {
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                regimen_id: z.string().uuid(),
+                active: z.boolean(),
+            },
+            outputSchema: {
+                regimen: z.object(SUPPLEMENT_REGIMEN_OUTPUT_SCHEMA),
+                changed: z.boolean(),
+            },
+        },
+        async ({ regimen_id, active }) => {
+            return withAnalytics(
+                "set_supplement_regimen_active",
+                async () => {
+                    const result = await setSupplementRegimenActive(
+                        mealEventsPool,
+                        userId,
+                        regimen_id,
+                        active,
+                    ).catch(supplementToolError);
+                    const structuredContent = {
+                        regimen: result.regimen,
+                        changed: result.changed,
+                    };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "resolve_supplement_product",
+        {
+            title: "Resolve Supplement Product",
+            description:
+                "Resolve a direct product id or an exact alias/name (case-insensitive, whitespace-collapsed, Unicode-normalized) against the user's ACTIVE products' current label versions. Returns a structured result: resolved with one candidate, ambiguous with every candidate (pass a direct product_id to log_supplement_intake instead), or not_found. Read-only: never writes anything and never picks a product silently.",
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                product_id: z.string().uuid().optional(),
+                alias: z.string().min(1).optional(),
+            },
+            outputSchema: RESOLVE_PRODUCT_OUTPUT_SCHEMA,
+        },
+        async ({ product_id, alias }) => {
+            return withAnalytics(
+                "resolve_supplement_product",
+                async () => {
+                    const result = await resolveSupplementProduct(
+                        mealEventsPool,
+                        userId,
+                        { product_id, alias },
+                    ).catch(supplementToolError);
+                    const structuredContent = {
+                        resolution_status: result.resolution_status,
+                        candidates: result.candidates,
+                    };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "log_supplement_intake",
+        {
+            title: "Log Supplement Intake",
+            description:
+                "Append one immutable supplement intake fact for the user: exactly one selector (direct product_id, a unique alias, or an active regimen_id which supplies the pinned product/version), positive servings, a strict occurred_at timestamp, and state_action done|missed|cleared. Facts are never updated or deleted; a correction appends a new fact (optionally superseding an earlier one with a reason). The public visible state is exactly undefined|done|missed (cleared projects undefined). A done fact immutably snapshots the bound label version's nutrients scaled by servings; missed/cleared facts snapshot nothing. This version performs NO caloric meal-event linkage for sports nutrition (that arrives with a later slice). Data only — no dosage or medical advice. Replaying the same idempotency_key returns the original fact; the same key with a different fact is a conflict.",
+            annotations: {
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                product_id: z.string().uuid().optional(),
+                alias: z.string().min(1).optional(),
+                product_version: z.number().int().min(1).optional(),
+                regimen_id: z.string().uuid().optional(),
+                servings: z.number().positive().finite(),
+                occurred_at: z.string().refine(isStrictIsoTimestamp, {
+                    message:
+                        "occurred_at must be a strict ISO-8601 timestamp with an explicit offset",
+                }),
+                state_action: z.enum(["done", "missed", "cleared"]),
+                reason: z.string().max(1000).nullable().optional(),
+                supersedes_intake_id: z.string().uuid().nullable().optional(),
+                idempotency_key: z.string().min(1).max(255),
+            },
+            outputSchema: {
+                intake: z.object(SUPPLEMENT_INTAKE_FACT_OUTPUT_SCHEMA),
+                deduplicated: z.boolean(),
+            },
+        },
+        async ({
+            product_id,
+            alias,
+            product_version,
+            regimen_id,
+            servings,
+            occurred_at,
+            state_action,
+            reason,
+            supersedes_intake_id,
+            idempotency_key,
+        }) => {
+            return withAnalytics(
+                "log_supplement_intake",
+                async () => {
+                    const result = await logSupplementIntake(mealEventsPool, {
+                        user_id: userId,
+                        product_id: product_id ?? null,
+                        alias: alias ?? null,
+                        product_version: product_version ?? null,
+                        regimen_id: regimen_id ?? null,
+                        servings,
+                        occurred_at,
+                        state_action,
+                        reason: reason ?? null,
+                        supersedes_intake_id: supersedes_intake_id ?? null,
+                        idempotency_key,
+                        actor: userId,
+                    }).catch(supplementToolError);
+                    const structuredContent = {
+                        intake: result.intake,
+                        deduplicated: result.deduplicated,
+                    };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "get_supplement_intakes",
+        {
+            title: "Get Supplement Intakes",
+            description:
+                "Read the user's append-only supplement intake history, newest first, with optional product/regimen/time filters. Each fact carries the raw audit state_action (done|missed|cleared) and its public visible_state projection (exactly undefined|done|missed), plus the immutable bound-version nutrient snapshots for done facts. Read-only: derives nothing and writes nothing.",
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                product_id: z.string().uuid().optional(),
+                regimen_id: z.string().uuid().optional(),
+                from: z
+                    .string()
+                    .refine(isStrictIsoTimestamp, {
+                        message:
+                            "from must be a strict ISO-8601 timestamp with an explicit offset",
+                    })
+                    .optional(),
+                to: z
+                    .string()
+                    .refine(isStrictIsoTimestamp, {
+                        message:
+                            "to must be a strict ISO-8601 timestamp with an explicit offset",
+                    })
+                    .optional(),
+                limit: z.number().int().min(1).max(500).optional(),
+            },
+            outputSchema: {
+                intakes: z.array(
+                    z.object(SUPPLEMENT_INTAKE_FACT_OUTPUT_SCHEMA),
+                ),
+            },
+        },
+        async ({ product_id, regimen_id, from, to, limit }) => {
+            return withAnalytics(
+                "get_supplement_intakes",
+                async () => {
+                    const intakes = await getSupplementIntakes(
+                        mealEventsPool,
+                        userId,
+                        {
+                            productId: product_id,
+                            regimenId: regimen_id,
+                            from,
+                            to,
+                            limit,
+                        },
+                    );
+                    const structuredContent = { intakes };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "get_supplement_regimen_status",
+        {
+            title: "Get Supplement Regimen Status",
+            description:
+                "Derive one of the user's supplement regimens' per-occurrence visible state over an inclusive date window (at most 92 days) in the regimen's timezone: each occurrence is exactly undefined (unmarked or cleared), done, or missed, with the latest matching fact's id when one exists. Read-only and purely derived — no occurrence is ever materialized, scheduled, reminded, or marked automatically.",
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                regimen_id: z.string().uuid(),
+                from_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+                to_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+            },
+            outputSchema: REGIMEN_STATUS_OUTPUT_SCHEMA,
+        },
+        async ({ regimen_id, from_date, to_date }) => {
+            return withAnalytics(
+                "get_supplement_regimen_status",
+                async () => {
+                    const result = await getSupplementRegimenStatus(
+                        mealEventsPool,
+                        userId,
+                        regimen_id,
+                        { from_date, to_date },
+                    ).catch(supplementToolError);
+                    const structuredContent = {
+                        regimen: result.regimen,
+                        occurrences: result.occurrences,
                     };
                     return {
                         content: [

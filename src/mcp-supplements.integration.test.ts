@@ -53,7 +53,25 @@ const SUPPLEMENT_TOOL_NAMES = [
     "list_supplement_products",
     "search_supplement_products",
     "revise_supplement_product_label",
+    "create_supplement_regimen",
+    "list_supplement_regimens",
+    "set_supplement_regimen_active",
+    "resolve_supplement_product",
+    "log_supplement_intake",
+    "get_supplement_intakes",
+    "get_supplement_regimen_status",
 ];
+
+// Truthful read/write annotations: reads never write, mutations do.
+const SUPPLEMENT_READ_ONLY_TOOLS = new Set([
+    "get_supplement_product",
+    "list_supplement_products",
+    "search_supplement_products",
+    "list_supplement_regimens",
+    "resolve_supplement_product",
+    "get_supplement_intakes",
+    "get_supplement_regimen_status",
+]);
 
 async function resetSchema(pool: Pool): Promise<void> {
     const client = await pool.connect();
@@ -75,8 +93,10 @@ interface ToolResult {
 
 interface ListedTool {
     name: string;
+    description?: string;
     inputSchema?: Record<string, unknown>;
     outputSchema?: Record<string, unknown>;
+    annotations?: { readOnlyHint?: boolean };
 }
 
 interface ToolContext {
@@ -191,6 +211,24 @@ describeDb("supplement product MCP tools (requires DATABASE_URL_TEST)", () => {
         // Drain fire-and-forget analytics writes before the next reset drops
         // the schema out from under them.
         await flushAnalytics();
+    });
+
+    test("listTools advertises the twelve supplement tools with schemas and truthful annotations", async () => {
+        await withSupplementTools(pool, "u1", async ({ listTools }) => {
+            const tools = await listTools();
+            const byName = new Map(tools.map((t) => [t.name, t]));
+            for (const name of SUPPLEMENT_TOOL_NAMES) {
+                const tool = byName.get(name);
+                expect(tool, `tool ${name} registered`).toBeDefined();
+                expect(tool!.inputSchema).toBeDefined();
+                expect(tool!.outputSchema).toBeDefined();
+                // Truthful annotations: read tools declare readOnlyHint,
+                // mutations do not.
+                expect(tool!.annotations?.readOnlyHint).toBe(
+                    SUPPLEMENT_READ_ONLY_TOOLS.has(name),
+                );
+            }
+        });
     });
 
     test("listTools advertises the five supplement tools with input and output schemas", async () => {
