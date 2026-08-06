@@ -556,10 +556,13 @@ describe("calculation bundle commit seam", () => {
 
     test("rejects bundle with wrong fingerprint even when provided", async () => {
         const bundle = makeBundle();
-        bundle.fingerprint = "bundle:0000000000000000000000000000000000000000000000000000000000000000";
+        bundle.fingerprint =
+            "bundle:0000000000000000000000000000000000000000000000000000000000000000";
         const client = {
             query: async (_sql: string) => {
-                throw new Error("should not reach DB — fingerprint validation fails first");
+                throw new Error(
+                    "should not reach DB — fingerprint validation fails first",
+                );
             },
             release: () => undefined,
         };
