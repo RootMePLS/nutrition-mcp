@@ -651,3 +651,740 @@ describeDb("supplement product MCP tools (requires DATABASE_URL_TEST)", () => {
         });
     });
 });
+
+// ---------------------------------------------------------------------------
+// Slice 5: the seven regimen/intake tools through the real public transport.
+// structuredContent of every success is validated by the SDK against the
+// declared outputSchema automatically — a non-error result is a parsed one.
+// ---------------------------------------------------------------------------
+
+const SLICE_FIVE_TOOL_NAMES = [
+    "create_supplement_regimen",
+    "list_supplement_regimens",
+    "set_supplement_regimen_active",
+    "resolve_supplement_product",
+    "log_supplement_intake",
+    "get_supplement_intakes",
+    "get_supplement_regimen_status",
+];
+
+const DOMAIN_TABLES = [
+    "supplement_products",
+    "supplement_product_versions",
+    "supplement_product_aliases",
+    "supplement_product_nutrients",
+    "supplement_product_label_limits",
+    "supplement_regimens",
+    "supplement_intake_events",
+    "supplement_intake_nutrient_snapshots",
+    "supplement_intake_meal_links",
+    "meal_events",
+    "meal_event_versions",
+    "meal_event_items",
+];
+
+function validRegimenArgs(
+    productId: string,
+    overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+    return {
+        product_id: productId,
+        dose_servings: 1.5,
+        schedule: {
+            timezone: "UTC",
+            frequency: "daily",
+            local_time: "08:00",
+        },
+        starts_on: "2026-08-01",
+        ends_on: null,
+        idempotency_key: `regimen:${crypto.randomUUID()}`,
+        ...overrides,
+    };
+}
+
+function validIntakeArgs(
+    overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+    return {
+        servings: 2,
+        occurred_at: "2026-08-02T08:00:00.000Z",
+        state_action: "done",
+        idempotency_key: `intake:${crypto.randomUUID()}`,
+        ...overrides,
+    };
+}
+
+describeDb(
+    "supplement regimen/intake MCP tools (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await flushAnalytics();
+            await pool.end();
+        });
+
+        beforeEach(async () => {
+            await resetSchema(pool);
+        });
+
+        afterEach(async () => {
+            await flushAnalytics();
+        });
+
+        async function domainCounts(): Promise<Record<string, number>> {
+            const counts: Record<string, number> = {};
+            for (const table of DOMAIN_TABLES) {
+                counts[table] = await tableCount(pool, table);
+            }
+            return counts;
+        }
+
+        async function createProduct(
+            call: ToolContext["call"],
+            overrides: Record<string, unknown> = {},
+        ): Promise<string> {
+            const res = await call(
+                "create_supplement_product",
+                validCreateArgs({
+                    idempotency_key: `product:${crypto.randomUUID()}`,
+                    ...overrides,
+                }),
+            );
+            expect(res.isError).toBeFalsy();
+            return (
+                res.structuredContent as { product: { product_id: string } }
+            ).product.product_id;
+        }
+
+        async function createRegimen(
+            call: ToolContext["call"],
+            productId: string,
+            overrides: Record<string, unknown> = {},
+        ): Promise<string> {
+            const res = await call(
+                "create_supplement_regimen",
+                validRegimenArgs(productId, overrides),
+            );
+            expect(res.isError).toBeFalsy();
+            return (
+                res.structuredContent as { regimen: { regimen_id: string } }
+            ).regimen.regimen_id;
+        }
+
+        test("full vertical path: create regimen, log done/missed/cleared, read history and derived status", async () => {
+            await withSupplementTools(pool, "u1", async ({ call }) => {
+                const productId = await createProduct(call);
+                const regimenId = await createRegimen(call, productId);
+
+                const done = await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({ regimen_id: regimenId }),
+                );
+                expect(done.isError).toBeFalsy();
+                const donePayload = done.structuredContent as {
+                    intake: {
+                        intake_id: string;
+                        regimen_id: string | null;
+                        product_version: number;
+                        visible_state: string;
+                        state_action: string;
+                        nutrient_snapshots: unknown[];
+                    };
+                    deduplicated: boolean;
+                };
+                expect(donePayload.deduplicated).toBe(false);
+                expect(donePayload.intake.regimen_id).toBe(regimenId);
+                expect(donePayload.intake.product_version).toBe(1);
+                expect(donePayload.intake.visible_state).toBe("done");
+                expect(
+                    donePayload.intake.nutrient_snapshots.length,
+                ).toBeGreaterThan(0);
+
+                const missed = await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({
+                        regimen_id: regimenId,
+                        occurred_at: "2026-08-03T08:00:00.000Z",
+                        state_action: "missed",
+                    }),
+                );
+                expect(missed.isError).toBeFalsy();
+
+                const cleared = await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({
+                        regimen_id: regimenId,
+                        occurred_at: "2026-08-04T08:00:00.000Z",
+                        state_action: "cleared",
+                        supersedes_intake_id: donePayload.intake.intake_id,
+                        reason: "logged on the wrong day",
+                    }),
+                );
+                expect(cleared.isError).toBeFalsy();
+
+                const history = await call("get_supplement_intakes", {});
+                expect(history.isError).toBeFalsy();
+                const facts = (
+                    history.structuredContent as {
+                        intakes: {
+                            state_action: string;
+                            visible_state: string;
+                        }[];
+                    }
+                ).intakes;
+                expect(facts).toHaveLength(3);
+                // The public state vocabulary is exactly these three values;
+                // raw cleared appears only as audit state_action.
+                for (const fact of facts) {
+                    expect(["undefined", "done", "missed"]).toContain(
+                        fact.visible_state,
+                    );
+                }
+                expect(facts[0]!.state_action).toBe("cleared");
+                expect(facts[0]!.visible_state).toBe("undefined");
+                expect(facts[1]!.visible_state).toBe("missed");
+                expect(facts[2]!.visible_state).toBe("done");
+
+                const status = await call("get_supplement_regimen_status", {
+                    regimen_id: regimenId,
+                    from_date: "2026-08-01",
+                    to_date: "2026-08-04",
+                });
+                expect(status.isError).toBeFalsy();
+                const occurrences = (
+                    status.structuredContent as {
+                        occurrences: {
+                            local_date: string;
+                            visible_state: string;
+                        }[];
+                    }
+                ).occurrences;
+                expect(
+                    occurrences.map((o) => [o.local_date, o.visible_state]),
+                ).toEqual([
+                    // Nothing auto-marks a due occurrence: 08-01 stays
+                    // undefined even though it is in the past.
+                    ["2026-08-01", "undefined"],
+                    ["2026-08-02", "done"],
+                    ["2026-08-03", "missed"],
+                    ["2026-08-04", "undefined"],
+                ]);
+                for (const o of occurrences) {
+                    expect(["undefined", "done", "missed"]).toContain(
+                        o.visible_state,
+                    );
+                }
+            });
+        });
+
+        test("cross-user isolation: u2 cannot see or mutate u1 regimens/intakes through any new tool", async () => {
+            let u1RegimenId = "";
+            await withSupplementTools(pool, "u1", async ({ call }) => {
+                const productId = await createProduct(call);
+                u1RegimenId = await createRegimen(call, productId);
+                const logged = await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({ regimen_id: u1RegimenId }),
+                );
+                expect(logged.isError).toBeFalsy();
+
+                const u2 = await withSupplementToolsCapture(productId);
+                return u2;
+            });
+
+            async function withSupplementToolsCapture(u1ProductId: string) {
+                await withSupplementTools(pool, "u2", async ({ call }) => {
+                    const list = await call("list_supplement_regimens", {
+                        include_inactive: true,
+                    });
+                    expect(
+                        (list.structuredContent as { regimens: unknown[] })
+                            .regimens,
+                    ).toEqual([]);
+
+                    const status = await call("get_supplement_regimen_status", {
+                        regimen_id: u1RegimenId,
+                        from_date: "2026-08-01",
+                        to_date: "2026-08-03",
+                    });
+                    expect(status.isError).toBe(true);
+                    expect(status.content[0]!.text).toContain(
+                        "supplement_regimen_not_found",
+                    );
+
+                    const intakes = await call("get_supplement_intakes", {});
+                    expect(
+                        (intakes.structuredContent as { intakes: unknown[] })
+                            .intakes,
+                    ).toEqual([]);
+
+                    const resolved = await call("resolve_supplement_product", {
+                        product_id: u1ProductId,
+                    });
+                    expect(
+                        (
+                            resolved.structuredContent as {
+                                resolution_status: string;
+                            }
+                        ).resolution_status,
+                    ).toBe("not_found");
+                    const aliasResolved = await call(
+                        "resolve_supplement_product",
+                        { alias: "MP Whey" },
+                    );
+                    expect(
+                        (
+                            aliasResolved.structuredContent as {
+                                resolution_status: string;
+                            }
+                        ).resolution_status,
+                    ).toBe("not_found");
+
+                    const logDirect = await call(
+                        "log_supplement_intake",
+                        validIntakeArgs({ product_id: u1ProductId }),
+                    );
+                    expect(logDirect.isError).toBe(true);
+                    expect(logDirect.content[0]!.text).toContain(
+                        "supplement_product_not_found",
+                    );
+
+                    const logRegimen = await call(
+                        "log_supplement_intake",
+                        validIntakeArgs({ regimen_id: u1RegimenId }),
+                    );
+                    expect(logRegimen.isError).toBe(true);
+                    expect(logRegimen.content[0]!.text).toContain(
+                        "supplement_regimen_not_found",
+                    );
+
+                    const flip = await call("set_supplement_regimen_active", {
+                        regimen_id: u1RegimenId,
+                        active: false,
+                    });
+                    expect(flip.isError).toBe(true);
+                    expect(flip.content[0]!.text).toContain(
+                        "supplement_regimen_not_found",
+                    );
+
+                    const createReg = await call(
+                        "create_supplement_regimen",
+                        validRegimenArgs(u1ProductId),
+                    );
+                    expect(createReg.isError).toBe(true);
+                    expect(createReg.content[0]!.text).toContain(
+                        "supplement_product_not_found",
+                    );
+                });
+            }
+
+            // u1's rows are untouched by every u2 attempt.
+            const { rows } = await pool.query(
+                `SELECT active FROM supplement_regimens WHERE id = $1`,
+                [u1RegimenId],
+            );
+            expect(rows[0]!.active).toBe(true);
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(1);
+        });
+
+        test("ambiguous alias: resolve returns candidates read-only; log fails with supplement_alias_ambiguous and zero writes", async () => {
+            await withSupplementTools(pool, "u1", async ({ call }) => {
+                await createProduct(call, { aliases: ["shared whey"] });
+                await createProduct(call, {
+                    display_name: "Other Whey",
+                    aliases: ["shared WHEY"],
+                });
+
+                const resolved = await call("resolve_supplement_product", {
+                    alias: "shared whey",
+                });
+                expect(resolved.isError).toBeFalsy();
+                const resolution = resolved.structuredContent as {
+                    resolution_status: string;
+                    candidates: { product_id: string }[];
+                };
+                expect(resolution.resolution_status).toBe("ambiguous");
+                expect(resolution.candidates).toHaveLength(2);
+
+                const before = await domainCounts();
+                const logged = await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({ alias: "shared whey" }),
+                );
+                expect(logged.isError).toBe(true);
+                expect(logged.content[0]!.text).toContain(
+                    "supplement_alias_ambiguous",
+                );
+                expect(await domainCounts()).toEqual(before);
+            });
+        });
+
+        test("malformed payloads are rejected at the schema/handler boundary with zero writes", async () => {
+            await withSupplementTools(pool, "u1", async ({ call }) => {
+                const productId = await createProduct(call);
+                const before = await domainCounts();
+
+                // Schema-level rejections (zod "Invalid arguments").
+                const schemaCases: [string, Record<string, unknown>][] = [
+                    [
+                        "create_supplement_regimen",
+                        validRegimenArgs("not-a-uuid"),
+                    ],
+                    [
+                        "create_supplement_regimen",
+                        validRegimenArgs(productId, {
+                            schedule: {
+                                timezone: "UTC",
+                                frequency: "weekly",
+                                local_time: "08:00",
+                                weekdays: [8],
+                            },
+                        }),
+                    ],
+                    [
+                        "log_supplement_intake",
+                        validIntakeArgs({
+                            product_id: productId,
+                            state_action: "skipped",
+                        }),
+                    ],
+                    [
+                        "log_supplement_intake",
+                        validIntakeArgs({
+                            product_id: productId,
+                            occurred_at: "2026-08-02T08:00:00",
+                        }),
+                    ],
+                    [
+                        "log_supplement_intake",
+                        validIntakeArgs({
+                            product_id: productId,
+                            occurred_at: "2026-08-02T24:00:00.000Z",
+                        }),
+                    ],
+                    [
+                        "log_supplement_intake",
+                        validIntakeArgs({
+                            product_id: productId,
+                            occurred_at: "2026-08-02T08:00:00+15:00",
+                        }),
+                    ],
+                    [
+                        "log_supplement_intake",
+                        validIntakeArgs({
+                            product_id: productId,
+                            servings: -1,
+                        }),
+                    ],
+                    [
+                        "log_supplement_intake",
+                        validIntakeArgs({
+                            product_id: productId,
+                            idempotency_key: "",
+                        }),
+                    ],
+                    [
+                        "get_supplement_regimen_status",
+                        {
+                            regimen_id: productId,
+                            from_date: "2026-08-01",
+                            to_date: "01-08-2026",
+                        },
+                    ],
+                ];
+                for (const [tool, args] of schemaCases) {
+                    const result = await call(tool, args);
+                    expect(result.isError, `${tool} rejects`).toBe(true);
+                    expect(result.content[0]!.text).toContain(
+                        "Invalid arguments",
+                    );
+                }
+
+                // Handler/service-level rejections (stable validation code).
+                const validationCases: [string, Record<string, unknown>][] = [
+                    [
+                        "resolve_supplement_product",
+                        { product_id: productId, alias: "MP Whey" },
+                    ],
+                    ["resolve_supplement_product", {}],
+                    [
+                        "log_supplement_intake",
+                        validIntakeArgs({
+                            product_id: productId,
+                            alias: "MP Whey",
+                        }),
+                    ],
+                    [
+                        "log_supplement_intake",
+                        validIntakeArgs({ product_version: 1 }),
+                    ],
+                    [
+                        "create_supplement_regimen",
+                        validRegimenArgs(productId, {
+                            schedule: {
+                                timezone: "UTC",
+                                frequency: "daily",
+                                local_time: "08:00",
+                                weekdays: [1],
+                            },
+                        }),
+                    ],
+                    [
+                        "create_supplement_regimen",
+                        validRegimenArgs(productId, {
+                            schedule: {
+                                timezone: "Atlantis/North",
+                                frequency: "daily",
+                                local_time: "08:00",
+                            },
+                        }),
+                    ],
+                    [
+                        "get_supplement_regimen_status",
+                        {
+                            regimen_id: productId,
+                            from_date: "2026-01-01",
+                            to_date: "2026-12-31",
+                        },
+                    ],
+                ];
+                for (const [tool, args] of validationCases) {
+                    const result = await call(tool, args);
+                    expect(result.isError, `${tool} rejects`).toBe(true);
+                    expect(result.content[0]!.text).toContain(
+                        "supplement_validation_failed",
+                    );
+                }
+
+                expect(await domainCounts()).toEqual(before);
+            });
+        });
+
+        test("every read-only tool leaves all domain table counts unchanged, including error paths", async () => {
+            await withSupplementTools(pool, "u1", async ({ call }) => {
+                const productId = await createProduct(call);
+                const regimenId = await createRegimen(call, productId);
+                const logged = await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({ regimen_id: regimenId }),
+                );
+                expect(logged.isError).toBeFalsy();
+
+                const before = await domainCounts();
+                await call("list_supplement_regimens", {});
+                await call("list_supplement_regimens", {
+                    include_inactive: true,
+                    product_id: productId,
+                    limit: 5,
+                });
+                await call("resolve_supplement_product", {
+                    product_id: productId,
+                });
+                await call("resolve_supplement_product", {
+                    alias: "no such product",
+                });
+                await call("get_supplement_intakes", {});
+                await call("get_supplement_intakes", {
+                    product_id: productId,
+                    regimen_id: regimenId,
+                    from: "2026-08-01T00:00:00.000Z",
+                    to: "2026-08-31T00:00:00.000Z",
+                    limit: 10,
+                });
+                await call("get_supplement_regimen_status", {
+                    regimen_id: regimenId,
+                    from_date: "2026-08-01",
+                    to_date: "2026-08-05",
+                });
+                // Error paths of read tools write nothing either.
+                await call("get_supplement_regimen_status", {
+                    regimen_id: crypto.randomUUID(),
+                    from_date: "2026-08-01",
+                    to_date: "2026-08-05",
+                });
+                expect(await domainCounts()).toEqual(before);
+            });
+        });
+
+        test("a sports_nutrition done intake through the tool creates zero meal roots and zero links", async () => {
+            await withSupplementTools(pool, "u1", async ({ call }) => {
+                const productId = await createProduct(call); // sports_nutrition
+                const logged = await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({ product_id: productId }),
+                );
+                expect(logged.isError).toBeFalsy();
+                expect(await tableCount(pool, "supplement_intake_events")).toBe(
+                    1,
+                );
+                expect(await tableCount(pool, "meal_events")).toBe(0);
+                expect(await tableCount(pool, "meal_event_versions")).toBe(0);
+                expect(await tableCount(pool, "meal_event_items")).toBe(0);
+                expect(
+                    await tableCount(pool, "supplement_intake_meal_links"),
+                ).toBe(0);
+            });
+        });
+
+        test("replayed mutation calls with the same key deduplicate through the transport", async () => {
+            await withSupplementTools(pool, "u1", async ({ call }) => {
+                const productId = await createProduct(call);
+
+                const regimenArgs = validRegimenArgs(productId, {
+                    idempotency_key: "regimen:replay",
+                });
+                const first = await call(
+                    "create_supplement_regimen",
+                    regimenArgs,
+                );
+                const replay = await call(
+                    "create_supplement_regimen",
+                    regimenArgs,
+                );
+                expect(replay.isError).toBeFalsy();
+                const firstRegimen = (
+                    first.structuredContent as {
+                        regimen: { regimen_id: string };
+                    }
+                ).regimen.regimen_id;
+                const replayPayload = replay.structuredContent as {
+                    regimen: { regimen_id: string };
+                    deduplicated: boolean;
+                };
+                expect(replayPayload.deduplicated).toBe(true);
+                expect(replayPayload.regimen.regimen_id).toBe(firstRegimen);
+                expect(await tableCount(pool, "supplement_regimens")).toBe(1);
+
+                const intakeArgs = validIntakeArgs({
+                    regimen_id: firstRegimen,
+                    idempotency_key: "intake:replay",
+                });
+                const loggedFirst = await call(
+                    "log_supplement_intake",
+                    intakeArgs,
+                );
+                const loggedReplay = await call(
+                    "log_supplement_intake",
+                    intakeArgs,
+                );
+                expect(loggedReplay.isError).toBeFalsy();
+                const replayIntake = loggedReplay.structuredContent as {
+                    intake: { intake_id: string };
+                    deduplicated: boolean;
+                };
+                expect(replayIntake.deduplicated).toBe(true);
+                expect(replayIntake.intake.intake_id).toBe(
+                    (
+                        loggedFirst.structuredContent as {
+                            intake: { intake_id: string };
+                        }
+                    ).intake.intake_id,
+                );
+                expect(await tableCount(pool, "supplement_intake_events")).toBe(
+                    1,
+                );
+                expect(
+                    await tableCount(
+                        pool,
+                        "supplement_intake_nutrient_snapshots",
+                    ),
+                ).toBe(4);
+
+                // Same key, different identity: stable conflict.
+                const conflict = await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({
+                        regimen_id: firstRegimen,
+                        idempotency_key: "intake:replay",
+                        servings: 3,
+                    }),
+                );
+                expect(conflict.isError).toBe(true);
+                expect(conflict.content[0]!.text).toContain(
+                    "idempotency_conflict",
+                );
+            });
+
+            // Analytics recorded the new tools against the same database.
+            await flushAnalytics();
+            const { rows } = await pool.query(
+                `SELECT count(*)::int AS n FROM tool_analytics
+                 WHERE tool_name = 'log_supplement_intake'`,
+            );
+            expect(rows[0]!.n).toBeGreaterThanOrEqual(3);
+        });
+
+        test("inactive regimen logging through the tool fails closed with the stable code", async () => {
+            await withSupplementTools(pool, "u1", async ({ call }) => {
+                const productId = await createProduct(call);
+                const regimenId = await createRegimen(call, productId);
+
+                const deactivated = await call(
+                    "set_supplement_regimen_active",
+                    { regimen_id: regimenId, active: false },
+                );
+                expect(deactivated.isError).toBeFalsy();
+                expect(
+                    (deactivated.structuredContent as { changed: boolean })
+                        .changed,
+                ).toBe(true);
+
+                const repeat = await call("set_supplement_regimen_active", {
+                    regimen_id: regimenId,
+                    active: false,
+                });
+                expect(
+                    (repeat.structuredContent as { changed: boolean }).changed,
+                ).toBe(false);
+
+                const logged = await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({ regimen_id: regimenId }),
+                );
+                expect(logged.isError).toBe(true);
+                expect(logged.content[0]!.text).toContain(
+                    "supplement_regimen_inactive",
+                );
+                expect(await tableCount(pool, "supplement_intake_events")).toBe(
+                    0,
+                );
+
+                // The unique-alias path logs through the public transport.
+                await call("set_supplement_regimen_active", {
+                    regimen_id: regimenId,
+                    active: true,
+                });
+                const byAlias = await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({ alias: "MP Whey" }),
+                );
+                expect(byAlias.isError).toBeFalsy();
+                expect(
+                    (
+                        byAlias.structuredContent as {
+                            intake: { product_id: string };
+                        }
+                    ).intake.product_id,
+                ).toBe(productId);
+            });
+        });
+
+        test("the seven new tool descriptions carry no medical or dosage advice", async () => {
+            await withSupplementTools(pool, "u1", async ({ listTools }) => {
+                const tools = await listTools();
+                const byName = new Map(tools.map((t) => [t.name, t]));
+                for (const name of SLICE_FIVE_TOOL_NAMES) {
+                    const description = byName.get(name)!.description ?? "";
+                    expect(description).not.toMatch(
+                        /dosage advice|should take|recommended dose|consult|interaction/i,
+                    );
+                }
+            });
+        });
+    },
+);
