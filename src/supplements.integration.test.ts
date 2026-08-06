@@ -2262,3 +2262,155 @@ describeDb(
         });
     },
 );
+
+describeDb(
+    "supplement intake idempotency, concurrency, rollback (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await pool.end();
+        });
+
+        beforeEach(async () => {
+            await resetSchema(pool);
+        });
+
+        async function seedProduct(
+            overrides: Record<string, unknown> = {},
+        ): Promise<string> {
+            const result = await createSupplementProduct(
+                pool,
+                validCreateCommand({
+                    idempotency_key: `product:${crypto.randomUUID()}`,
+                    ...overrides,
+                }),
+            );
+            return result.product.product_id;
+        }
+
+        test("same-key same-identity replay (even with a different reason) dedups the original", async () => {
+            const productId = await seedProduct();
+            const command = validIntakeCommand(productId, {
+                idempotency_key: "intake:replay",
+            });
+            const first = await logSupplementIntake(pool, command);
+            // reason is audit metadata, NOT identity: a replay carrying a
+            // different reason still converges on the original fact.
+            const replay = await logSupplementIntake(pool, {
+                ...command,
+                reason: "retry with a note",
+            });
+            expect(replay.deduplicated).toBe(true);
+            expect(replay.intake.intake_id).toBe(first.intake.intake_id);
+            expect(replay.intake.reason).toBeNull();
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(1);
+            expect(
+                await tableCount(pool, "supplement_intake_nutrient_snapshots"),
+            ).toBe(4);
+        });
+
+        test("same key with differing servings/time/action/product is a stable conflict with no second row", async () => {
+            const productId = await seedProduct();
+            const otherProduct = await seedProduct({
+                display_name: "Creatine",
+                aliases: ["creatine"],
+            });
+            await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, {
+                    idempotency_key: "intake:conflict",
+                }),
+            );
+            const variants: Record<string, unknown>[] = [
+                { servings: 1 },
+                { occurred_at: "2026-08-05T09:00:00.000Z" },
+                { state_action: "missed" },
+                { product_id: otherProduct },
+            ];
+            for (const overrides of variants) {
+                await expect(
+                    logSupplementIntake(
+                        pool,
+                        validIntakeCommand(productId, {
+                            idempotency_key: "intake:conflict",
+                            ...overrides,
+                        }),
+                    ),
+                ).rejects.toBeInstanceOf(SupplementIdempotencyConflictError);
+            }
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(1);
+            expect(
+                await tableCount(pool, "supplement_intake_nutrient_snapshots"),
+            ).toBe(4);
+        });
+
+        test("two concurrent same-key same-identity logs converge on one fact and one snapshot set", async () => {
+            const productId = await seedProduct();
+            const command = validIntakeCommand(productId, {
+                idempotency_key: "intake:race",
+            });
+            const results = await Promise.all([
+                logSupplementIntake(pool, command),
+                logSupplementIntake(pool, command),
+            ]);
+            expect(results[0]!.intake.intake_id).toBe(
+                results[1]!.intake.intake_id,
+            );
+            expect(results.filter((r) => r.deduplicated).length).toBe(1);
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(1);
+            expect(
+                await tableCount(pool, "supplement_intake_nutrient_snapshots"),
+            ).toBe(4);
+        });
+
+        test("two concurrent same-key differing-identity logs: one wins, the other gets the stable conflict", async () => {
+            const productId = await seedProduct();
+            const base = validIntakeCommand(productId, {
+                idempotency_key: "intake:race-conflict",
+            });
+            const settled = await Promise.allSettled([
+                logSupplementIntake(pool, base),
+                logSupplementIntake(pool, { ...base, servings: 3 }),
+            ]);
+            const fulfilled = settled.filter((s) => s.status === "fulfilled");
+            const rejected = settled.filter((s) => s.status === "rejected");
+            expect(fulfilled.length).toBe(1);
+            expect(rejected.length).toBe(1);
+            expect(
+                (rejected[0] as PromiseRejectedResult).reason,
+            ).toBeInstanceOf(SupplementIdempotencyConflictError);
+            // Exactly one fact, with exactly one complete snapshot set.
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(1);
+            expect(
+                await tableCount(pool, "supplement_intake_nutrient_snapshots"),
+            ).toBe(4);
+        });
+
+        test("an injected failure after fact+snapshot inserts rolls back everything", async () => {
+            const productId = await seedProduct();
+            await expect(
+                logSupplementIntake(pool, validIntakeCommand(productId), {
+                    beforeCommit: () =>
+                        Promise.reject(new Error("injected rollback")),
+                }),
+            ).rejects.toThrow("injected rollback");
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(0);
+            expect(
+                await tableCount(pool, "supplement_intake_nutrient_snapshots"),
+            ).toBe(0);
+            expect(await tableCount(pool, "supplement_intake_meal_links")).toBe(
+                0,
+            );
+            // The product catalogue rows are untouched.
+            expect(await tableCount(pool, "supplement_products")).toBe(1);
+            expect(await tableCount(pool, "supplement_product_versions")).toBe(
+                1,
+            );
+        });
+    },
+);
