@@ -1301,7 +1301,7 @@ describeDb(
             });
         });
 
-        test("a sports_nutrition done intake through the tool creates zero meal roots and zero links", async () => {
+        test("a sports_nutrition done intake through the tool creates a snack event and a link", async () => {
             await withSupplementTools(pool, "u1", async ({ call }) => {
                 const productId = await createProduct(call); // sports_nutrition
                 const logged = await call(
@@ -1309,15 +1309,71 @@ describeDb(
                     validIntakeArgs({ product_id: productId }),
                 );
                 expect(logged.isError).toBeFalsy();
+                const content = logged.structuredContent as Record<
+                    string,
+                    unknown
+                >;
+                expect(typeof content.snack_event_id).toBe("string");
+                expect(content.snack_version).toBe(1);
                 expect(await tableCount(pool, "supplement_intake_events")).toBe(
                     1,
                 );
-                expect(await tableCount(pool, "meal_events")).toBe(0);
-                expect(await tableCount(pool, "meal_event_versions")).toBe(0);
-                expect(await tableCount(pool, "meal_event_items")).toBe(0);
+                expect(await tableCount(pool, "meal_events")).toBe(1);
+                expect(await tableCount(pool, "meal_event_versions")).toBe(1);
+                expect(await tableCount(pool, "meal_event_items")).toBe(1);
                 expect(
                     await tableCount(pool, "supplement_intake_meal_links"),
-                ).toBe(0);
+                ).toBe(1);
+            });
+        });
+
+        test("the snack event's provenance is publicly re-readable through get_calculation_provenance", async () => {
+            await withSupplementTools(pool, "u1", async ({ call }) => {
+                const productId = await createProduct(call); // sports_nutrition, 120/21/0 + vitamin_d
+                const logged = await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({ product_id: productId }), // servings: 2, done
+                );
+                expect(logged.isError).toBeFalsy();
+                const content = logged.structuredContent as {
+                    snack_event_id: string;
+                    snack_version: number;
+                };
+
+                const prov = await call("get_calculation_provenance", {
+                    event_id: content.snack_event_id,
+                    version: content.snack_version,
+                });
+                expect(prov.isError).toBeFalsy();
+                const payload = prov.structuredContent as {
+                    event_id: string;
+                    version: number;
+                    compatibility: boolean;
+                    bundle_fingerprint: string | null;
+                    providers: Array<{
+                        provider: string;
+                        status: string;
+                        source_id: string | null;
+                        nutrients: Record<string, number | null>;
+                    }>;
+                };
+                expect(payload.event_id).toBe(content.snack_event_id);
+                expect(payload.version).toBe(1);
+                // Label write carries no calculation bundle and says so.
+                expect(payload.compatibility).toBe(true);
+                expect(payload.bundle_fingerprint).toBeNull();
+                expect(payload.providers).toHaveLength(1);
+                const own = payload.providers[0]!;
+                expect(own.provider).toBe("own");
+                expect(own.status).toBe("succeeded");
+                expect(own.source_id).toStartWith("suppl-snack:");
+                // Exact stored label values scaled by 2 servings, zero
+                // preserved, absent nutrients NULL — nothing fabricated on
+                // the public surface.
+                expect(own.nutrients.calories).toBe(240);
+                expect(own.nutrients.protein_g).toBe(42);
+                expect(own.nutrients.fat_g).toBe(0);
+                expect(own.nutrients.carbs_g).toBeNull();
             });
         });
 
