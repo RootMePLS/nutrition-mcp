@@ -5,6 +5,7 @@ import {
     beforeEach,
     describe,
     expect,
+    setSystemTime,
     test,
 } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -244,93 +245,104 @@ describeDb("legacy meal MCP tools use the event projection", () => {
     test.serial(
         "log and all eight legacy reads work through the real MCP transport",
         async () => {
-            await callTools(async (call) => {
-                // Computed, not hardcoded: get_meals_today resolves "today" in
-                // UTC for a profile-less user, so a fixed calendar date makes
-                // this test fail the day after it was written.
-                const day = new Date().toISOString().slice(0, 10);
-                const logged = await call("log_meal", {
-                    description: "oatmeal with banana",
-                    meal_type: "breakfast",
-                    calories: 500,
-                    protein_g: 20,
-                    carbs_g: 80,
-                    fat_g: 10,
-                    fiber_g: 8,
-                    sugar_g: 12,
-                    logged_at: `${day}T08:00:00.000Z`,
-                    idempotency_key: "legacy-mcp-read-regression",
-                });
-                expect(logged.isError).not.toBe(true);
-
-                const byDate = await call("get_meals_by_date", {
-                    date: day,
-                });
-                expect(byDate.isError).not.toBe(true);
-                expect(byDate.content[0]!.text).toContain("oatmeal");
-                expect(byDate.content[0]!.text).toContain("Calories: 500");
-
-                const today = await call("get_meals_today");
-                expect(today.isError).not.toBe(true);
-                expect(today.content[0]!.text).toContain("oatmeal");
-
-                const range = await call("get_meals_by_date_range", {
-                    start_date: day,
-                    end_date: day,
-                });
-                expect(range.isError).not.toBe(true);
-                expect(range.content[0]!.text).toContain(day);
-
-                const summary = await call("get_nutrition_summary", {
-                    start_date: day,
-                    end_date: day,
-                });
-                expect(summary.isError).not.toBe(true);
-                expect(summary.structuredContent?.logged_days).toBe(1);
-                expect(
-                    (summary.structuredContent?.meals as unknown[]).length,
-                ).toBe(1);
-
-                const progress = await call("get_goal_progress", {
-                    date: day,
-                });
-                expect(progress.isError).not.toBe(true);
-                expect(progress.structuredContent?.meal_count).toBe(1);
-
-                const trends = await call("get_trends", {
-                    days: 7,
-                    end_date: day,
-                });
-                expect(trends.isError).not.toBe(true);
-                expect(
-                    (trends.structuredContent?.days as unknown[]).length,
-                ).toBe(30);
-
-                const patterns = await call("get_meal_patterns", {
-                    days: 7,
-                    end_date: day,
-                });
-                expect(patterns.isError).not.toBe(true);
-                expect(patterns.content[0]!.text).toContain("Patterns —");
-
-                const search = await call("search_meals", {
-                    queries: ["oatmeal"],
-                    days: 3650,
-                    limit: 10,
-                });
-                expect(search.isError).not.toBe(true);
-                expect(search.content[0]!.text).toContain("oatmeal");
-            });
-
-            const events = await pool.query(
-                "SELECT count(*)::int AS count FROM meal_events WHERE user_id = $1 AND status = 'active'",
-                ["u1"],
+            // Computed, not hardcoded: get_meals_today resolves "today" in
+            // UTC for a profile-less user, so a fixed calendar date makes
+            // this test fail the day after it was written. Freeze the clock
+            // at noon UTC of the real current day so the sampled `day` and
+            // the server's live "today" cannot diverge if UTC midnight
+            // passes mid-test.
+            const frozenNow = new Date(
+                `${new Date().toISOString().slice(0, 10)}T12:00:00.000Z`,
             );
-            expect(events.rows[0]!.count).toBe(1);
-            const legacy = await pool.query(
-                "SELECT to_regclass('public.meals') AS table_name",
-            );
-            expect(legacy.rows[0]!.table_name).toBeNull();
+            setSystemTime(frozenNow);
+            const day = frozenNow.toISOString().slice(0, 10);
+            try {
+                await callTools(async (call) => {
+                    const logged = await call("log_meal", {
+                        description: "oatmeal with banana",
+                        meal_type: "breakfast",
+                        calories: 500,
+                        protein_g: 20,
+                        carbs_g: 80,
+                        fat_g: 10,
+                        fiber_g: 8,
+                        sugar_g: 12,
+                        logged_at: `${day}T08:00:00.000Z`,
+                        idempotency_key: "legacy-mcp-read-regression",
+                    });
+                    expect(logged.isError).not.toBe(true);
+
+                    const byDate = await call("get_meals_by_date", {
+                        date: day,
+                    });
+                    expect(byDate.isError).not.toBe(true);
+                    expect(byDate.content[0]!.text).toContain("oatmeal");
+                    expect(byDate.content[0]!.text).toContain("Calories: 500");
+
+                    const today = await call("get_meals_today");
+                    expect(today.isError).not.toBe(true);
+                    expect(today.content[0]!.text).toContain("oatmeal");
+
+                    const range = await call("get_meals_by_date_range", {
+                        start_date: day,
+                        end_date: day,
+                    });
+                    expect(range.isError).not.toBe(true);
+                    expect(range.content[0]!.text).toContain(day);
+
+                    const summary = await call("get_nutrition_summary", {
+                        start_date: day,
+                        end_date: day,
+                    });
+                    expect(summary.isError).not.toBe(true);
+                    expect(summary.structuredContent?.logged_days).toBe(1);
+                    expect(
+                        (summary.structuredContent?.meals as unknown[]).length,
+                    ).toBe(1);
+
+                    const progress = await call("get_goal_progress", {
+                        date: day,
+                    });
+                    expect(progress.isError).not.toBe(true);
+                    expect(progress.structuredContent?.meal_count).toBe(1);
+
+                    const trends = await call("get_trends", {
+                        days: 7,
+                        end_date: day,
+                    });
+                    expect(trends.isError).not.toBe(true);
+                    expect(
+                        (trends.structuredContent?.days as unknown[]).length,
+                    ).toBe(30);
+
+                    const patterns = await call("get_meal_patterns", {
+                        days: 7,
+                        end_date: day,
+                    });
+                    expect(patterns.isError).not.toBe(true);
+                    expect(patterns.content[0]!.text).toContain("Patterns —");
+
+                    const search = await call("search_meals", {
+                        queries: ["oatmeal"],
+                        days: 3650,
+                        limit: 10,
+                    });
+                    expect(search.isError).not.toBe(true);
+                    expect(search.content[0]!.text).toContain("oatmeal");
+                });
+
+                const events = await pool.query(
+                    "SELECT count(*)::int AS count FROM meal_events WHERE user_id = $1 AND status = 'active'",
+                    ["u1"],
+                );
+                expect(events.rows[0]!.count).toBe(1);
+                const legacy = await pool.query(
+                    "SELECT to_regclass('public.meals') AS table_name",
+                );
+                expect(legacy.rows[0]!.table_name).toBeNull();
+            } finally {
+                setSystemTime();
+            }
         },
     );
 
