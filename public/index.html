@@ -1,26 +1,24 @@
 <!doctype html>
 <html lang="en">
     <head>
-        <title>
-            Nutrition MCP — AI Meal &amp; Macro Tracker for Claude &amp; ChatGPT
-        </title>
+        <title>Nutrition MCP: AI Meal &amp; Macro Tracker MCP Server</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta charset="utf-8" />
         <meta
             name="description"
-            content="Track meals, macros, weight, and nutrition history through conversation with Claude or ChatGPT. Free MCP server for AI-powered food logging, barcode scanning, calorie counting, weight tracking, and diet tracking."
+            content="Track meals, macros, weight, and nutrition history through conversation with an AI assistant. Free MCP server for AI-powered food logging, barcode scanning, calorie counting, weight tracking, and diet tracking."
         />
         <meta
             name="keywords"
-            content="nutrition tracker, meal tracker, MCP server, Claude AI, ChatGPT, calorie counter, macro tracker, barcode scanner, food logging, diet tracker, weight tracker, weight log, AI nutrition, Model Context Protocol"
+            content="nutrition tracker, meal tracker, MCP server, calorie counter, macro tracker, barcode scanner, food logging, diet tracker, weight tracker, weight log, AI nutrition, Model Context Protocol"
         />
         <meta
             property="og:title"
-            content="Nutrition MCP — AI Meal &amp; Macro Tracker for Claude &amp; ChatGPT"
+            content="Nutrition MCP: AI Meal &amp; Macro Tracker MCP Server"
         />
         <meta
             property="og:description"
-            content="Track meals, macros, weight, and nutrition history through conversation with Claude or ChatGPT. Free MCP server for AI-powered food logging, barcode scanning, and weight tracking."
+            content="Track meals, macros, weight, and nutrition history through conversation with an AI assistant. Free MCP server for AI-powered food logging, barcode scanning, and weight tracking."
         />
         <meta property="og:type" content="website" />
         <meta property="og:url" content="https://nutrition-mcp.com" />
@@ -31,11 +29,11 @@
         <meta name="twitter:image" content="https://nutrition-mcp.com/og.png" />
         <meta
             name="twitter:title"
-            content="Nutrition MCP — AI Meal &amp; Macro Tracker for Claude &amp; ChatGPT"
+            content="Nutrition MCP: AI Meal &amp; Macro Tracker MCP Server"
         />
         <meta
             name="twitter:description"
-            content="Track meals, macros, weight, and nutrition history through conversation with Claude or ChatGPT. Free MCP server for AI-powered food logging, barcode scanning, and weight tracking."
+            content="Track meals, macros, weight, and nutrition history through conversation with an AI assistant. Free MCP server for AI-powered food logging, barcode scanning, and weight tracking."
         />
         <link rel="canonical" href="https://nutrition-mcp.com" />
         <link rel="icon" href="/favicon.ico" />
@@ -46,7 +44,7 @@
                 "@context": "https://schema.org",
                 "@type": "SoftwareApplication",
                 "name": "Nutrition MCP",
-                "description": "Track meals, macros, weight, and nutrition history through conversation with Claude or ChatGPT. Free MCP server for AI-powered food logging, barcode scanning, calorie counting, weight tracking, and diet tracking.",
+                "description": "Track meals, macros, weight, and nutrition history through conversation with an AI assistant. Free MCP server for AI-powered food logging, barcode scanning, calorie counting, weight tracking, and diet tracking.",
                 "url": "https://nutrition-mcp.com",
                 "applicationCategory": "HealthApplication",
                 "operatingSystem": "Any",
@@ -67,7 +65,7 @@
                         "name": "What is Nutrition MCP?",
                         "acceptedAnswer": {
                             "@type": "Answer",
-                            "text": "Nutrition MCP is a free Model Context Protocol (MCP) server that lets you track meals, calories, macros, and nutrition history through natural conversation with Claude or ChatGPT. Instead of typing into a traditional app, you tell your AI what you ate and it logs everything for you."
+                            "text": "Nutrition MCP is a free Model Context Protocol (MCP) server that lets you track meals, calories, macros, and nutrition history through natural conversation with an AI assistant. Instead of typing into a traditional app, you tell your AI what you ate and it logs everything for you."
                         }
                     },
                     {
@@ -107,7 +105,7 @@
                         "name": "Is Nutrition MCP free?",
                         "acceptedAnswer": {
                             "@type": "Answer",
-                            "text": "Yes, it is completely free — no premium tiers, ads, or hidden costs. You just need a Claude or ChatGPT account to connect. Donations on Patreon help cover server costs."
+                            "text": "The server does not charge a fee. Connection depends on your client's support for unauthenticated remote HTTP MCP servers; check your client's documentation. Donations on Patreon help cover server costs."
                         }
                     },
                     {
@@ -228,8 +226,9 @@
                             Track your nutrition by <em>talking</em> to your AI.
                         </h1>
                         <p class="lead">
-                            Connect Claude or ChatGPT, then just say what you
-                            ate. Calories and macros, logged automatically.
+                            Connect a client that supports unauthenticated
+                            remote HTTP MCP, then just say what you ate.
+                            Calories and macros, logged automatically.
                         </p>
                         <div class="hero-actions">
                             <a class="btn btn-primary" href="#install"
@@ -594,8 +593,8 @@
                             ></span>
                             <h3>1 · Connect once</h3>
                             <p>
-                                Works with any AI client that supports remote
-                                MCP servers — Claude, ChatGPT, and more. No
+                                Connect from a client that supports
+                                unauthenticated remote HTTP MCP servers. No
                                 install, no API keys.
                             </p>
                         </div>
@@ -690,78 +689,16 @@
                             <div class="tab-panel panel-claude">
                                 <ol class="steps">
                                     <li>
-                                        Open <strong>Claude</strong> (web or
-                                        desktop) and click
-                                        <strong>Customize</strong> in the
-                                        top-left corner.
-                                    </li>
-                                    <li>Click <strong>Connectors</strong>.</li>
-                                    <li>
-                                        Click <strong>+</strong>, then
-                                        <strong>Add custom connector</strong>.
+                                        Check
+                                        <strong>Claude's documentation</strong>
+                                        for whether your plan and app version
+                                        support adding unauthenticated remote
+                                        HTTP MCP servers, and follow its current
+                                        steps to add one.
                                     </li>
                                     <li>
-                                        Give it a name, for example
-                                        <strong>Nutrition</strong>.
-                                    </li>
-                                    <li>
-                                        Paste
-                                        <span class="copy-url"
-                                            ><code
-                                                >https://nutrition-mcp.com/mcp</code
-                                            ><button
-                                                class="copy-mini"
-                                                type="button"
-                                                data-copy="https://nutrition-mcp.com/mcp"
-                                                aria-label="Copy server URL"
-                                            >
-                                                <i
-                                                    class="fa-solid fa-copy"
-                                                ></i></button
-                                        ></span>
-                                        into the
-                                        <strong>Remote MCP server URL</strong>
-                                        field.
-                                    </li>
-                                    <li>Click <strong>Add</strong>.</li>
-                                    <li>
-                                        Click <strong>Connect</strong>. There is
-                                        no login page or sign-in: this checkout
-                                        has no account or authentication layer.
-                                    </li>
-                                    <li>
-                                        Done. It works right away and shows up
-                                        in your iOS and Android apps
-                                        automatically.
-                                    </li>
-                                </ol>
-                                <p class="note">
-                                    Works on every Claude plan. The free plan
-                                    allows one connected MCP server at a time.
-                                </p>
-                            </div>
-
-                            <div class="tab-panel panel-chatgpt">
-                                <ol class="steps">
-                                    <li>
-                                        Open
-                                        <strong>ChatGPT on the web</strong> →
-                                        <strong>Settings</strong> →
-                                        <strong>Apps</strong>.
-                                    </li>
-                                    <li>
-                                        Click <strong>Create app</strong> at the
-                                        bottom of the popup. If you don't see
-                                        it, turn on
-                                        <strong>Developer mode</strong> in
-                                        <strong>Advanced settings</strong>.
-                                    </li>
-                                    <li>
-                                        Give it a name, for example
-                                        <strong>Nutrition</strong>.
-                                    </li>
-                                    <li>
-                                        For <strong>Connection</strong>, paste
+                                        If your Claude setup supports it, the
+                                        server URL to enter is
                                         <span class="copy-url"
                                             ><code
                                                 >https://nutrition-mcp.com/mcp</code
@@ -777,31 +714,54 @@
                                         >.
                                     </li>
                                     <li>
-                                        For <strong>Authentication</strong>,
-                                        select the option for no authentication:
-                                        this server does not implement OAuth,
-                                        accounts, or authorization codes.
-                                    </li>
-                                    <li>
-                                        Check
-                                        <strong
-                                            >"I understand and want to
-                                            continue"</strong
-                                        >.
-                                    </li>
-                                    <li>Click <strong>Create</strong>.</li>
-                                    <li>
-                                        Start logging by saying what you ate.
-                                        There is no sign-in step: this checkout
-                                        has no login page, accounts, or
-                                        passwords.
-                                    </li>
-                                    <li>
-                                        Done. It works right away and shows up
-                                        in your iOS and Android apps
-                                        automatically.
+                                        There is no login page or sign-in: this
+                                        checkout has no account or
+                                        authentication layer.
                                     </li>
                                 </ol>
+                                <p class="note">
+                                    Whether Claude connects, and on which plans,
+                                    is described in Claude's own documentation.
+                                </p>
+                            </div>
+
+                            <div class="tab-panel panel-chatgpt">
+                                <ol class="steps">
+                                    <li>
+                                        Check
+                                        <strong>ChatGPT's documentation</strong>
+                                        for whether your plan and app version
+                                        support connecting to unauthenticated
+                                        remote MCP servers, and follow its
+                                        current steps to add one.
+                                    </li>
+                                    <li>
+                                        If your ChatGPT setup supports it, the
+                                        endpoint to enter is
+                                        <span class="copy-url"
+                                            ><code
+                                                >https://nutrition-mcp.com/mcp</code
+                                            ><button
+                                                class="copy-mini"
+                                                type="button"
+                                                data-copy="https://nutrition-mcp.com/mcp"
+                                                aria-label="Copy server URL"
+                                            >
+                                                <i
+                                                    class="fa-solid fa-copy"
+                                                ></i></button></span
+                                        >.
+                                    </li>
+                                    <li>
+                                        This server does not implement OAuth,
+                                        accounts, or authorization codes; there
+                                        is no sign-in step.
+                                    </li>
+                                </ol>
+                                <p class="note">
+                                    Whether ChatGPT connects is described in
+                                    ChatGPT's documentation.
+                                </p>
                             </div>
 
                             <div class="tab-panel panel-other">
@@ -814,18 +774,14 @@
   }
 }</pre>
                                 <p class="note">
-                                    Add the config above to your client (Cursor,
-                                    VS Code, Claude Code, and more). Windsurf
-                                    uses
-                                    <code>serverUrl</code> instead of
-                                    <code>url</code>. In Claude Code, run
-                                    <code
-                                        >claude mcp add --transport http
-                                        nutrition
-                                        https://nutrition-mcp.com/mcp</code
-                                    >. There is no login step: this checkout
-                                    does not implement OAuth, accounts, access
-                                    or refresh tokens, or authorization codes.
+                                    Add the config above to your MCP client's
+                                    configuration if the client supports
+                                    unauthenticated remote HTTP MCP servers.
+                                    Setting names and file locations vary by
+                                    client; check your client's documentation.
+                                    There is no login step: this checkout does
+                                    not implement OAuth, accounts, access or
+                                    refresh tokens, or authorization codes.
                                 </p>
                             </div>
                         </div>
@@ -2586,7 +2542,8 @@
                                 </li>
                                 <li>
                                     <i class="fa-solid fa-circle-check"></i>
-                                    Works inside Claude or ChatGPT, free
+                                    Free; connect from a client that supports
+                                    unauthenticated remote HTTP MCP
                                 </li>
                                 <li>
                                     <i class="fa-solid fa-circle-check"></i> Ask
@@ -2682,8 +2639,8 @@
                 <div class="container cta-inner">
                     <h2 class="cta-title">Start tracking in under a minute.</h2>
                     <p class="cta-sub">
-                        Free and open source — it works with the AI you already
-                        use.
+                        Free and open source. Connect from a client that
+                        supports unauthenticated remote HTTP MCP.
                     </p>
                     <div class="cta-actions">
                         <a class="btn btn-on-accent" href="#install"
@@ -2747,7 +2704,7 @@
                                 Nutrition MCP is a free Model Context Protocol
                                 (MCP) server that lets you track meals,
                                 calories, macros, and nutrition history through
-                                natural conversation with Claude or ChatGPT.
+                                natural conversation with an AI assistant.
                                 Instead of typing into a traditional app, you
                                 tell your AI what you ate and it logs everything
                                 for you.
@@ -2813,10 +2770,11 @@
                         <details>
                             <summary>Is Nutrition MCP free?</summary>
                             <p>
-                                Yes, it is completely free — no premium tiers,
-                                ads, or hidden costs. You just need a Claude or
-                                ChatGPT account to connect. Donations on Patreon
-                                help cover server costs.
+                                The server does not charge a fee. Connection
+                                depends on your client's support for
+                                unauthenticated remote HTTP MCP servers; check
+                                your client's documentation. Donations on
+                                Patreon help cover server costs.
                             </p>
                         </details>
                         <details>

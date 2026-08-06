@@ -2,21 +2,21 @@
 <html lang="en">
     <head>
         <title>
-            Lose It! MCP Server? Track Nutrition in Claude &amp; ChatGPT
+            Lose It! MCP Server? Track Nutrition by Talking to Your AI
         </title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta charset="utf-8" />
         <meta
             name="description"
-            content="No MCP server for Lose It!? Nutrition MCP logs meals and macros inside Claude or ChatGPT — free, open source, and it imports your CSV export."
+            content="No MCP server for Lose It!? Nutrition MCP logs meals and macros by conversation with your AI. Free, open source, and it imports your CSV export."
         />
         <meta
             property="og:title"
-            content="Lose It! MCP Server? Track Nutrition in Claude &amp; ChatGPT"
+            content="Lose It! MCP Server? Track Nutrition by Talking to Your AI"
         />
         <meta
             property="og:description"
-            content="Lose It! has no MCP server. Nutrition MCP is a free, open-source alternative that logs meals, macros, and weight in Claude or ChatGPT — and imports your Lose It! history from a CSV export."
+            content="Lose It! has no MCP server. Nutrition MCP is a free, open-source alternative that logs meals, macros, and weight by conversation with your AI, and it imports your Lose It! history from a CSV export."
         />
         <meta property="og:type" content="article" />
         <meta
@@ -30,11 +30,11 @@
         <meta name="twitter:image" content="https://nutrition-mcp.com/og.png" />
         <meta
             name="twitter:title"
-            content="Lose It! MCP Server? Track Nutrition in Claude &amp; ChatGPT"
+            content="Lose It! MCP Server? Track Nutrition by Talking to Your AI"
         />
         <meta
             name="twitter:description"
-            content="Lose It! has no MCP server. Nutrition MCP is a free, open-source alternative that logs meals, macros, and weight in Claude or ChatGPT — and imports your Lose It! history from a CSV export."
+            content="Lose It! has no MCP server. Nutrition MCP is a free, open-source alternative that logs meals, macros, and weight by conversation with your AI, and it imports your Lose It! history from a CSV export."
         />
         <link rel="canonical" href="https://nutrition-mcp.com/lose-it-mcp" />
         <link rel="icon" href="/favicon.ico" />
@@ -76,7 +76,7 @@
                         "name": "Does Lose It! have an MCP server?",
                         "acceptedAnswer": {
                             "@type": "Answer",
-                            "text": "No. Lose It! does not offer a Model Context Protocol (MCP) server, so there is no official way to connect it to Claude, ChatGPT, or other AI assistants. Nutrition MCP is a free, open-source alternative built as an MCP server from the ground up, so you can log meals and macros directly inside your AI."
+                            "text": "No. Lose It! does not offer a Model Context Protocol (MCP) server, so there is no official way to connect it to Claude, ChatGPT, or other AI assistants. Nutrition MCP is a free, open-source alternative built as an MCP server from the ground up; whether your AI assistant can connect to it depends on its support for unauthenticated remote HTTP MCP servers."
                         }
                     },
                     {
@@ -84,7 +84,7 @@
                         "name": "How do I connect Lose It! to Claude?",
                         "acceptedAnswer": {
                             "@type": "Answer",
-                            "text": "There is no official Lose It! connector for Claude, because Lose It! has no MCP server or public MCP integration. The closest option is Nutrition MCP, a free MCP server: add https://nutrition-mcp.com/mcp as a custom connector in Claude and start logging by conversation. There is no sign-in step."
+                            "text": "There is no official Lose It! connector for Claude, because Lose It! has no MCP server or public MCP integration. Nutrition MCP is a free MCP server: the endpoint is https://nutrition-mcp.com/mcp and there is no sign-in step. Check your client's documentation for unauthenticated remote-server support."
                         }
                     },
                     {
@@ -132,7 +132,7 @@
                         "name": "Is Nutrition MCP free?",
                         "acceptedAnswer": {
                             "@type": "Answer",
-                            "text": "Yes. Nutrition MCP is completely free with no premium tier, ads, or paywalled features — unlike apps that put some features behind a subscription. You only need a Claude or ChatGPT account to connect."
+                            "text": "Yes. Nutrition MCP is completely free with no premium tier, ads, or paywalled features — unlike apps that put some features behind a subscription. The server has no Nutrition MCP account or sign-in step; connection depends on your client's support for unauthenticated remote HTTP MCP servers."
                         }
                     }
                 ]
@@ -231,10 +231,11 @@
                             Looking for a <em>Lose It! MCP</em> server?
                         </h1>
                         <p class="lead">
-                            Lose It! doesn't have one — so you can't use it
-                            inside Claude or ChatGPT. Nutrition MCP does the
-                            same job by conversation, and it's free and open
-                            source.
+                            Lose It! doesn't have one. Nutrition MCP is a free,
+                            open-source MCP server that does the same job by
+                            conversation with your AI; connection depends on
+                            your client's support for unauthenticated remote
+                            HTTP MCP servers.
                         </p>
                         <div class="hero-actions">
                             <a class="btn btn-primary" href="#switch"
@@ -394,8 +395,9 @@
                             <ul>
                                 <li>
                                     <i class="fa-solid fa-circle-check"></i>
-                                    Built as an MCP server — lives inside Claude
-                                    &amp; ChatGPT
+                                    Built as an MCP server; connection depends
+                                    on the client's support for unauthenticated
+                                    remote HTTP MCP
                                 </li>
                                 <li>
                                     <i class="fa-solid fa-circle-check"></i>
@@ -417,7 +419,7 @@
                     <p class="note compare-note">
                         Lose It! is a friendly calorie counter. Nutrition MCP
                         does the same core logging by conversation, free,
-                        without ever leaving Claude or ChatGPT.
+                        without ever leaving your AI chat.
                     </p>
                 </div>
             </section>
@@ -530,17 +532,14 @@
                     <div class="card install-card">
                         <ol class="steps">
                             <li>
-                                Open <strong>Claude</strong> (web or desktop)
-                                and click <strong>Customize</strong> →
-                                <strong>Connectors</strong>.
+                                Check your AI client's documentation for whether
+                                it supports unauthenticated remote HTTP MCP
+                                servers, and follow its current steps to add
+                                one.
                             </li>
                             <li>
-                                Click <strong>+</strong>, then
-                                <strong>Add custom connector</strong>, and give
-                                it a name like <strong>Nutrition</strong>.
-                            </li>
-                            <li>
-                                Paste
+                                If your client supports them, the endpoint to
+                                enter is
                                 <span class="copy-url"
                                     ><code>https://nutrition-mcp.com/mcp</code
                                     ><button
@@ -551,20 +550,18 @@
                                     >
                                         <i class="fa-solid fa-copy"></i></button
                                 ></span>
-                                into the
-                                <strong>Remote MCP server URL</strong> field and
-                                click <strong>Add</strong>.
+                                .
                             </li>
                             <li>
-                                Click <strong>Connect</strong> and start logging
-                                by saying what you ate. There is no sign-in
-                                step.
+                                There is no sign-in step: the server has no
+                                account or authentication layer.
                             </li>
                         </ol>
                         <p class="note">
-                            Using ChatGPT or another client instead? The
-                            <a href="/#install">full install guide</a> covers
-                            ChatGPT, Cursor, VS Code, Claude Code, and more.
+                            Connection depends on your client. The
+                            <a href="/#install">full install guide</a> lists the
+                            same endpoint and what to check in your client's
+                            documentation.
                         </p>
                     </div>
                 </div>
@@ -588,8 +585,9 @@
                                 way to connect it to Claude, ChatGPT, or other
                                 AI assistants. Nutrition MCP is a free,
                                 open-source alternative built as an MCP server
-                                from the ground up, so you can log meals and
-                                macros directly inside your AI.
+                                from the ground up; whether your AI assistant
+                                can connect to it depends on its support for
+                                unauthenticated remote HTTP MCP servers.
                             </p>
                         </details>
                         <details>
@@ -599,11 +597,11 @@
                             <p>
                                 There is no official Lose It! connector for
                                 Claude, because Lose It! has no MCP server or
-                                public MCP integration. The closest option is
-                                Nutrition MCP, a free MCP server: add
-                                https://nutrition-mcp.com/mcp as a custom
-                                connector in Claude and start logging by
-                                conversation. There is no sign-in step.
+                                public MCP integration. Nutrition MCP is a free
+                                MCP server: the endpoint is
+                                https://nutrition-mcp.com/mcp and there is no
+                                sign-in step. Check your client's documentation
+                                for unauthenticated remote-server support.
                             </p>
                         </details>
                         <details>
@@ -697,8 +695,10 @@
                                 Yes. Nutrition MCP is completely free with no
                                 premium tier, ads, or paywalled features —
                                 unlike apps that put some features behind a
-                                subscription. You only need a Claude or ChatGPT
-                                account to connect.
+                                subscription. The server has no Nutrition MCP
+                                account or sign-in step; connection depends on
+                                your client's support for unauthenticated remote
+                                HTTP MCP servers.
                             </p>
                         </details>
                     </div>

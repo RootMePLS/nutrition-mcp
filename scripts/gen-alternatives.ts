@@ -88,7 +88,7 @@ const APPS: App[] = [
             body: [
                 "MyFitnessPal built its following on one of the largest food databases anywhere — tens of millions of crowd-sourced entries. That scale is also its friction: for any given food you scroll past near-duplicates and have to guess which entry is accurate. Conversational logging skips the lookup entirely — you describe the food and your AI estimates the macros.",
                 "You don't have to leave the diary behind to do it: a MyFitnessPal CSV export imports directly, quirks and all, so the years you've already logged come with you. Everything you record from then on is yours to export as CSV whenever you want.",
-                "The features MyFitnessPal gradually moved behind Premium — barcode scanning, macros by gram, no ads — are simply included here. You're not weighing a free tier against a $20-a-month upgrade; there's one free, open-source tier, and the only account you need is the Claude or ChatGPT one you already have.",
+                "The features MyFitnessPal gradually moved behind Premium — barcode scanning, macros by gram, no ads — are simply included here. You're not weighing a free tier against a $20-a-month upgrade; there's one free, open-source tier. The server has no Nutrition MCP account or sign-in step; connection depends on your client's support for unauthenticated remote HTTP MCP servers.",
             ],
         },
         importSection: {
@@ -161,14 +161,14 @@ const APPS: App[] = [
         file: "lose-it.html",
         icon: "fa-bullseye",
         hubBlurb:
-            "No MCP server. Log meals by talking to Claude or ChatGPT instead — free.",
+            "No MCP server. Log meals by talking to your AI instead, for free.",
         cons: [
             "No MCP server — can't run inside Claude or ChatGPT",
             "Search and log each item by hand",
             "Some features, like photo logging, need a paid plan",
             "Another app, another account, ads on the free tier",
         ],
-        note: "Lose It! is a friendly calorie counter. Nutrition MCP does the same core logging by conversation, free, without ever leaving Claude or ChatGPT.",
+        note: "Lose It! is a friendly calorie counter. Nutrition MCP does the same core logging by conversation, free, without ever leaving your AI chat.",
         migrate: {
             title: "The same simplicity, minus the app",
             body: [
@@ -237,11 +237,11 @@ const APPS: App[] = [
             },
             {
                 q: "Is Nutrition MCP really free when MacroFactor is subscription-only?",
-                a: "Yes. Nutrition MCP is completely free and open source, with no trial-then-pay and no free-tier limits — unlike MacroFactor, which has no free tier and requires a subscription after its trial. You only need a Claude or ChatGPT account.",
+                a: "Yes. Nutrition MCP is completely free and open source, with no trial-then-pay and no free-tier limits — unlike MacroFactor, which has no free tier and requires a subscription after its trial. The server has no Nutrition MCP account or sign-in step; connection depends on your client's support for unauthenticated remote HTTP MCP servers.",
             },
         ],
         freeAnswer:
-            "Yes. Nutrition MCP is completely free and open source, with no subscription — whereas MacroFactor requires a paid subscription after its free trial. You just need a Claude or ChatGPT account to connect.",
+            "Yes. Nutrition MCP is completely free and open source, with no subscription — whereas MacroFactor requires a paid subscription after its free trial. The server has no Nutrition MCP account or sign-in step; connection depends on your client's support for unauthenticated remote HTTP MCP servers.",
     },
     {
         name: "Yazio",
@@ -256,7 +256,7 @@ const APPS: App[] = [
             "Some features, like meal plans, need a paid PRO plan",
             "A separate app and account to manage",
         ],
-        note: "Yazio is a polished tracker with good meal plans. Nutrition MCP focuses on effortless conversational logging that lives inside Claude or ChatGPT — free and open source.",
+        note: "Yazio is a polished tracker with good meal plans. Nutrition MCP focuses on effortless conversational logging that lives inside your AI chat, free and open source.",
         migrate: {
             title: "Plans on one side, logging on the other",
             body: [
@@ -292,7 +292,7 @@ const APPS: App[] = [
         file: "lifesum.html",
         icon: "fa-leaf",
         hubBlurb:
-            "No MCP server. A leaner, free way to log food inside Claude or ChatGPT.",
+            "No MCP server. A leaner, free way to log food by talking to your AI.",
         cons: [
             "No MCP server — can't run inside Claude or ChatGPT",
             "Log foods by searching its database one by one",
@@ -325,7 +325,7 @@ const APPS: App[] = [
             },
             {
                 q: "Is Nutrition MCP free without a Lifesum Premium-style plan?",
-                a: "Yes. Nutrition MCP is completely free and open source, with no premium tier — whereas Lifesum puts diet plans and some tracking features behind a Premium subscription. You only need a Claude or ChatGPT account to connect.",
+                a: "Yes. Nutrition MCP is completely free and open source, with no premium tier — whereas Lifesum puts diet plans and some tracking features behind a Premium subscription. The server has no Nutrition MCP account or sign-in step; connection depends on your client's support for unauthenticated remote HTTP MCP servers.",
             },
         ],
     },
@@ -601,17 +601,14 @@ const FEATURES = `                    <div class="features-grid">
 const INSTALL = `                    <div class="card install-card">
                         <ol class="steps">
                             <li>
-                                Open <strong>Claude</strong> (web or desktop) and
-                                click <strong>Customize</strong> →
-                                <strong>Connectors</strong>.
+                                Check your AI client's documentation for whether
+                                it supports unauthenticated remote HTTP MCP
+                                servers, and follow its current steps to add
+                                one.
                             </li>
                             <li>
-                                Click <strong>+</strong>, then
-                                <strong>Add custom connector</strong>, and give it
-                                a name like <strong>Nutrition</strong>.
-                            </li>
-                            <li>
-                                Paste
+                                If your client supports them, the endpoint to
+                                enter is
                                 <span class="copy-url"
                                     ><code>https://nutrition-mcp.com/mcp</code
                                     ><button
@@ -622,26 +619,24 @@ const INSTALL = `                    <div class="card install-card">
                                     >
                                         <i class="fa-solid fa-copy"></i></button
                                 ></span>
-                                into the
-                                <strong>Remote MCP server URL</strong> field and
-                                click <strong>Add</strong>.
+                                .
                             </li>
                             <li>
-                                Click <strong>Connect</strong> and start logging
-                                by saying what you ate. There is no sign-in
-                                step.
+                                There is no sign-in step: the server has no
+                                account or authentication layer.
                             </li>
                         </ol>
                         <p class="note">
-                            Using ChatGPT or another client instead? The
-                            <a href="/#install">full install guide</a> covers
-                            ChatGPT, Cursor, VS Code, Claude Code, and more.
+                            Connection depends on your client. The
+                            <a href="/#install">full install guide</a> lists the
+                            same endpoint and what to check in your client's
+                            documentation.
                         </p>
                     </div>`;
 
 // The Nutrition MCP (right) column of the comparison is identical everywhere.
 const PROS = [
-    "Built as an MCP server — lives inside Claude &amp; ChatGPT",
+    "Built as an MCP server; connection depends on the client's support for unauthenticated remote HTTP MCP",
     "Describe meals in plain language; calories, macros, fiber &amp; sugar estimated for you",
     "Barcode scanning, trends, CSV import &amp; export — all free",
     "No separate app, no ads, open source",
@@ -663,11 +658,11 @@ function faqsFor(app: App): { q: string; a: string }[] {
     return [
         {
             q: `Does ${app.name} have an MCP server?`,
-            a: `No. ${app.name} does not offer a Model Context Protocol (MCP) server, so there is no official way to connect it to Claude, ChatGPT, or other AI assistants. Nutrition MCP is a free, open-source alternative built as an MCP server from the ground up, so you can log meals and macros directly inside your AI.`,
+            a: `No. ${app.name} does not offer a Model Context Protocol (MCP) server, so there is no official way to connect it to Claude, ChatGPT, or other AI assistants. Nutrition MCP is a free, open-source alternative built as an MCP server from the ground up; whether your AI assistant can connect to it depends on its support for unauthenticated remote HTTP MCP servers.`,
         },
         {
             q: `How do I connect ${app.name} to Claude?`,
-            a: `There is no official ${app.name} connector for Claude, because ${app.name} has no MCP server or public MCP integration. The closest option is Nutrition MCP, a free MCP server: add https://nutrition-mcp.com/mcp as a custom connector in Claude and start logging by conversation. There is no sign-in step.`,
+            a: `There is no official ${app.name} connector for Claude, because ${app.name} has no MCP server or public MCP integration. Nutrition MCP is a free MCP server: the endpoint is https://nutrition-mcp.com/mcp and there is no sign-in step. Check your client's documentation for unauthenticated remote-server support.`,
         },
         ...app.extraFaqs,
         {
@@ -686,7 +681,7 @@ function faqsFor(app: App): { q: string; a: string }[] {
             q: `Is Nutrition MCP free?`,
             a:
                 app.freeAnswer ??
-                `Yes. Nutrition MCP is completely free with no premium tier, ads, or paywalled features — unlike apps that put some features behind a subscription. You only need a Claude or ChatGPT account to connect.`,
+                `Yes. Nutrition MCP is completely free with no premium tier, ads, or paywalled features — unlike apps that put some features behind a subscription. The server has no Nutrition MCP account or sign-in step; connection depends on your client's support for unauthenticated remote HTTP MCP servers.`,
         },
     ];
 }
@@ -716,9 +711,9 @@ function renderApp(app: App): string {
     // that head term would cost more than an import keyword gains. The
     // description is a click-through lever rather than a ranking one, so it does
     // carry import — abandoning logged history is the top objection to switching.
-    const desc = `No MCP server for ${app.name}? Nutrition MCP logs meals and macros inside Claude or ChatGPT — free, open source, and it imports your CSV export.`;
-    const ogDesc = `${app.name} has no MCP server. Nutrition MCP is a free, open-source alternative that logs meals, macros, and weight in Claude or ChatGPT — and imports your ${app.name} history from a CSV export.`;
-    const title = `${app.name} MCP Server? Track Nutrition in Claude & ChatGPT`;
+    const desc = `No MCP server for ${app.name}? Nutrition MCP logs meals and macros by conversation with your AI. Free, open source, and it imports your CSV export.`;
+    const ogDesc = `${app.name} has no MCP server. Nutrition MCP is a free, open-source alternative that logs meals, macros, and weight by conversation with your AI, and it imports your ${app.name} history from a CSV export.`;
+    const title = `${app.name} MCP Server? Track Nutrition by Talking to Your AI`;
     const faqs = faqsFor(app);
 
     const breadcrumb = {
@@ -820,10 +815,11 @@ ${NAV}
                             Looking for a <em>${esc(app.name)} MCP</em> server?
                         </h1>
                         <p class="lead">
-                            ${esc(app.name)} doesn't have one — so you can't use
-                            it inside Claude or ChatGPT. Nutrition MCP does the
-                            same job by conversation, and it's free and open
-                            source.
+                            ${esc(app.name)} doesn't have one. Nutrition MCP is
+                            a free, open-source MCP server that does the same
+                            job by conversation with your AI; connection depends
+                            on your client's support for unauthenticated remote
+                            HTTP MCP servers.
                         </p>
                         <div class="hero-actions">
                             <a class="btn btn-primary" href="#switch"
@@ -1054,13 +1050,13 @@ function renderHub(): string {
     ).join("\n");
 
     const title =
-        "Nutrition App MCP Alternatives — Track Food in Claude & ChatGPT";
+        "Nutrition App MCP Alternatives: Track Food by Talking to Your AI";
     // As on the per-app pages, the title keeps the head term and the description
     // carries the import hook. See renderApp for the reasoning.
     const desc =
-        "MyFitnessPal, Cronometer, and Lose It! have no MCP server. Nutrition MCP is the free, open-source alternative for Claude and ChatGPT — and imports your history.";
+        "MyFitnessPal, Cronometer, and Lose It! have no MCP server. Nutrition MCP is a free, open-source MCP server for tracking nutrition by conversation, and it imports your history.";
     const ogDesc =
-        "Your nutrition app doesn't have an MCP server. Nutrition MCP is a free, open-source alternative that works inside Claude or ChatGPT — and imports your history from a CSV export.";
+        "Your nutrition app doesn't have an MCP server. Nutrition MCP is a free, open-source alternative that logs nutrition by conversation with your AI, and it imports your history from a CSV export.";
 
     return `<!doctype html>
 <html lang="en">
@@ -1107,10 +1103,12 @@ ${NAV}
                             <em>MCP server</em>.
                         </h1>
                         <p class="lead">
-                            Apps like MyFitnessPal, Cronometer, and Lose It can't
-                            connect to Claude or ChatGPT. Nutrition MCP is the
-                            free, open-source way to track meals, macros, and
-                            weight by talking to your AI.
+                            Apps like MyFitnessPal, Cronometer, and Lose It
+                            publish no MCP server. Nutrition MCP is a free,
+                            open-source remote HTTP MCP endpoint for tracking
+                            meals, macros, and weight by talking to your AI.
+                            Connection depends on your client's support for
+                            unauthenticated remote MCP servers.
                         </p>
                         <div class="hero-actions">
                             <a class="btn btn-primary" href="/#install"
@@ -1205,8 +1203,9 @@ ${cards}
                         Track nutrition inside the AI you already use.
                     </h2>
                     <p class="cta-sub">
-                        Free and open source — it works with Claude, ChatGPT, and
-                        any MCP client.
+                        Free and open source. Connection depends on your
+                        client's support for unauthenticated remote HTTP MCP
+                        servers.
                     </p>
                     <div class="cta-actions">
                         <a class="btn btn-on-accent" href="/#install"
