@@ -35,3 +35,8 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Hermes planning artifacts are working-session state, not repository content.
+# Already-tracked historical plan files are unaffected (gitignore only guards
+# UNTRACKED paths); this stops `git add -A` from ever re-tracking new ones.
+.hermes/
