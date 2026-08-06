@@ -637,6 +637,54 @@ describeDb("calculation bundle PostgreSQL integration", () => {
             ).toBe("0");
         }
     });
+
+    test("commit over a compatibility version replaces placeholders instead of crashing", async () => {
+        const eventId = "00000000-0000-4000-8000-000000000001";
+        // Simulate what update_meal's compatibility correction persists for a
+        // new version: one placeholder 'own' provider row + one canonical row,
+        // calculation_bundle_fingerprint left NULL (see src/meal-events.ts).
+        await pool.query(
+            `INSERT INTO meal_event_nutrition_results
+                (event_id, version, ordinal, provider, source_id, status,
+                 request_fingerprint, algorithm_version, raw_payload, provenance, calories)
+             VALUES ($1, 1, NULL, 'own', 'legacy:compat', 'succeeded',
+                     'legacy:compat', 'legacy-compat',
+                     '{"compatibility": true}', '{"compatibility": true}', 555)`,
+            [eventId],
+        );
+        await pool.query(
+            `INSERT INTO meal_event_canonical_results
+                (event_id, version, ordinal, status, consensus_status,
+                 calories, policy_version, audit_evidence)
+             VALUES ($1, 1, NULL, 'ready', 'insufficient_data',
+                     555, 'legacy-compat', '{"compatibility": true}')`,
+            [eventId],
+        );
+
+        const bundle = makeBundle();
+        const result = await commitCalculationBundle(pool, bundle);
+        expect(result.deduplicated).toBe(false);
+        expect(result.canonical.nutrients.calories).toBe(505);
+
+        // Placeholders are gone; exactly the bundle's 3 provider rows remain.
+        const providers = await pool.query(
+            `SELECT provider, source_id FROM meal_event_nutrition_results
+              WHERE event_id = $1 AND version = 1 AND ordinal IS NULL
+              ORDER BY provider`,
+            [eventId],
+        );
+        expect(providers.rows).toHaveLength(3);
+        expect(
+            providers.rows.some((r) => r.source_id === "legacy:compat"),
+        ).toBe(false);
+        // Exactly one canonical row per scope (event scope here).
+        const canonical = await pool.query(
+            `SELECT count(*) FROM meal_event_canonical_results
+              WHERE event_id = $1 AND version = 1`,
+            [eventId],
+        );
+        expect(canonical.rows[0].count).toBe("1");
+    });
 });
 
 async function correctionRows(pool: Pool) {

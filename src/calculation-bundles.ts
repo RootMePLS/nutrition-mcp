@@ -382,6 +382,26 @@ export async function commitCalculationBundle(
                 canonical: persisted.canonical,
             };
         }
+        // A compatibility write (log_meal / update_meal correction) leaves
+        // placeholder provider rows (provenance {"compatibility": true}) and
+        // canonical rows for this version with a NULL bundle fingerprint. The
+        // explicit bundle is the authoritative provenance for the version:
+        // replace the placeholders inside this same transaction, or the
+        // canonical INSERT below hits UNIQUE (event_id, version, scope_key).
+        // Reached only when calculation_bundle_fingerprint IS NULL (a non-NULL
+        // fingerprint returned via the dedupe/conflict paths above), so every
+        // row deleted here is a recomputable compatibility placeholder.
+        await client.query(
+            `DELETE FROM meal_event_nutrition_results
+              WHERE event_id = $1 AND version = $2
+                AND provenance @> '{"compatibility": true}'::jsonb`,
+            [bundle.event_id, bundle.version],
+        );
+        await client.query(
+            `DELETE FROM meal_event_canonical_results
+              WHERE event_id = $1 AND version = $2`,
+            [bundle.event_id, bundle.version],
+        );
         for (const result of bundle.results) {
             const scope = result.scope.ordinal ?? null;
             const sourceId = result.source_id;
