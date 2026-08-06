@@ -7,6 +7,7 @@
 // and idempotency identity. No database, no network, no MCP registration.
 
 import { NUTRIENT_FIELDS, sha256Hex } from "./meal-types.js";
+import { dowInTz, shiftLocalDate, zonedHourUtc } from "./tz.js";
 
 // ---------------------------------------------------------------------------
 // PRODUCT CATEGORY
@@ -262,4 +263,141 @@ export function deriveSupplementIntakeIdempotencyFingerprint(
         String(identity.occurred_at),
         identity.state_action,
     ])}`;
+}
+
+// ---------------------------------------------------------------------------
+// STABLE SERIALIZATION
+// ---------------------------------------------------------------------------
+// Deterministic JSON (sorted object keys) so an idempotency fingerprint is
+// stable across jsonb round-trips that reorder keys.
+
+export function stableStringify(value: unknown): string {
+    if (value === null || typeof value !== "object") {
+        return JSON.stringify(value) ?? "null";
+    }
+    if (Array.isArray(value)) {
+        return `[${value.map(stableStringify).join(",")}]`;
+    }
+    const entries = Object.entries(value as Record<string, unknown>)
+        .filter(([, v]) => v !== undefined)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries
+        .map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`)
+        .join(",")}}`;
+}
+
+// ---------------------------------------------------------------------------
+// REGIMEN IDEMPOTENCY IDENTITY
+// ---------------------------------------------------------------------------
+// Regimen create identity mirrors the intake helper: the key binds the user
+// and the immutable intent (product/version/dose/schedule/window). The
+// schedule is serialized with sorted keys so semantically equal schedules
+// fingerprint identically regardless of object key order.
+
+export interface SupplementRegimenIdempotencyIdentity {
+    user_id: string;
+    idempotency_key: string;
+    product_id: string;
+    product_version: number;
+    dose_servings: number;
+    schedule: RegimenSchedule;
+    /** YYYY-MM-DD. */
+    starts_on: string;
+    /** YYYY-MM-DD or null for an open-ended regimen. */
+    ends_on: string | null;
+}
+
+export function deriveSupplementRegimenIdempotencyFingerprint(
+    identity: SupplementRegimenIdempotencyIdentity,
+): string {
+    return `supplement-regimen:${sha256Hex([
+        identity.user_id,
+        identity.idempotency_key,
+        identity.product_id,
+        identity.product_version,
+        identity.dose_servings,
+        stableStringify(identity.schedule),
+        identity.starts_on,
+        identity.ends_on,
+    ])}`;
+}
+
+// ---------------------------------------------------------------------------
+// REGIMEN OCCURRENCE DERIVATION (pure, bounded by the caller's window)
+// ---------------------------------------------------------------------------
+// An occurrence is one (regimen, local date) pair: the schedule says an
+// intake is due at local_time on that local date in the schedule timezone.
+// Nothing is materialized, scheduled, or auto-marked — this only derives
+// which local dates carry an expectation inside a requested window.
+
+export interface RegimenOccurrence {
+    /** YYYY-MM-DD in schedule.timezone. */
+    local_date: string;
+    /** schedule.local_time. */
+    local_time: string;
+}
+
+export function deriveRegimenOccurrences(
+    schedule: RegimenSchedule,
+    startsOn: string,
+    endsOn: string | null,
+    windowFrom: string,
+    windowTo: string,
+): RegimenOccurrence[] {
+    // Effective range = [max(startsOn, windowFrom), min(endsOn ?? windowTo,
+    // windowTo)]; YYYY-MM-DD strings compare lexicographically.
+    const from = startsOn > windowFrom ? startsOn : windowFrom;
+    const to = endsOn !== null && endsOn < windowTo ? endsOn : windowTo;
+    if (from > to) return [];
+    const weekdays =
+        schedule.frequency === "weekly"
+            ? new Set(schedule.weekdays ?? [])
+            : null;
+    const occurrences: RegimenOccurrence[] = [];
+    for (let date = from; date <= to; date = shiftLocalDate(date, 1)) {
+        if (weekdays !== null) {
+            // ISO weekday of the local date in the schedule timezone. Anchor
+            // at local noon so a midnight DST transition can never shift the
+            // computed day.
+            const noonUtc = zonedHourUtc(date, schedule.timezone, 12);
+            const isoDow = ((dowInTz(noonUtc, schedule.timezone) + 6) % 7) + 1;
+            if (!weekdays.has(isoDow)) continue;
+        }
+        occurrences.push({
+            local_date: date,
+            local_time: schedule.local_time,
+        });
+    }
+    return occurrences;
+}
+
+// ---------------------------------------------------------------------------
+// OCCURRENCE STATE REDUCTION (latest fact wins by append order)
+// ---------------------------------------------------------------------------
+// State authority is append order (created_at, id), never supersedes links:
+// the links are audit metadata. The projection vocabulary stays exactly
+// undefined|done|missed — cleared projects undefined.
+
+export interface IntakeFactForProjection {
+    id: string;
+    regimen_id: string | null;
+    occurred_at: string | Date;
+    state_action: SupplementIntakeStateAction;
+    created_at: string | Date;
+}
+
+function epochMs(instant: string | Date): number {
+    return instant instanceof Date ? instant.getTime() : Date.parse(instant);
+}
+
+export function reduceOccurrenceState(
+    facts: IntakeFactForProjection[],
+): SupplementIntakeVisibleState {
+    if (facts.length === 0) return "undefined";
+    const ordered = [...facts].sort((a, b) => {
+        const byTime = epochMs(a.created_at) - epochMs(b.created_at);
+        if (byTime !== 0) return byTime;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+    return projectIntakeVisibleState(ordered[ordered.length - 1]!.state_action);
 }

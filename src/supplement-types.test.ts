@@ -8,6 +8,12 @@ import {
     validateLabelNutrients,
     validateRegimenSchedule,
     deriveSupplementIntakeIdempotencyFingerprint,
+    deriveSupplementRegimenIdempotencyFingerprint,
+    deriveRegimenOccurrences,
+    reduceOccurrenceState,
+    type RegimenSchedule,
+    type SupplementRegimenIdempotencyIdentity,
+    type IntakeFactForProjection,
 } from "./supplement-types.js";
 
 // Pure contracts for the supplement/sports-nutrition catalogue and meal-reuse
@@ -376,5 +382,294 @@ describe("meal reuse idempotency identity", () => {
 
     test("reuse identity is namespaced away from create/correction fingerprints", () => {
         expect(deriveReuseIdempotencyFingerprint(base)).toMatch(/^reuse:/);
+    });
+});
+
+describe("supplement regimen idempotency identity", () => {
+    const schedule: RegimenSchedule = {
+        timezone: "Europe/Berlin",
+        frequency: "weekly",
+        local_time: "08:30",
+        weekdays: [1, 4],
+    };
+    const base: SupplementRegimenIdempotencyIdentity = {
+        user_id: "u1",
+        idempotency_key: "reg-key-1",
+        product_id: "11111111-1111-1111-1111-111111111111",
+        product_version: 2,
+        dose_servings: 1.5,
+        schedule,
+        starts_on: "2026-08-01",
+        ends_on: "2026-12-31",
+    };
+
+    test("is deterministic and namespaced", () => {
+        const fp = deriveSupplementRegimenIdempotencyFingerprint(base);
+        expect(fp).toBe(
+            deriveSupplementRegimenIdempotencyFingerprint({ ...base }),
+        );
+        expect(fp).toMatch(/^supplement-regimen:/);
+    });
+
+    test("is stable across schedule object key order", () => {
+        const reordered: RegimenSchedule = {
+            weekdays: [1, 4],
+            local_time: "08:30",
+            frequency: "weekly",
+            timezone: "Europe/Berlin",
+        };
+        expect(
+            deriveSupplementRegimenIdempotencyFingerprint({
+                ...base,
+                schedule: reordered,
+            }),
+        ).toBe(deriveSupplementRegimenIdempotencyFingerprint(base));
+    });
+
+    test("same key with any differing identity field conflicts", () => {
+        const original = deriveSupplementRegimenIdempotencyFingerprint(base);
+        const variants: SupplementRegimenIdempotencyIdentity[] = [
+            { ...base, user_id: "u2" },
+            { ...base, idempotency_key: "reg-key-2" },
+            {
+                ...base,
+                product_id: "22222222-2222-2222-2222-222222222222",
+            },
+            { ...base, product_version: 3 },
+            { ...base, dose_servings: 2 },
+            { ...base, schedule: { ...schedule, local_time: "09:00" } },
+            { ...base, schedule: { ...schedule, frequency: "daily" } },
+            { ...base, schedule: { ...schedule, weekdays: [2] } },
+            { ...base, starts_on: "2026-08-02" },
+            { ...base, ends_on: null },
+            { ...base, ends_on: "2026-11-30" },
+        ];
+        for (const variant of variants) {
+            expect(
+                deriveSupplementRegimenIdempotencyFingerprint(variant),
+            ).not.toBe(original);
+        }
+    });
+});
+
+describe("regimen occurrence derivation (pure, bounded, tz-aware)", () => {
+    const daily: RegimenSchedule = {
+        timezone: "Europe/Berlin",
+        frequency: "daily",
+        local_time: "08:00",
+    };
+
+    test("daily schedule yields every date in the effective range", () => {
+        const occurrences = deriveRegimenOccurrences(
+            daily,
+            "2026-08-01",
+            null,
+            "2026-08-01",
+            "2026-08-05",
+        );
+        expect(occurrences.map((o) => o.local_date)).toEqual([
+            "2026-08-01",
+            "2026-08-02",
+            "2026-08-03",
+            "2026-08-04",
+            "2026-08-05",
+        ]);
+        for (const o of occurrences) {
+            expect(o.local_time).toBe("08:00");
+        }
+    });
+
+    test("effective range is window intersected with [starts_on, ends_on]", () => {
+        // starts_on inside the window clips the front.
+        expect(
+            deriveRegimenOccurrences(
+                daily,
+                "2026-08-03",
+                null,
+                "2026-08-01",
+                "2026-08-05",
+            ).map((o) => o.local_date),
+        ).toEqual(["2026-08-03", "2026-08-04", "2026-08-05"]);
+        // ends_on inside the window clips the tail.
+        expect(
+            deriveRegimenOccurrences(
+                daily,
+                "2026-08-01",
+                "2026-08-03",
+                "2026-08-01",
+                "2026-08-05",
+            ).map((o) => o.local_date),
+        ).toEqual(["2026-08-01", "2026-08-02", "2026-08-03"]);
+    });
+
+    test("an inverted effective range yields zero occurrences", () => {
+        expect(
+            deriveRegimenOccurrences(
+                daily,
+                "2026-08-10",
+                null,
+                "2026-08-01",
+                "2026-08-05",
+            ),
+        ).toEqual([]);
+        expect(
+            deriveRegimenOccurrences(
+                daily,
+                "2026-08-01",
+                "2026-08-02",
+                "2026-08-03",
+                "2026-08-05",
+            ),
+        ).toEqual([]);
+    });
+
+    test("weekly schedule keeps only listed ISO weekdays (1 = Monday)", () => {
+        // 2026-08-03 is a Monday, 2026-08-06 a Thursday, 2026-08-08 a Saturday.
+        const weekly: RegimenSchedule = {
+            timezone: "UTC",
+            frequency: "weekly",
+            local_time: "21:15",
+            weekdays: [1, 6],
+        };
+        const occurrences = deriveRegimenOccurrences(
+            weekly,
+            "2026-08-01",
+            null,
+            "2026-08-03",
+            "2026-08-09",
+        );
+        expect(occurrences.map((o) => o.local_date)).toEqual([
+            "2026-08-03",
+            "2026-08-08",
+        ]);
+        expect(occurrences[0]!.local_time).toBe("21:15");
+    });
+
+    test("a DST-transition local date still yields exactly one occurrence", () => {
+        // Europe/Berlin springs forward on 2026-03-29 and falls back on
+        // 2026-10-25; each local date must appear exactly once either way.
+        const spring = deriveRegimenOccurrences(
+            daily,
+            "2026-03-27",
+            null,
+            "2026-03-27",
+            "2026-03-31",
+        );
+        expect(spring.map((o) => o.local_date)).toEqual([
+            "2026-03-27",
+            "2026-03-28",
+            "2026-03-29",
+            "2026-03-30",
+            "2026-03-31",
+        ]);
+        const autumn = deriveRegimenOccurrences(
+            daily,
+            "2026-10-24",
+            null,
+            "2026-10-24",
+            "2026-10-27",
+        );
+        expect(autumn.map((o) => o.local_date)).toEqual([
+            "2026-10-24",
+            "2026-10-25",
+            "2026-10-26",
+            "2026-10-27",
+        ]);
+    });
+});
+
+describe("occurrence state reduction (latest fact wins by append order)", () => {
+    function fact(
+        id: string,
+        state_action: "done" | "missed" | "cleared",
+        created_at: string,
+    ): IntakeFactForProjection {
+        return {
+            id,
+            regimen_id: "reg-1",
+            occurred_at: "2026-08-06T08:00:00.000Z",
+            state_action,
+            created_at,
+        };
+    }
+
+    test("no facts projects undefined (an absent mark is never missed)", () => {
+        expect(reduceOccurrenceState([])).toBe("undefined");
+    });
+
+    test("a single done or missed fact projects itself", () => {
+        expect(
+            reduceOccurrenceState([fact("a", "done", "2026-08-06T08:00:00Z")]),
+        ).toBe("done");
+        expect(
+            reduceOccurrenceState([
+                fact("a", "missed", "2026-08-06T08:00:00Z"),
+            ]),
+        ).toBe("missed");
+    });
+
+    test("done then cleared projects undefined (the cycle returns)", () => {
+        expect(
+            reduceOccurrenceState([
+                fact("a", "done", "2026-08-06T08:00:00Z"),
+                fact("b", "cleared", "2026-08-06T09:00:00Z"),
+            ]),
+        ).toBe("undefined");
+    });
+
+    test("done then missed projects missed; missed then cleared returns to undefined", () => {
+        expect(
+            reduceOccurrenceState([
+                fact("a", "done", "2026-08-06T08:00:00Z"),
+                fact("b", "missed", "2026-08-06T09:00:00Z"),
+            ]),
+        ).toBe("missed");
+        expect(
+            reduceOccurrenceState([
+                fact("a", "done", "2026-08-06T08:00:00Z"),
+                fact("b", "missed", "2026-08-06T09:00:00Z"),
+                fact("c", "cleared", "2026-08-06T10:00:00Z"),
+            ]),
+        ).toBe("undefined");
+    });
+
+    test("append order, not input order, decides the latest fact", () => {
+        expect(
+            reduceOccurrenceState([
+                fact("b", "cleared", "2026-08-06T09:00:00Z"),
+                fact("a", "done", "2026-08-06T08:00:00Z"),
+            ]),
+        ).toBe("undefined");
+    });
+
+    test("equal created_at breaks the tie by id (higher id is later)", () => {
+        expect(
+            reduceOccurrenceState([
+                fact("b", "missed", "2026-08-06T09:00:00Z"),
+                fact("a", "done", "2026-08-06T09:00:00Z"),
+            ]),
+        ).toBe("missed");
+        expect(
+            reduceOccurrenceState([
+                fact("b", "done", "2026-08-06T09:00:00Z"),
+                fact("a", "missed", "2026-08-06T09:00:00Z"),
+            ]),
+        ).toBe("done");
+    });
+
+    test("the projection vocabulary never emits cleared", () => {
+        const states = [
+            reduceOccurrenceState([]),
+            reduceOccurrenceState([
+                fact("a", "cleared", "2026-08-06T08:00:00Z"),
+            ]),
+            reduceOccurrenceState([
+                fact("a", "done", "2026-08-06T08:00:00Z"),
+                fact("b", "cleared", "2026-08-06T09:00:00Z"),
+            ]),
+        ];
+        for (const state of states) {
+            expect(["undefined", "done", "missed"]).toContain(state);
+        }
     });
 });

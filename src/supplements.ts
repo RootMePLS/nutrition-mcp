@@ -30,6 +30,7 @@ import { escapeLikePattern } from "./search.js";
 import {
     isSupplementProductCategory,
     normalizeSupplementAlias,
+    stableStringify,
     validateLabelNutrients,
     type SupplementLabelNutrientInput,
     type SupplementProductCategory,
@@ -355,23 +356,6 @@ function validateLabelFields(fields: SupplementLabelFields): NormalizedLabel {
         label_evidence: fields.label_evidence,
         label_source_kind: optionalText(fields.label_source_kind),
     };
-}
-
-// Deterministic JSON (sorted object keys) so an idempotency fingerprint is
-// stable across jsonb round-trips that reorder keys.
-function stableStringify(value: unknown): string {
-    if (value === null || typeof value !== "object") {
-        return JSON.stringify(value) ?? "null";
-    }
-    if (Array.isArray(value)) {
-        return `[${value.map(stableStringify).join(",")}]`;
-    }
-    const entries = Object.entries(value as Record<string, unknown>)
-        .filter(([, v]) => v !== undefined)
-        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    return `{${entries
-        .map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`)
-        .join(",")}}`;
 }
 
 interface LabelIdentitySource {
