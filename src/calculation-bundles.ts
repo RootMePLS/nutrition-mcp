@@ -329,6 +329,11 @@ export async function commitCalculationBundle(
     bundle: CalculationBundleInput,
     options: CalculationBundleCommitOptions = {},
 ): Promise<CalculationBundleCommitResult> {
+    if (bundle.fingerprint === undefined)
+        bundle.fingerprint = stableBundleFingerprint({
+            ...bundle,
+            fingerprint: undefined,
+        } as never);
     const issues = validateCalculationBundle(bundle);
     if (issues.length) throw new CalculationBundleValidationError(issues);
     const expected = stableBundleFingerprint({
@@ -448,6 +453,11 @@ export async function commitCalculationCorrection(
 ): Promise<CalculationBundleCommitResult> {
     const issues = validateCalculationCorrection(metadata);
     if (issues.length) throw new CalculationBundleValidationError(issues);
+    if (bundle.fingerprint === undefined)
+        bundle.fingerprint = stableBundleFingerprint({
+            ...bundle,
+            fingerprint: undefined,
+        } as never);
     const bundleIssues = validateCalculationBundle(bundle);
     if (bundleIssues.length)
         throw new CalculationBundleValidationError(bundleIssues);
