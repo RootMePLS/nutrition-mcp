@@ -25,6 +25,8 @@
 
 import { Pool, type PoolClient } from "pg";
 import { withTransaction } from "./db.js";
+import { createMealEvent } from "./meal-events.js";
+import type { CreateMealEventCommand, Nutrients } from "./meal-types.js";
 import { isStrictIsoTimestamp, sha256Hex } from "./meal-types.js";
 import { escapeLikePattern } from "./search.js";
 import { dateInTz } from "./tz.js";
@@ -32,6 +34,8 @@ import {
     deriveRegimenOccurrences,
     deriveSupplementIntakeIdempotencyFingerprint,
     deriveSupplementRegimenIdempotencyFingerprint,
+    FOOD_COMPATIBLE_NUTRIENT_KEYS,
+    isFoodCompatibleNutrientKey,
     isSupplementProductCategory,
     normalizeSupplementAlias,
     projectIntakeVisibleState,
@@ -1631,6 +1635,10 @@ export interface SupplementIntakeFactReadback {
 export interface LogSupplementIntakeResult {
     intake: SupplementIntakeFactReadback;
     deduplicated: boolean;
+    /** Present when a done sports_nutrition intake also created a snack event. */
+    snack_event_id?: string;
+    /** Present when a done sports_nutrition intake also created a snack event. */
+    snack_version?: number;
 }
 
 const INTAKE_STATE_ACTIONS: readonly string[] = ["done", "missed", "cleared"];
@@ -1951,10 +1959,25 @@ export async function logSupplementIntake(
                     if (existingFingerprint !== fingerprint) {
                         throw new SupplementIdempotencyConflictError();
                     }
-                    return {
+                    const dedupResult: LogSupplementIntakeResult = {
                         intake: await assembleIntakeReadback(client, existing),
                         deduplicated: true,
                     };
+                    // Re-read the link if one exists for this intake (retry convergence).
+                    const { rows: linkRows } = await client.query(
+                        `SELECT event_id, version FROM supplement_intake_meal_links
+                         WHERE intake_id = $1`,
+                        [existing.id],
+                    );
+                    if (linkRows.length > 0) {
+                        const link = linkRows[0] as {
+                            event_id: string;
+                            version: number;
+                        };
+                        dedupResult.snack_event_id = link.event_id;
+                        dedupResult.snack_version = link.version;
+                    }
+                    return dedupResult;
                 }
 
                 const { rows: inserted } = await client.query(
@@ -2003,6 +2026,135 @@ export async function logSupplementIntake(
                     );
                 }
 
+                // ---------------------------------------------------------------------------
+                // Slice 6: caloric sports-nutrition done intake → snack meal-event link
+                // ---------------------------------------------------------------------------
+                let snackEventId: string | undefined;
+                let snackVersion: number | undefined;
+
+                if (
+                    fields.state_action === "done" &&
+                    root.category === "sports_nutrition"
+                ) {
+                    // 1. Fetch the bound version's display_name for the snack description.
+                    const { rows: labelRows } = await client.query(
+                        `SELECT display_name FROM supplement_product_versions
+                         WHERE product_id = $1 AND version = $2`,
+                        [root.id, boundVersion],
+                    );
+                    const boundLabel = labelRows[0] as
+                        { display_name: string } | undefined;
+                    const description =
+                        boundLabel?.display_name ??
+                        `Suppl. ${root.id.slice(0, 8)}`;
+
+                    // 2. Fetch the scaled snapshot nutrients that were just inserted
+                    //    (visible inside the same transaction).
+                    const { rows: snapRows } = await client.query(
+                        `SELECT nutrient_key, scaled_amount
+                         FROM supplement_intake_nutrient_snapshots
+                         WHERE intake_id = $1
+                           AND nutrient_key = ANY($2::text[])
+                         ORDER BY nutrient_key`,
+                        [intakeId, FOOD_COMPATIBLE_NUTRIENT_KEYS],
+                    );
+
+                    // 3. Build the "own" nutrient payload with FOOD_COMPATIBLE_NUTRIENT_KEYS only.
+                    const ownNutrients: Partial<Nutrients> = {};
+                    for (const snap of snapRows as Array<{
+                        nutrient_key: string;
+                        scaled_amount: string | number;
+                    }>) {
+                        // pg returns numeric as string; convert explicitly and
+                        // fail closed on any non-finite value or non-food key
+                        // instead of narrowing silently.
+                        if (!isFoodCompatibleNutrientKey(snap.nutrient_key)) {
+                            throw new Error(
+                                `snack linkage read a non-food nutrient key: ${snap.nutrient_key}`,
+                            );
+                        }
+                        const scaled = Number(snap.scaled_amount);
+                        if (!Number.isFinite(scaled)) {
+                            throw new Error(
+                                `snack linkage read a non-numeric scaled amount for ${snap.nutrient_key}`,
+                            );
+                        }
+                        ownNutrients[snap.nutrient_key] = scaled;
+                    }
+
+                    // 4. Build CreateMealEventCommand with label-specific provenance.
+                    const snackIdempotencyKey = `snack:suppl-intake:${intakeId}`;
+                    const cmd: CreateMealEventCommand = {
+                        user_id: command.user_id,
+                        idempotency_key: snackIdempotencyKey,
+                        reported_at: fields.occurred_at,
+                        consumed_at: fields.occurred_at,
+                        meal_type: "snack",
+                        items: [
+                            {
+                                ordinal: 0,
+                                raw_item_text: description,
+                                normalized_name: description,
+                            },
+                        ],
+                        inputs: [
+                            {
+                                source_kind: "photo_ocr",
+                                content: `Supplement label nutrients from product ${root.id} v${boundVersion}`,
+                                metadata: {
+                                    intake_id: intakeId,
+                                    product_id: root.id,
+                                    product_version: boundVersion,
+                                },
+                            },
+                        ],
+                        media: [],
+                        provider_results: [
+                            {
+                                provider: "own",
+                                status: "succeeded",
+                                request_fingerprint: `suppl-snack:${intakeId}`,
+                                algorithm_version: "label-compat-v1",
+                                source_id: `suppl-snack:${intakeId}`,
+                                nutrients: ownNutrients,
+                            },
+                        ],
+                        parser_policy_version: "label-compat-v1",
+                        created_by: "supplement-log",
+                    };
+
+                    const snackResult = await createMealEvent(
+                        pool,
+                        cmd,
+                        client,
+                    );
+                    snackEventId = snackResult.event_id;
+                    snackVersion = snackResult.version;
+
+                    // 5. Insert the bidirectional link row.
+                    const linkFingerprint = `suppl-meal:${sha256Hex([
+                        intakeId,
+                        snackEventId,
+                        String(snackVersion),
+                    ])}`;
+                    await client.query(
+                        `INSERT INTO supplement_intake_meal_links
+                            (user_id, intake_id, event_id, version, product_id,
+                             product_version, idempotency_fingerprint)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)
+                         ON CONFLICT (intake_id) DO NOTHING`,
+                        [
+                            command.user_id,
+                            intakeId,
+                            snackEventId,
+                            snackVersion,
+                            root.id,
+                            boundVersion,
+                            linkFingerprint,
+                        ],
+                    );
+                }
+
                 await opts.beforeCommit?.();
 
                 const { rows: factRows } = await client.query(
@@ -2014,6 +2166,8 @@ export async function logSupplementIntake(
                 return {
                     intake: await assembleIntakeReadback(client, fact),
                     deduplicated: false,
+                    snack_event_id: snackEventId,
+                    snack_version: snackVersion,
                 };
             });
         } catch (err) {
