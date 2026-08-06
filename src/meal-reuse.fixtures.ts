@@ -331,7 +331,6 @@ export async function withReuseTools(
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Slice 4 test-only fixtures: full-row source snapshots (byte-identical
 // before/after proofs) and reuse command builders.

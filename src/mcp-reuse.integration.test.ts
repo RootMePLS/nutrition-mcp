@@ -316,7 +316,6 @@ describeDb(
     },
 );
 
-
 // ---------------------------------------------------------------------------
 // Slice 4 public transport: the reuse_meal_calculation mutation through a
 // real McpServer + Client + InMemoryTransport against real PostgreSQL.
@@ -418,7 +417,6 @@ describeDb(
     },
 );
 
-
 // ---------------------------------------------------------------------------
 // Slice 4 transport adversarial gates: payload hardening, no-leak scope
 // failures, stable public errors, retry/conflict/concurrency, and historical
@@ -484,17 +482,13 @@ describeDb(
                     })(),
                 );
                 expect(missing.isError).toBe(true);
-                expect(missing.content[0]!.text).toContain(
-                    "Invalid arguments",
-                );
+                expect(missing.content[0]!.text).toContain("Invalid arguments");
                 const invalid = await call(
                     "reuse_meal_calculation",
                     validArgs(sourceId, { confirmation: "yes please" }),
                 );
                 expect(invalid.isError).toBe(true);
-                expect(invalid.content[0]!.text).toContain(
-                    "Invalid arguments",
-                );
+                expect(invalid.content[0]!.text).toContain("Invalid arguments");
                 expect(await domainTableCounts(pool)).toEqual(before);
             });
         });
@@ -534,9 +528,7 @@ describeDb(
                     "reuse_meal_calculation",
                     validArgs(sourceId, {
                         canonical: { calories: 9999, protein_g: 9999 },
-                        provider_results: [
-                            { provider: "own", calories: 9999 },
-                        ],
+                        provider_results: [{ provider: "own", calories: 9999 }],
                         nutrients: { calories: 9999 },
                         bundle_fingerprint: "forged",
                         source_evidence: "forged",
@@ -608,9 +600,7 @@ describeDb(
                 expect(absent.content[0]!.text).toBe(
                     crossUser.content[0]!.text,
                 );
-                expect(JSON.stringify(crossUser)).not.toContain(
-                    "confidential",
-                );
+                expect(JSON.stringify(crossUser)).not.toContain("confidential");
                 expect(JSON.stringify(crossUser)).not.toContain(sourceId);
                 expect(await domainTableCounts(pool)).toEqual(before);
             });
@@ -628,7 +618,9 @@ describeDb(
             const unavailableId = await seedMealEvent(pool, "u1", {
                 idempotencyKey: "adv-unavail",
                 consumedAt: daysAgo(1),
-                items: [{ ordinal: 0, raw_item_text: "unavailable reuse oats" }],
+                items: [
+                    { ordinal: 0, raw_item_text: "unavailable reuse oats" },
+                ],
             });
             await commitBundle(pool, "u1", unavailableBundle(unavailableId, 1));
 
@@ -693,9 +685,7 @@ describeDb(
                 );
                 expect(retryPayload.event_id).toBe(firstPayload.event_id);
                 expect(retryPayload.deduplicated).toBe(true);
-                expect(retryPayload.canonical).toEqual(
-                    firstPayload.canonical,
-                );
+                expect(retryPayload.canonical).toEqual(firstPayload.canonical);
                 expect(await domainTableCounts(pool)).toEqual(before);
 
                 const conflict = await call(

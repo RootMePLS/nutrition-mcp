@@ -565,7 +565,6 @@ describeDb(
     },
 );
 
-
 // ---------------------------------------------------------------------------
 // Slice 4 repository gate: the confirmed reuse mutation against real
 // PostgreSQL. Same reset/replay harness as the Slice 3 suite above.
@@ -573,14 +572,8 @@ describeDb(
 
 import { deriveReuseIdempotencyFingerprint } from "./meal-types.js";
 import { getMealEventProvenance } from "./meal-events.js";
-import {
-    getReuseLineage,
-    reuseMealCalculation,
-} from "./meal-reuse.js";
-import {
-    reuseCommand,
-    snapshotAggregate,
-} from "./meal-reuse.fixtures.js";
+import { getReuseLineage, reuseMealCalculation } from "./meal-reuse.js";
+import { reuseCommand, snapshotAggregate } from "./meal-reuse.fixtures.js";
 
 /** Columns that identity-remap in a copy: every other column is byte-equal. */
 function stripIdentity(
@@ -698,9 +691,9 @@ describeDb(
             const target = await snapshotAggregate(pool, result.event_id, 1);
 
             // Items: identical content, same ordinals.
-            expect(
-                target.items.map((r) => stripIdentity(r)),
-            ).toEqual(source.items.map((r) => stripIdentity(r)));
+            expect(target.items.map((r) => stripIdentity(r))).toEqual(
+                source.items.map((r) => stripIdentity(r)),
+            );
             // Provider evidence: every column byte-equal except identity.
             expect(target.provider_results).toHaveLength(
                 source.provider_results.length,
@@ -773,7 +766,9 @@ describeDb(
             expect(lineage).not.toBeNull();
             expect(lineage!.source_event_id).toBe(sourceId);
             expect(lineage!.source_version).toBe(1);
-            expect(lineage!.source_bundle_fingerprint).toBe(bundle.fingerprint!);
+            expect(lineage!.source_bundle_fingerprint).toBe(
+                bundle.fingerprint!,
+            );
             expect(lineage!.reuse_idempotency_key).toBe(
                 command.idempotency_key,
             );
@@ -811,9 +806,9 @@ describeDb(
                 expect(targetIds.has(mapping.target_provider_result_id)).toBe(
                     true,
                 );
-                expect(
-                    sourceById.get(mapping.source_provider_result_id),
-                ).toBe(mapping.source_request_fingerprint);
+                expect(sourceById.get(mapping.source_provider_result_id)).toBe(
+                    mapping.source_request_fingerprint,
+                );
             }
         });
 
@@ -946,7 +941,6 @@ describeDb(
     },
 );
 
-
 // ---------------------------------------------------------------------------
 // Slice 4 fail-closed eligibility: every rejection class carries a stable
 // typed error, writes nothing, and never fabricates a zero-valued canonical.
@@ -969,9 +963,7 @@ async function expectNoZeroCanonical(pool: Pool): Promise<void> {
     expect(rows[0]!.c).toBe(0);
 }
 
-async function catchReuseError(
-    promise: Promise<unknown>,
-): Promise<Error> {
+async function catchReuseError(promise: Promise<unknown>): Promise<Error> {
     try {
         await promise;
     } catch (err) {
@@ -1021,15 +1013,14 @@ describeDb(
                 reuseMealCalculation(
                     pool,
                     reuseCommand({
-                        source_event_id:
-                            "99999999-9999-9999-9999-999999999999",
+                        source_event_id: "99999999-9999-9999-9999-999999999999",
                     }),
                 ),
             );
             expect(err).toBeInstanceOf(MealReuseSourceNotFoundError);
-            expect(
-                (err as MealReuseSourceNotFoundError).code,
-            ).toBe("meal_reuse_source_not_found");
+            expect((err as MealReuseSourceNotFoundError).code).toBe(
+                "meal_reuse_source_not_found",
+            );
             expect(await domainTableCounts(pool)).toEqual(before);
             await expectNoZeroCanonical(pool);
         });
@@ -1055,8 +1046,7 @@ describeDb(
                     pool,
                     reuseCommand({
                         user_id: "u2",
-                        source_event_id:
-                            "99999999-9999-9999-9999-999999999999",
+                        source_event_id: "99999999-9999-9999-9999-999999999999",
                         idempotency_key: "xu-absent",
                     }),
                 ),
@@ -1162,9 +1152,9 @@ describeDb(
                 ),
             );
             expect(err).toBeInstanceOf(MealReuseSourceIneligibleError);
-            expect(
-                (err as MealReuseSourceIneligibleError).category,
-            ).toBe("compatibility");
+            expect((err as MealReuseSourceIneligibleError).category).toBe(
+                "compatibility",
+            );
             expect(err.message).toContain(
                 "meal_reuse_source_ineligible: compatibility",
             );
@@ -1187,9 +1177,9 @@ describeDb(
                 ),
             );
             expect(err).toBeInstanceOf(MealReuseSourceIneligibleError);
-            expect(
-                (err as MealReuseSourceIneligibleError).category,
-            ).toBe("unavailable");
+            expect((err as MealReuseSourceIneligibleError).category).toBe(
+                "unavailable",
+            );
             expect(await domainTableCounts(pool)).toEqual(before);
             await expectNoZeroCanonical(pool);
         });
@@ -1214,9 +1204,9 @@ describeDb(
                 ),
             );
             expect(err).toBeInstanceOf(MealReuseSourceIneligibleError);
-            expect(
-                (err as MealReuseSourceIneligibleError).category,
-            ).toBe("pending");
+            expect((err as MealReuseSourceIneligibleError).category).toBe(
+                "pending",
+            );
             expect(await domainTableCounts(pool)).toEqual(before);
             await expectNoZeroCanonical(pool);
         });
@@ -1228,7 +1218,6 @@ describeDb(
         });
     },
 );
-
 
 // ---------------------------------------------------------------------------
 // Slice 4 idempotency: identical retry converges on the original graph with
@@ -1393,7 +1382,6 @@ describeDb(
         });
     },
 );
-
 
 // ---------------------------------------------------------------------------
 // Slice 4 concurrency + injected rollback: DB-serialized same-key racers

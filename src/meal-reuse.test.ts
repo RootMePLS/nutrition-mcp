@@ -107,7 +107,6 @@ describe("rankReuseVariations", () => {
     });
 });
 
-
 // ---------------------------------------------------------------------------
 // Slice 4 pure layer: reuse idempotency identity equality and eligibility
 // classification contracts. No DB.

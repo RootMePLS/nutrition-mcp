@@ -252,7 +252,6 @@ export async function searchReuseCandidates(
     };
 }
 
-
 // ---------------------------------------------------------------------------
 // Slice 4: confirmed meal-reuse mutation — pure contracts.
 //
@@ -282,10 +281,7 @@ export class MealReuseSourceVersionError extends Error {
 }
 
 export type MealReuseIneligibleCategory =
-    | "compatibility"
-    | "pending"
-    | "unavailable"
-    | "missing";
+    "compatibility" | "pending" | "unavailable" | "missing";
 
 export class MealReuseSourceIneligibleError extends Error {
     readonly code = "meal_reuse_source_ineligible";
@@ -344,7 +340,9 @@ export function reuseIdentityMatches(
 export function classifyReuseEligibility(derived: {
     provenance_status: "ready" | "pending" | "unavailable" | "missing";
     compatibility: boolean;
-}): { eligible: true } | { eligible: false; category: MealReuseIneligibleCategory } {
+}):
+    | { eligible: true }
+    | { eligible: false; category: MealReuseIneligibleCategory } {
     if (derived.compatibility === true) {
         return { eligible: false, category: "compatibility" };
     }
@@ -353,7 +351,6 @@ export function classifyReuseEligibility(derived: {
     }
     return { eligible: true };
 }
-
 
 // ---------------------------------------------------------------------------
 // Slice 4: confirmed meal-reuse mutation — transactional copy service.
@@ -400,7 +397,10 @@ function validateReuseCommand(command: ReuseMealCalculationCommand): void {
     if (!UUID_RE.test(command.source_event_id)) {
         issues.push("source_event_id must be a UUID");
     }
-    if (!Number.isInteger(command.source_version) || command.source_version < 1) {
+    if (
+        !Number.isInteger(command.source_version) ||
+        command.source_version < 1
+    ) {
         issues.push("source_version must be an integer >= 1");
     }
     if (Number.isNaN(Date.parse(command.reported_at))) {
@@ -566,7 +566,9 @@ async function readSourceAggregateForReuse(
                 NUTRIENT_FIELDS.map((f) => [f, numOrNull(r[f])]),
             ) as Partial<Nutrients>,
         })),
-        canonical: eventCanonicalRow ? mapCanonicalRow(eventCanonicalRow) : null,
+        canonical: eventCanonicalRow
+            ? mapCanonicalRow(eventCanonicalRow)
+            : null,
         item_canonicals: itemCanonicalRows.map((row) => ({
             ...mapCanonicalRow(row),
             ordinal: Number(row.ordinal),
@@ -720,8 +722,8 @@ export async function reuseMealCalculation(
         if (!verdict.eligible) {
             throw new MealReuseSourceIneligibleError(verdict.category);
         }
-        const sourceFingerprint = snapshot.aggregate.version
-            .calculation_bundle_fingerprint;
+        const sourceFingerprint =
+            snapshot.aggregate.version.calculation_bundle_fingerprint;
         if (sourceFingerprint === null) {
             // Unreachable after an eligible verdict (ready implies a bundle
             // fingerprint); belt-and-braces because the fingerprint is
