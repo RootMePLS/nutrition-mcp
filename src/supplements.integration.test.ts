@@ -3070,17 +3070,31 @@ describeDb(
             expect(prv.algorithm_version).toBe("label-compat-v1");
             expect(prv.request_fingerprint).toStartWith("suppl-snack:");
 
-            // Verify the snack event provenance status.
-            const { rows: evRows } = await pool.query(
-                `SELECT provenance_data FROM meal_event_versions
-                     WHERE event_id = $1 AND version = $2`,
+            // The snack version carries no calculation bundle: it is a
+            // label-derived compatibility write, and its provider row records
+            // the label lineage.
+            const { rows: verRows } = await pool.query(
+                `SELECT calculation_bundle_fingerprint FROM meal_event_versions
+                  WHERE event_id = $1 AND version = $2`,
                 [result.snack_event_id, result.snack_version],
             );
-            const ev = evRows[0] as { provenance_data: unknown };
-            const prov = ev.provenance_data as Record<string, unknown>;
-            expect(prov).toMatchObject({
-                provenance_status: "compatibility",
-            });
+            expect(verRows).toHaveLength(1);
+            expect(
+                (verRows[0] as { calculation_bundle_fingerprint: string | null })
+                    .calculation_bundle_fingerprint,
+            ).toBeNull();
+
+            const { rows: provRows } = await pool.query(
+                `SELECT provenance FROM meal_event_nutrition_results
+                  WHERE event_id = $1 AND version = $2`,
+                [result.snack_event_id, result.snack_version],
+            );
+            expect(provRows).toHaveLength(1);
+            const provenance = (provRows[0] as { provenance: Record<string, unknown> })
+                .provenance;
+            expect(provenance.kind).toBe("supplement_label");
+            expect(provenance.product_version).toBe(1);
+            expect(typeof provenance.intake_id).toBe("string");
 
             // No external provider result sets exist for this event.
             const otherProviders = ["myfitnesspal", "nutrition-local"];
