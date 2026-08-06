@@ -1228,3 +1228,168 @@ describeDb(
         });
     },
 );
+
+
+// ---------------------------------------------------------------------------
+// Slice 4 idempotency: identical retry converges on the original graph with
+// zero new rows; changed identity under the same key is a stable conflict;
+// different keys produce independent targets.
+// ---------------------------------------------------------------------------
+
+describeDb(
+    "reuse_meal_calculation idempotency (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await pool.end();
+        });
+
+        beforeEach(async () => {
+            await resetSchema(pool);
+        });
+
+        afterEach(async () => {
+            await flushAnalytics();
+        });
+
+        async function seedReady(key: string, text: string): Promise<string> {
+            const id = await seedMealEvent(pool, "u1", {
+                idempotencyKey: key,
+                consumedAt: daysAgo(2),
+                items: [{ ordinal: 0, raw_item_text: text }],
+            });
+            await commitBundle(pool, "u1", readyBundle(id, 1));
+            return id;
+        }
+
+        test("identical retry returns the original readback with zero row delta", async () => {
+            const sourceId = await seedReady("idem-src", "idempotent oats");
+            const command = reuseCommand({ source_event_id: sourceId });
+            const first = await reuseMealCalculation(pool, command);
+            const before = await domainTableCounts(pool);
+
+            const retry = await reuseMealCalculation(pool, command);
+
+            expect(retry.event_id).toBe(first.event_id);
+            expect(retry.deduplicated).toBe(true);
+            expect(retry.source_event_id).toBe(sourceId);
+            expect(retry.source_version).toBe(1);
+            expect(retry.source_was_current).toBe(true);
+            expect(retry.source_bundle_fingerprint).toBe(
+                first.source_bundle_fingerprint,
+            );
+            expect(retry.provenance_status).toBe("ready");
+            expect(retry.compatibility).toBe(false);
+            expect(await domainTableCounts(pool)).toEqual(before);
+        });
+
+        test("same key + different source_version -> idempotency_conflict, zero delta", async () => {
+            const sourceId = await seedReady("confv-src", "conflict v oats");
+            await correctMeal(pool, "u1", sourceId, {
+                correctionKey: "confv-v2",
+                items: [{ ordinal: 0, raw_item_text: "conflict v oats v2" }],
+            });
+            await reuseMealCalculation(
+                pool,
+                reuseCommand({
+                    source_event_id: sourceId,
+                    source_version: 1,
+                    idempotency_key: "conflict-key",
+                }),
+            );
+            const before = await domainTableCounts(pool);
+
+            const err = await catchReuseError(
+                reuseMealCalculation(
+                    pool,
+                    reuseCommand({
+                        source_event_id: sourceId,
+                        source_version: 2,
+                        idempotency_key: "conflict-key",
+                    }),
+                ),
+            );
+            expect(err).toBeInstanceOf(MealReuseIdempotencyConflictError);
+            expect((err as MealReuseIdempotencyConflictError).code).toBe(
+                "idempotency_conflict",
+            );
+            expect(await domainTableCounts(pool)).toEqual(before);
+        });
+
+        test("same key + different consumed_at -> idempotency_conflict, zero delta", async () => {
+            const sourceId = await seedReady("conft-src", "conflict t oats");
+            await reuseMealCalculation(
+                pool,
+                reuseCommand({
+                    source_event_id: sourceId,
+                    idempotency_key: "conflict-time",
+                }),
+            );
+            const before = await domainTableCounts(pool);
+
+            const err = await catchReuseError(
+                reuseMealCalculation(
+                    pool,
+                    reuseCommand({
+                        source_event_id: sourceId,
+                        idempotency_key: "conflict-time",
+                        consumed_at: "2026-08-06T12:45:00.000Z",
+                    }),
+                ),
+            );
+            expect(err).toBeInstanceOf(MealReuseIdempotencyConflictError);
+            expect(await domainTableCounts(pool)).toEqual(before);
+        });
+
+        test("different keys + same source produce two independent targets and lineage rows", async () => {
+            const sourceId = await seedReady("twice-src", "twice reused oats");
+            const first = await reuseMealCalculation(
+                pool,
+                reuseCommand({
+                    source_event_id: sourceId,
+                    idempotency_key: "twice-1",
+                }),
+            );
+            const second = await reuseMealCalculation(
+                pool,
+                reuseCommand({
+                    source_event_id: sourceId,
+                    idempotency_key: "twice-2",
+                    consumed_at: "2026-08-06T18:00:00.000Z",
+                    reported_at: "2026-08-06T18:30:00.000Z",
+                }),
+            );
+            expect(second.event_id).not.toBe(first.event_id);
+            expect(second.deduplicated).toBe(false);
+            const lineage = await pool.query(
+                `SELECT event_id FROM meal_event_reuse_sources
+                 WHERE user_id = 'u1' AND source_event_id = $1
+                 ORDER BY event_id`,
+                [sourceId],
+            );
+            expect(lineage.rows.map((r) => r.event_id).sort()).toEqual(
+                [first.event_id, second.event_id].sort(),
+            );
+            // Both targets are independent, ready roots.
+            for (const eventId of [first.event_id, second.event_id]) {
+                const readback = await getMealEventProvenance(
+                    pool,
+                    "u1",
+                    eventId,
+                );
+                expect(readback!.provenance_status).toBe("ready");
+            }
+            // The source root was never repointed by either reuse.
+            const source = await pool.query(
+                `SELECT current_version FROM meal_events WHERE id = $1`,
+                [sourceId],
+            );
+            expect(source.rows[0]!.current_version).toBe(1);
+        });
+    },
+);
