@@ -150,9 +150,12 @@ export async function searchMealProjections(
     pool: Pool,
     userId: string,
     queries: string[],
-    opts: { limit?: number; sinceIso?: string } = {},
+    opts: { limit?: number | null; sinceIso?: string } = {},
 ): Promise<MealEventProjection[]> {
-    const limit = opts.limit ?? 50;
+    // limit: null omits the LIMIT clause entirely — required by the 90-day
+    // reuse-discovery ranking, which must count the FULL match set before
+    // grouping; all existing callers keep the default 50-row cap.
+    const limit = opts.limit === undefined ? 50 : opts.limit;
     const alternatives = queries
         .map(tokenizeQuery)
         .filter((tokens) => tokens.length);
@@ -176,10 +179,11 @@ export async function searchMealProjections(
         );
     }
     where.push(`(${tokenClauses.join(" OR ")})`);
-    params.push(limit);
-    const { rows } = await pool.query(
-        `${SELECT} AND ${where.slice(1).join(" AND ")}${GROUP} ORDER BY e.consumed_at DESC, e.id DESC LIMIT $${params.length}`,
-        params,
-    );
+    let sql = `${SELECT} AND ${where.slice(1).join(" AND ")}${GROUP} ORDER BY e.consumed_at DESC, e.id DESC`;
+    if (limit !== null) {
+        params.push(limit);
+        sql += ` LIMIT $${params.length}`;
+    }
+    const { rows } = await pool.query(sql, params);
     return rows.map(projection);
 }
