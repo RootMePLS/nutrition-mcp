@@ -588,6 +588,75 @@ describeDb(
             });
         });
 
+        test("parser-accepted 24:00 and out-of-range UTC offsets are rejected through the real transport with zero writes", async () => {
+            const sourceId = await seedReady("iso-rng-src", "range iso oats");
+            await withReuseTools(pool, "u1", async ({ call }) => {
+                const before = await domainTableCounts(pool);
+                const cases: Record<string, unknown>[] = [
+                    validArgs(sourceId, {
+                        reported_at: "2026-08-06T24:00:00Z",
+                        idempotency_key: "iso-rng-1",
+                    }),
+                    validArgs(sourceId, {
+                        consumed_at: "2026-08-06T24:00:00+00:00",
+                        idempotency_key: "iso-rng-2",
+                    }),
+                    validArgs(sourceId, {
+                        reported_at: "2026-08-06T12:00:00+14:01",
+                        idempotency_key: "iso-rng-3",
+                    }),
+                    validArgs(sourceId, {
+                        consumed_at: "2026-08-06T12:00:00+15:00",
+                        idempotency_key: "iso-rng-4",
+                    }),
+                ];
+                for (const args of cases) {
+                    // Every candidate is Date.parse-parseable — the parser
+                    // silently normalizes 24:00 and swallows illegal offsets,
+                    // which is the exact remaining Terra gap. Strict
+                    // validation must reject anyway.
+                    for (const field of ["reported_at", "consumed_at"]) {
+                        const v = args[field];
+                        expect(Number.isNaN(Date.parse(v as string))).toBe(
+                            false,
+                        );
+                    }
+                    const result = await call("reuse_meal_calculation", args);
+                    expect(result.isError).toBe(true);
+                    // Zod boundary rejection, not a repository/domain error.
+                    expect(result.content[0]!.text).toContain(
+                        "Invalid arguments",
+                    );
+                }
+                expect(await domainTableCounts(pool)).toEqual(before);
+            });
+        });
+
+        test("maximum legal offsets +14:00 and -12:00 remain accepted end-to-end", async () => {
+            const sourceId = await seedReady("iso-max-src", "legal edge oats");
+            await withReuseTools(pool, "u1", async ({ call }) => {
+                const result = await call(
+                    "reuse_meal_calculation",
+                    validArgs(sourceId, {
+                        reported_at: "2026-08-06T13:00:00.000+14:00",
+                        consumed_at: "2026-08-06T12:30:00-12:00",
+                        idempotency_key: "iso-max-key",
+                    }),
+                );
+                expect(result.isError).not.toBe(true);
+                const payload = result.structuredContent as {
+                    reported_at: string;
+                    consumed_at: string;
+                    provenance_status: string;
+                };
+                // timestamptz round-trip normalizes to canonical Z at exactly
+                // the supplied instants — the legal extremes are preserved.
+                expect(payload.reported_at).toBe("2026-08-05T23:00:00.000Z");
+                expect(payload.consumed_at).toBe("2026-08-07T00:30:00.000Z");
+                expect(payload.provenance_status).toBe("ready");
+            });
+        });
+
         test("forged canonical/provider/fingerprint args are inert: persisted target equals source values", async () => {
             const sourceId = await seedReady("forge-src", "forgery oats");
             await withReuseTools(pool, "u1", async ({ call }) => {

@@ -254,6 +254,12 @@ describe("slice 4 pure reuse helpers", () => {
             "2026-08-06T12:30:00+00:00", // offset variant of the same instant
             "2026-08-06T10:00:00.123456Z", // timestamptz microsecond round-trip
             "2026-08-06T15:30:00-05:00", // non-UTC explicit offset
+            "2026-08-06T12:00:00+14:00", // maximum legal east offset (Kiritimati)
+            "2026-08-06T12:00:00-12:00", // maximum legal west offset (AoE)
+            "2026-08-06T12:00:00+13:45", // Chatham DST — real 45-minute offset
+            "2026-08-06T12:00:00-00:00", // RFC 3339 unknown-local-offset; same instant as Z
+            "2026-08-06T23:59:59Z", // last plain second of a day
+            "2026-08-06T00:00:00Z", // canonical start-of-day (the only midnight form)
         ];
         for (const value of accepted) {
             test(`accepts ${value}`, () => {
@@ -274,6 +280,16 @@ describe("slice 4 pure reuse helpers", () => {
             "2026-08-06T13:00:00.Z", // empty fraction
             "",
             "not-a-timestamp",
+            "2026-08-06T24:00:00Z", // ISO end-of-day alias — parser normalizes to next day
+            "2026-08-06T24:00:00.000Z", // 24:00 with zero fraction — also parser-accepted
+            "2026-08-06T24:00:00+00:00", // 24:00 with offset designator
+            "2026-08-06T24:30:00Z", // hour 24 with nonzero minutes
+            "2026-08-06T12:00:00+14:01", // Terra finding: beyond +14:00 legal maximum
+            "2026-08-06T12:00:00+15:00", // Terra finding: offset hour beyond legal range
+            "2026-08-06T12:00:00+23:59", // parser-accepted extreme offset
+            "2026-08-06T12:00:00-12:01", // beyond -12:00 legal western maximum
+            "2026-08-06T12:00:00-15:00", // far beyond western maximum
+            "2026-08-06T12:00:00+12:99", // offset minute out of 00-59 (shape-valid)
         ];
         for (const value of rejected) {
             test(`rejects ${JSON.stringify(value)}`, () => {

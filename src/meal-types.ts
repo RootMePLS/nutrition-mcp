@@ -217,19 +217,42 @@ export function resolveConsumedAt(
 // precision, optional fractional seconds, and a MANDATORY explicit UTC
 // designator ('Z' or ±HH:MM) — storage is timestamptz and reuse idempotency
 // identity compares milliseconds, so ambiguous zoneless instants are unsafe.
-// `Date.parse` then runs as a backstop for impossible times (25:00), and the
-// date components are round-tripped because JSC normalizes impossible
-// calendar dates (2026-02-30 -> 2026-03-02) instead of returning NaN.
+// Numeric ranges are then enforced explicitly because ECMAScript parsers
+// silently NORMALIZE two shape-valid classes instead of rejecting them:
+//   - the ISO end-of-day alias 24:00:00 (becomes 00:00 of the NEXT day), and
+//   - UTC offsets beyond the legal zone window (any ±00:00..±23:59 parses).
+// The legal window is the real-world zone range [-12:00, +14:00]
+// (Baker Island / AoE west, Kiritimati east). `Date.parse` remains only a
+// backstop for the ranges parsers do reject (12:99 minutes, :60 seconds),
+// and the date components are round-tripped because JSC normalizes
+// impossible calendar dates (2026-02-30 -> 2026-03-02) instead of
+// returning NaN.
 // ---------------------------------------------------------------------------
 const STRICT_ISO_TIMESTAMP_RE =
-    /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|([+-])(\d{2}):(\d{2}))$/;
+
+const UTC_OFFSET_MAX_EAST_MINUTES = 14 * 60; // +14:00
+const UTC_OFFSET_MAX_WEST_MINUTES = 12 * 60; // -12:00
 
 export function isStrictIsoTimestamp(value: unknown): value is string {
     if (typeof value !== "string") return false;
     const match = STRICT_ISO_TIMESTAMP_RE.exec(value);
     if (!match) return false;
     if (Number.isNaN(Date.parse(value))) return false;
-    const [, year, month, day] = match;
+    const [, year, month, day, hour, offsetSign, offsetHours, offsetMinutes] =
+        match;
+    // Reject the parser-normalized end-of-day alias (24:00:00[.0+] parses).
+    if (Number(hour) > 23) return false;
+    if (offsetSign !== undefined) {
+        const minutesPart = Number(offsetMinutes);
+        if (minutesPart > 59) return false;
+        const totalMinutes = Number(offsetHours) * 60 + minutesPart;
+        const maxMinutes =
+            offsetSign === "+"
+                ? UTC_OFFSET_MAX_EAST_MINUTES
+                : UTC_OFFSET_MAX_WEST_MINUTES;
+        if (totalMinutes > maxMinutes) return false;
+    }
     const roundTrip = new Date(
         Date.UTC(Number(year), Number(month) - 1, Number(day)),
     );
