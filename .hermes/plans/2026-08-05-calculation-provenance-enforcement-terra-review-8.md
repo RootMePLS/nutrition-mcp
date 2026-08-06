@@ -16,19 +16,19 @@ The live tree passes the deterministic unit/DB runner and the new public calcula
 ## Commands actually run and exact results
 
 1. `DATABASE_URL_TEST=postgres://localhost/nutrition_mcp_test DATABASE_URL=postgres://localhost/nutrition_mcp_test bun run test:acceptance`
-   - **PASS**
-   - Unit gate: **444 pass, 84 skip, 0 fail, 528 tests across 33 files**.
-   - DB gate: **82 pass, 0 skip, 0 fail, 82 tests across 7 suites**.
-   - DB suite counts: `db.integration` 5, `meal-events` 41, `calculation-bundles.integration` 7, `meal-captures` 4, `mcp-food-tracking` 8, `backup-policy` 7, `legacy-meal-tools.integration` 10.
-   - The DB output is real PostgreSQL evidence against `postgres://localhost/nutrition_mcp_test`, not invented or inferred evidence.
+    - **PASS**
+    - Unit gate: **444 pass, 84 skip, 0 fail, 528 tests across 33 files**.
+    - DB gate: **82 pass, 0 skip, 0 fail, 82 tests across 7 suites**.
+    - DB suite counts: `db.integration` 5, `meal-events` 41, `calculation-bundles.integration` 7, `meal-captures` 4, `mcp-food-tracking` 8, `backup-policy` 7, `legacy-meal-tools.integration` 10.
+    - The DB output is real PostgreSQL evidence against `postgres://localhost/nutrition_mcp_test`, not invented or inferred evidence.
 2. `bun run typecheck`
-   - **PASS**: `src/ typechecks clean`.
+    - **PASS**: `src/ typechecks clean`.
 3. Targeted Prettier check over `scripts/test-db-gate.ts` and changed calculation/MCP/legacy files
-   - **PASS**: all matched files use Prettier code style.
+    - **PASS**: all matched files use Prettier code style.
 4. `git diff --check`
-   - **PASS**.
+    - **PASS**.
 5. Post-run `git status --short --branch`
-   - **PASS for preservation/hygiene**: no `exports/` directory; unrelated dirty files were not cleaned or overwritten.
+    - **PASS for preservation/hygiene**: no `exports/` directory; unrelated dirty files were not cleaned or overwritten.
 
 ## Acceptance evaluation
 
@@ -43,7 +43,7 @@ Positive evidence:
 Blocking findings:
 
 - `readPersistedWriteStatus()` still substitutes `c.source_result_ids ?? []`, `c.audit_evidence ?? {}`, and `c.algorithm_version ?? null` (`src/meal-events.ts:108-114`) instead of rejecting absent required audit fields. This can turn incomplete persisted evidence into a synthetic aggregate and then classify it as pending/unavailable rather than failing the durable seam closed.
-- `insertVersionChildren()` remains a separate compatibility persistence path (`src/meal-events.ts:409-589`) and synthesizes `LEGACY_COMPATIBILITY_SOURCE_ID`/compatibility provenance and canonical audit metadata. The calculation bundle seam likewise uses `COMPATIBILITY_SOURCE_ID` and `{ compatibility: true }` defaults (`src/calculation-bundles.ts:13`, `289-309`, `473-490`). This is not a synthetic *empty public response*, but it violates the requested exact provenance/audit contract for supplied evidence.
+- `insertVersionChildren()` remains a separate compatibility persistence path (`src/meal-events.ts:409-589`) and synthesizes `LEGACY_COMPATIBILITY_SOURCE_ID`/compatibility provenance and canonical audit metadata. The calculation bundle seam likewise uses `COMPATIBILITY_SOURCE_ID` and `{ compatibility: true }` defaults (`src/calculation-bundles.ts:13`, `289-309`, `473-490`). This is not a synthetic _empty public response_, but it violates the requested exact provenance/audit contract for supplied evidence.
 
 ### 2. Exact provider/canonical provenance/audit round-trip — PARTIAL, FAIL overall
 

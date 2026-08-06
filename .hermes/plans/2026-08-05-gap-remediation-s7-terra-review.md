@@ -8,9 +8,9 @@ Verdict: **FAIL — handoff correction required; implementation behavior otherwi
 ## Blocking finding
 
 1. **Handoff false claim: background work cannot be said not to survive a timed-out probe.**
-   - `.hermes/plans/2026-08-05-gap-remediation-s7-kimi-handoff.md:68-71` says that on timeout “No background work or retries survive a failed/timed-out probe.” This is false as written.
-   - The same handoff accurately documents the contrary limitation at lines 153-155: the underlying `pg` connection attempt is left to finish after the caller has received the bounded timeout result.
-   - `src/readiness.ts:62-68` retains the losing `pool.query("SELECT 1")` promise after `Promise.race` resolves through the timeout. Its rejection is handled by the race, and the app-created timer is cleaned up, but the underlying driver work is not cancelled. Repeated timed-out `/ready` probes can therefore accumulate in-flight driver connection attempts until the driver's own timeout/cleanup completes. The 2-second caller ceiling is still met.
+    - `.hermes/plans/2026-08-05-gap-remediation-s7-kimi-handoff.md:68-71` says that on timeout “No background work or retries survive a failed/timed-out probe.” This is false as written.
+    - The same handoff accurately documents the contrary limitation at lines 153-155: the underlying `pg` connection attempt is left to finish after the caller has received the bounded timeout result.
+    - `src/readiness.ts:62-68` retains the losing `pool.query("SELECT 1")` promise after `Promise.race` resolves through the timeout. Its rejection is handled by the race, and the app-created timer is cleaned up, but the underlying driver work is not cancelled. Repeated timed-out `/ready` probes can therefore accumulate in-flight driver connection attempts until the driver's own timeout/cleanup completes. The 2-second caller ceiling is still met.
 
 ### Required coder-kimi fix
 
@@ -33,25 +33,25 @@ Keep the existing known-limitation text, or merge it into this corrected paragra
 
 ## HTTP and resource evidence
 
-| Server configuration | `/ready` | `/health` |
-| --- | --- | --- |
-| `PORT=49431`, live `postgres://localhost:5432/nutrition_mcp_test` | `200`, `ok`, 0.038209 s | `200`, `ok`, 0.000952 s |
+| Server configuration                                                                                             | `/ready`                               | `/health`               |
+| ---------------------------------------------------------------------------------------------------------------- | -------------------------------------- | ----------------------- |
+| `PORT=49431`, live `postgres://localhost:5432/nutrition_mcp_test`                                                | `200`, `ok`, 0.038209 s                | `200`, `ok`, 0.000952 s |
 | `PORT=49432`, unreachable credential-bearing `postgres://live_user:***@localhost:5439/nope?sslmode=require#frag` | `503`, redacted JSON above, 0.012291 s | `200`, `ok`, 0.000738 s |
 
 Both temporary Bun servers were SIGTERM-stopped. Post-stop `lsof -nP -iTCP:49431 -sTCP:LISTEN` and port 49432 equivalents were empty; no server listener remained.
 
 ## Gates run by reviewer
 
-| Command | Result |
-| --- | --- |
-| `bun test src/readiness.test.ts` | 12 pass, 0 fail, 56 expects |
-| Independent late-rejection/hanging-stub test | 53 ms timeout; 0 unhandled rejections; no credential leak |
-| Independent repeated-hanging-stub test | 20/20 timeouts; no app-owned active timer handles |
-| `bun run typecheck` | `src/ typechecks clean` |
-| `bun run test:unit` | 498 pass, 156 skip, 0 fail; 654 tests |
+| Command                                                                                                                                    | Result                                                     |
+| ------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------- |
+| `bun test src/readiness.test.ts`                                                                                                           | 12 pass, 0 fail, 56 expects                                |
+| Independent late-rejection/hanging-stub test                                                                                               | 53 ms timeout; 0 unhandled rejections; no credential leak  |
+| Independent repeated-hanging-stub test                                                                                                     | 20/20 timeouts; no app-owned active timer handles          |
+| `bun run typecheck`                                                                                                                        | `src/ typechecks clean`                                    |
+| `bun run test:unit`                                                                                                                        | 498 pass, 156 skip, 0 fail; 654 tests                      |
 | `DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test bun run test:db` | 140 pass, 0 fail, 0 skip; 140 tests across all 8 DB suites |
-| `bunx prettier --check src/readiness.ts src/readiness.test.ts src/index.ts src/db.integration.test.ts README.md` | passed |
-| `git diff --check f1aee7d..2c83751` | clean |
+| `bunx prettier --check src/readiness.ts src/readiness.test.ts src/index.ts src/db.integration.test.ts README.md`                           | passed                                                     |
+| `git diff --check f1aee7d..2c83751`                                                                                                        | clean                                                      |
 
 ## Repository state
 

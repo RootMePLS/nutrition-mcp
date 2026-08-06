@@ -15,8 +15,8 @@ The remediation satisfies the sole prior blocking criterion without weakening or
 
 - The preserved FAIL review SHA-256 is exactly `26f5dddcc5b243997078244495b0fcf83242f06772f5130c0cded79d6afc991c`, byte-identical to the required value.
 - `git diff --name-status f9d9b7f..44921c7` contains exactly two paths:
-  - `A src/calculation-acceptance.fixtures.ts`
-  - `M src/calculation-acceptance.integration.test.ts`
+    - `A src/calculation-acceptance.fixtures.ts`
+    - `M src/calculation-acceptance.integration.test.ts`
 - No production `src/*.ts` file, migration, DB-gate file, S3 path, or S3 behavior changed. The remediation range's migration and `scripts/test-db-gate.ts` path queries are empty.
 - The fixture module's header states it contains shared S2 acceptance fixtures and that nothing in it is imported by production code. Repository grep finds its sole import in the acceptance integration test.
 - Main acceptance-suite line count: base 748; remediation 563. Extracted test fixture module: 205. Combined test-only source: 768 lines.
@@ -34,17 +34,17 @@ DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test \
 bun test src/calculation-acceptance.integration.test.ts
 ```
 
-| Check | Independent result |
-| --- | --- |
-| Focused run 1 | 8 pass, 0 fail, 56 `expect()` calls |
-| Focused run 2 | 8 pass, 0 fail, 56 `expect()` calls |
-| Focused run 3 | 8 pass, 0 fail, 56 `expect()` calls |
-| Focused run 4 | 8 pass, 0 fail, 56 `expect()` calls |
-| `bun run typecheck` | `src/ typechecks clean` |
-| `bun run test:unit` | 448 pass, 103 skip, 0 fail, 551 tests |
-| Explicit `bun run test:db` with both URLs above | 97 pass, 0 fail, 0 skip, 97 tests across 8 DB suites; S2 suite: 8 pass, 0 fail, 0 skip, 56 `expect()` calls |
-| `bunx prettier --check src/calculation-acceptance.integration.test.ts src/calculation-acceptance.fixtures.ts` | All matched files use Prettier code style |
-| `git diff --check f9d9b7f..44921c7` | clean (silent; explicit confirmation emitted) |
+| Check                                                                                                         | Independent result                                                                                          |
+| ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Focused run 1                                                                                                 | 8 pass, 0 fail, 56 `expect()` calls                                                                         |
+| Focused run 2                                                                                                 | 8 pass, 0 fail, 56 `expect()` calls                                                                         |
+| Focused run 3                                                                                                 | 8 pass, 0 fail, 56 `expect()` calls                                                                         |
+| Focused run 4                                                                                                 | 8 pass, 0 fail, 56 `expect()` calls                                                                         |
+| `bun run typecheck`                                                                                           | `src/ typechecks clean`                                                                                     |
+| `bun run test:unit`                                                                                           | 448 pass, 103 skip, 0 fail, 551 tests                                                                       |
+| Explicit `bun run test:db` with both URLs above                                                               | 97 pass, 0 fail, 0 skip, 97 tests across 8 DB suites; S2 suite: 8 pass, 0 fail, 0 skip, 56 `expect()` calls |
+| `bunx prettier --check src/calculation-acceptance.integration.test.ts src/calculation-acceptance.fixtures.ts` | All matched files use Prettier code style                                                                   |
+| `git diff --check f9d9b7f..44921c7`                                                                           | clean (silent; explicit confirmation emitted)                                                               |
 
 ## Acceptance checklist
 

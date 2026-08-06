@@ -74,18 +74,18 @@ Implement one repository-level projection/query boundary (preferably a new `src/
 
 For an active event `e`:
 
-| Legacy projection field | Event schema source / rule |
-|---|---|
-| `id` | `meal_events.id` (stable aggregate identifier) |
-| `user_id` | `meal_events.user_id`; every query predicates it explicitly |
-| `logged_at` | `meal_events.consumed_at` (the user-facing eating time; do not use `created_at`) |
-| `meal_type` | `meal_events.meal_type` |
-| `description` | Deterministic rendering of current-version `meal_event_items` in ordinal order, preferably `normalized_name` when present and otherwise `raw_item_text`; retain raw text and do not invent a parser |
-| `calories` … `alcohol_g` | Current-version event-scope canonical row in `meal_event_canonical_results` (`ordinal IS NULL`); preserve NULLs rather than converting missing values to zero before existing display/aggregation rules |
-| `notes` | No direct event-root equivalent. Candidate is the current-version item notes joined/rendered, or a documented empty/null value. This requires a product decision because search and export currently promise meal-level notes |
-| `idempotency_key` | `meal_events.idempotency_key` |
-| current version | `meal_events.current_version`; expose internally for correction/read consistency, not necessarily in every old text response |
-| deleted status | Exclude `status = 'deleted'` from normal reads; never expose a deleted root as an active meal |
+| Legacy projection field  | Event schema source / rule                                                                                                                                                                                                    |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                     | `meal_events.id` (stable aggregate identifier)                                                                                                                                                                                |
+| `user_id`                | `meal_events.user_id`; every query predicates it explicitly                                                                                                                                                                   |
+| `logged_at`              | `meal_events.consumed_at` (the user-facing eating time; do not use `created_at`)                                                                                                                                              |
+| `meal_type`              | `meal_events.meal_type`                                                                                                                                                                                                       |
+| `description`            | Deterministic rendering of current-version `meal_event_items` in ordinal order, preferably `normalized_name` when present and otherwise `raw_item_text`; retain raw text and do not invent a parser                           |
+| `calories` … `alcohol_g` | Current-version event-scope canonical row in `meal_event_canonical_results` (`ordinal IS NULL`); preserve NULLs rather than converting missing values to zero before existing display/aggregation rules                       |
+| `notes`                  | No direct event-root equivalent. Candidate is the current-version item notes joined/rendered, or a documented empty/null value. This requires a product decision because search and export currently promise meal-level notes |
+| `idempotency_key`        | `meal_events.idempotency_key`                                                                                                                                                                                                 |
+| current version          | `meal_events.current_version`; expose internally for correction/read consistency, not necessarily in every old text response                                                                                                  |
+| deleted status           | Exclude `status = 'deleted'` from normal reads; never expose a deleted root as an active meal                                                                                                                                 |
 
 The query must join `meal_event_versions` on `(event_id, version = current_version)`, left join the event-scope canonical result, and aggregate current-version items in ordinal order. It must never select stale version rows or sum item canonical rows in addition to the event aggregate. If event-scope canonical data is absent/pending, return nullable nutrients and let the established formatter show missing data; do not fabricate zeroes or recompute provider consensus in the read adapter.
 
@@ -123,10 +123,10 @@ Out of scope: Telegram/webhook ingestion, STT, OCR/vision, provider calls/worker
 These are real contract mismatches, not implementation details:
 
 1. **How should legacy `log_meal` become an event?** Its public input supplies one description and optional precomputed nutrients, but `CreateMealEventCommand` requires `items`, evidence, parser policy/creator, and provider results. Decide whether to:
-   - wrap the description as one `raw_item_text`, store nutrients as an explicitly named compatibility/provider result and derive canonical from it;
-   - route legacy `log_meal` to a new prepared-event MCP tool and change the public contract; or
-   - retire `log_meal` in favor of `log_meal_event`/capture confirmation.
-   The recommended bounded approach is the first, with a clearly labeled compatibility source and no claim of multi-provider consensus.
+    - wrap the description as one `raw_item_text`, store nutrients as an explicitly named compatibility/provider result and derive canonical from it;
+    - route legacy `log_meal` to a new prepared-event MCP tool and change the public contract; or
+    - retire `log_meal` in favor of `log_meal_event`/capture confirmation.
+      The recommended bounded approach is the first, with a clearly labeled compatibility source and no claim of multi-provider consensus.
 2. **What is the legacy `Meal.notes` mapping?** The event model has item notes and raw evidence but no meal-level notes. Decide whether to render/join current-version item notes, add a root-note field via a migration, or make notes unavailable in legacy search/export. Do not silently lose notes.
 3. **What does `update_meal` correction mean for fields omitted by the old patch API?** A correction needs a complete new version. Decide whether the adapter must read the current projection, merge the patch, and write a complete one-item version, or whether the public tool should be changed to accept a full event correction payload.
 4. **How should `delete_meal` report idempotent/not-found cases?** Existing code always says deleted after `DELETE` regardless of row count. Decide whether soft delete should preserve that response, return “not found,” or expose `deduplicated/already_deleted`.
@@ -141,6 +141,7 @@ If Dmitrii does not resolve these choices, coder-kimi must stop at the boundary 
 ### 1. Add the event-backed projection/repository boundary
 
 **Files:**
+
 - Create: `src/meal-event-projection.ts` (recommended) or modify `src/meal-events.ts` if the repository convention requires one module.
 - Modify: `src/meal-types.ts` only if a shared projection/compatibility type is needed.
 - Tests: new `src/meal-event-projection.test.ts` plus PostgreSQL cases in `src/meal-events.test.ts` or a focused integration file.
@@ -159,6 +160,7 @@ Tests must seed two users, multiple versions for one event, item-level and event
 ### 2. Convert the compatibility write path
 
 **Files:**
+
 - Modify: `src/db.ts` to remove production `meals` SQL and either delegate legacy function names to the event adapter or replace call sites with event repository functions.
 - Modify: `src/mcp.ts` for `log_meal`, `bulk_import_meals`, `update_meal`, `delete_meal`, and `buildMealProgress` dependency wiring.
 - Modify: `src/import.ts` only where the insert/idempotency callback types need an event-backed result.
@@ -173,6 +175,7 @@ For bulk import, preserve dry-run/control-total behavior and source-row idempote
 ### 3. Migrate insights and all eight read tools
 
 **Files:**
+
 - Modify: `src/mcp.ts` handlers and helper types/formatters.
 - Modify: `src/insights.ts` to consume the event projection (or introduce a conversion function at the repository boundary with tests proving no information-changing accidental zeroing).
 - Tests: `src/mcp.test.ts` and new real-DB MCP regression cases in `src/mcp-food-tracking.test.ts`.
@@ -190,6 +193,7 @@ Keep the public schemas/text stable. Confirm:
 ### 4. Migrate export, cleanup, and destructive account deletion
 
 **Files:**
+
 - Modify: `src/export.ts` to consume the event projection and document one-row-per-event behavior.
 - Modify: `src/db.ts` `deleteAllUserData` to delete event roots in dependency-safe order or use a transaction that removes child rows before roots, while preserving unrelated tables and export-file cleanup.
 - Tests: `src/export.test.ts`, `src/db.integration.test.ts`, and MCP tests for export/delete-all if present.
@@ -199,6 +203,7 @@ Ensure export never resurrects `meals`, leaks another user, or emits stale corre
 ### 5. Regression-proof migration/test database setup
 
 **Files:**
+
 - Modify: `src/db.integration.test.ts` only to add event-backed compatibility fixtures and ensure the complete `001 → 002 → 003 → 004 → 005` chain is applied.
 - Modify: `src/meal-events.test.ts` / `src/mcp-food-tracking.test.ts` for real MCP + DB coverage.
 - Do not modify `db/migrations/002_food_tracking.sql` to restore `meals`; add a new migration only if one of the approved decisions requires a root notes/compatibility column.

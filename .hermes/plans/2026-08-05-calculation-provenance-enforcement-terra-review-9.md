@@ -14,19 +14,19 @@ Terra 9 re-read the approved implementation plan and Terra 8, inspected the live
 ## Commands actually run
 
 1. `DATABASE_URL_TEST=postgres://localhost/nutrition_mcp_test DATABASE_URL=postgres://localhost/nutrition_mcp_test bun run test:acceptance`
-   - **PASS**
-   - Unit gate: **445 pass, 84 skip, 0 fail, 529 tests across 33 files**. The 84 skips are DB-gated tests intentionally excluded from the unit child; they are not counted as DB evidence.
-   - Deterministic DB gate: **82 pass, 0 skip, 0 fail, 82 tests across 7 suites**.
-   - Per-suite DB totals: `db.integration` 5, `meal-events` 41, `calculation-bundles.integration` 7, `meal-captures.integration` 4, `mcp-food-tracking` 8, `backup-policy` 7, `legacy-meal-tools.integration` 10.
-   - This is real PostgreSQL evidence against `postgres://localhost/nutrition_mcp_test`.
+    - **PASS**
+    - Unit gate: **445 pass, 84 skip, 0 fail, 529 tests across 33 files**. The 84 skips are DB-gated tests intentionally excluded from the unit child; they are not counted as DB evidence.
+    - Deterministic DB gate: **82 pass, 0 skip, 0 fail, 82 tests across 7 suites**.
+    - Per-suite DB totals: `db.integration` 5, `meal-events` 41, `calculation-bundles.integration` 7, `meal-captures.integration` 4, `mcp-food-tracking` 8, `backup-policy` 7, `legacy-meal-tools.integration` 10.
+    - This is real PostgreSQL evidence against `postgres://localhost/nutrition_mcp_test`.
 2. `bun run typecheck`
-   - **PASS**: `src/ typechecks clean`.
+    - **PASS**: `src/ typechecks clean`.
 3. Targeted `bunx prettier --check` over the acceptance runner and changed calculation/MCP/legacy/widget files
-   - **PASS**: all matched files use Prettier code style.
+    - **PASS**: all matched files use Prettier code style.
 4. `git diff --check`
-   - **PASS**.
+    - **PASS**.
 5. `bun run format:check`
-   - **Non-feature warning only / not a Terra blocker**: repository-wide check exits 1 because 13 `.hermes/plans/*.md` artifacts (the approved plan and prior Terra/legacy plan artifacts) have existing Markdown formatting warnings. No production source, test, runner, or widget file was reported by this command. Those unrelated plan artifacts were not rewritten.
+    - **Non-feature warning only / not a Terra blocker**: repository-wide check exits 1 because 13 `.hermes/plans/*.md` artifacts (the approved plan and prior Terra/legacy plan artifacts) have existing Markdown formatting warnings. No production source, test, runner, or widget file was reported by this command. Those unrelated plan artifacts were not rewritten.
 
 ## Acceptance evaluation
 

@@ -1,17 +1,20 @@
 # Brief: enforce calculation provenance for every nutrition meal write
 
 ## Repository
+
 - `/Users/fishhead/.workspace/projects/nutrition-mcp`
 - Bun + TypeScript MCP server, PostgreSQL, append-only `meal_events` model.
 - Current branch: `main`, currently aligned with `origin/main` at audit time.
 - Working tree is already dirty with unrelated tracked changes and many untracked `.hermes/plans/*` files. Do not reset, stash, overwrite, or clean unrelated work.
 
 ## User-visible incident
+
 On 2026-08-05 Hermes logged a breakfast through a path that persisted a meal with zero nutrition values instead of retaining the three calculations (own calculation, nutrition-local, MyFitnessPal) and the canonical median. The agent-side workflow was supposed to calculate independently, query nutrition-local and MFP, compare all three, preserve raw results, and store the median.
 
 The immediate data was manually repaired, but the repository must prevent a repeat and make the provenance queryable. A successful write response must not mean "meal row exists" when provider results/canonical evidence were not persisted.
 
 ## Grounded repository evidence
+
 - `db/migrations/002_food_tracking.sql` is the append-only event schema and explicitly removes the flat `meals` model.
 - `db/migrations/003_meal_captures.sql` adds capture/event storage.
 - `db/migrations/004_calculation_bundles.sql` adds `source_id`, `basis`, `units`, `provenance`, and `calculation_bundle_fingerprint`.
@@ -24,10 +27,12 @@ The immediate data was manually repaired, but the repository must prevent a repe
 - Existing adjacent plans may be stale or in progress. Reconcile live HEAD and current code before proposing file changes; do not assume the legacy meal migration plan is complete.
 
 ## Required workflow
+
 Planner-fable must inspect the live repository and write a grounded implementation plan at:
 `/Users/fishhead/.workspace/projects/nutrition-mcp/.hermes/plans/2026-08-05-calculation-provenance-enforcement-plan.md`
 
 The plan must answer:
+
 1. Which MCP-reachable meal creation/correction paths can persist a meal without a complete provider-result bundle or canonical result?
 2. Whether the fix belongs in `createMealEvent`, `confirm_meal_capture`, legacy compatibility writes, `commit_calculation_bundle`, or a new explicit command/tool boundary. State the invariant and the narrowest enforcement point.
 3. How the agent can retrieve all persisted calculations for an event/version, including provider, source_id, status, raw_payload, provenance, nutrients, basis, units, algorithm/request fingerprints, errors, canonical result, eligible/outlier providers, threshold, policy version, and fingerprint.
@@ -38,7 +43,9 @@ The plan must answer:
 8. How to handle already-created legacy events with no bundle. Recommend an honest read status and a correction/backfill path; do not fabricate historical provider results.
 
 ## Scope
+
 In scope:
+
 - A bounded backend/MCP contract change that makes calculation provenance durable and queryable.
 - Validation/guardrails at the narrowest common write boundary.
 - Readback of provider results and canonical audit evidence.
@@ -46,6 +53,7 @@ In scope:
 - Documentation and tool descriptions that state the actual contract.
 
 Out of scope:
+
 - Calling nutrition-local, MyFitnessPal, web search, or any external provider from the repository.
 - Telegram/agent orchestration, photo/OCR/vision/audio processing.
 - Rebuilding the old flat `meals` table or compatibility view.
@@ -53,6 +61,7 @@ Out of scope:
 - Manual repair of the breakfast data already corrected in external systems.
 
 ## Mandatory TDD/acceptance requirements for the plan
+
 - Start with failing tests proving a meal write cannot report nutrition-ready while its calculation bundle/canonical evidence is absent, unless the contract explicitly permits a pending state and exposes it.
 - Test three provider results with two-agree/one-outlier consensus and assert the persisted canonical value is recomputed, not a caller proposal.
 - Test raw payload and source/provenance fields survive a write/read round trip.
@@ -65,7 +74,9 @@ Out of scope:
 - Include focused, full-suite, typecheck, format, diff, and real MCP smoke/regression commands with real local values, never placeholders.
 
 ## Planner output
+
 The plan must contain:
+
 - current-reality gap report;
 - architecture stance and invariant;
 - exact files/functions/tests to modify or add;

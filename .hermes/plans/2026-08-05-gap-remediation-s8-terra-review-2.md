@@ -17,19 +17,19 @@ However, the handoff's claim that no client compatibility is asserted is false. 
 
 1. In `public/index.html`, replace the JSON-LD plus visible duplicate free-answer text at `:110` and `:2818`:
 
-   `Yes, it is completely free — no premium tiers, ads, or hidden costs. You just need a Claude or ChatGPT account to connect.`
+    `Yes, it is completely free — no premium tiers, ads, or hidden costs. You just need a Claude or ChatGPT account to connect.`
 
-   with:
+    with:
 
-   `The server does not charge a fee. Connection depends on your client's support for unauthenticated remote HTTP MCP servers; check your client's documentation.`
+    `The server does not charge a fee. Connection depends on your client's support for unauthenticated remote HTTP MCP servers; check your client's documentation.`
 
-   Replace the hero imperative at `:231`, `Connect Claude or ChatGPT, then just say what you ate`, with `Connect a client that supports unauthenticated remote HTTP MCP, then just say what you ate.` Do not name a client as known-compatible without an independently repeatable unauthenticated connection proof.
+    Replace the hero imperative at `:231`, `Connect Claude or ChatGPT, then just say what you ate`, with `Connect a client that supports unauthenticated remote HTTP MCP, then just say what you ate.` Do not name a client as known-compatible without an independently repeatable unauthenticated connection proof.
 
 2. In `scripts/gen-alternatives.ts`, replace every stated Claude/ChatGPT compatibility or account-sufficiency promise at current `:91`, `:240`, `:244`, `:328`, and the fallback `:689` with wording that makes no client-specific assertion. A safe replacement for the account-sufficiency clause is:
 
-   `The server has no Nutrition MCP account or sign-in step; connection depends on your client's support for unauthenticated remote HTTP MCP servers.`
+    `The server has no Nutrition MCP account or sign-in step; connection depends on your client's support for unauthenticated remote HTTP MCP servers.`
 
-   Rewrite the generated connector answer at `:670` to say only that the endpoint is `https://nutrition-mcp.com/mcp`, that it has no sign-in step, and that the reader must check the client's documentation for unauthenticated remote-server support. Remove `add ... as a custom connector in Claude` unless demonstrated.
+    Rewrite the generated connector answer at `:670` to say only that the endpoint is `https://nutrition-mcp.com/mcp`, that it has no sign-in step, and that the reader must check the client's documentation for unauthenticated remote-server support. Remove `add ... as a custom connector in Claude` unless demonstrated.
 
 3. In the alternatives-hub template in `scripts/gen-alternatives.ts`, replace current `:1111` (`can't connect to Claude or ChatGPT`) and `:1208-1209` (`it works with Claude, ChatGPT, and any MCP client`) with neutral endpoint/client-support wording. Also audit its generated `public/alternatives/index.html` output.
 
@@ -56,13 +56,13 @@ However, the handoff's claim that no client compatibility is asserted is false. 
 - Narrow grep: 24 total survivors: four README historical/negative lines and 20 semantically negative no-auth public/source lines. No positive OAuth, Google/email account, Supabase Auth, token, authorization-code, or registration claim remains.
 - Broad grep found the blocking client-compatibility phrases listed above, plus unrelated Google Analytics/Fonts and contact-email references.
 - Generator proof: ran `bun run scripts/gen-alternatives.ts`, formatted all seven outputs, captured SHA-256 values, repeated generator plus formatting, and got zero diff between hash lists. The six pages and hub were unchanged from HEAD after this proof. Second-run hashes:
-  - cronometer `42b2775cda8bd55ff43bf52dd926b8bbf134d2c7a39731ee22658b5495349bca`
-  - lifesum `ed2faa7a57695b882e8d21c8e16e0af0de378e13c003b7b8ed229d40fd5e3f54`
-  - lose-it `c4360b88f89f7a39e4046764fc12271c389f7958eb27f7fc9aeabe48a045e834`
-  - macrofactor `4c321a32597fe3abfe4eabb69119499d563858522eba1db366b473df2440a287`
-  - myfitnesspal `b294e750a6bcbbdbd737134a60c494b708b8e20c64a8a90d7b663e4c1c5afcb6`
-  - yazio `f8281e12025317274b0f74f70db92d972661b0aa147cc152bbd055302fae5ecb`
-  - index `4e7682d09eabd2c07d678b9ac85c88cbd339c56ab582a839639a83f7456eb3cb`
+    - cronometer `42b2775cda8bd55ff43bf52dd926b8bbf134d2c7a39731ee22658b5495349bca`
+    - lifesum `ed2faa7a57695b882e8d21c8e16e0af0de378e13c003b7b8ed229d40fd5e3f54`
+    - lose-it `c4360b88f89f7a39e4046764fc12271c389f7958eb27f7fc9aeabe48a045e834`
+    - macrofactor `4c321a32597fe3abfe4eabb69119499d563858522eba1db366b473df2440a287`
+    - myfitnesspal `b294e750a6bcbbdbd737134a60c494b708b8e20c64a8a90d7b663e4c1c5afcb6`
+    - yazio `f8281e12025317274b0f74f70db92d972661b0aa147cc152bbd055302fae5ecb`
+    - index `4e7682d09eabd2c07d678b9ac85c88cbd339c56ab582a839639a83f7456eb3cb`
 - JSON-LD: all 15/15 blocks across `public/index.html` and seven alternatives outputs parse as JSON.
 - HTML: Prettier parsed and checked all changed public/generator files successfully. An independent default `html-validate` run reported 298 existing repository-style/accessibility errors (lowercase doctype, XHTML-style void tags, inline styles, landmark naming, and title length), including unchanged head/layout lines. It did not identify a remediation-line structural parse failure; this pre-existing baseline is not the S8 blocker.
 - Focused affected tests: `bun test src/db-helpers.test.ts src/mcp.test.ts src/import.test.ts src/foods.test.ts src/insights.test.ts src/food-tracking-docs.test.ts` — 235 pass, 0 fail.

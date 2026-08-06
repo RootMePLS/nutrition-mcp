@@ -5,18 +5,18 @@
 ## Verification evidence
 
 - Targeted unit/schema run:
-  - `bun test src/nutrition-bundle.test.ts src/calculation-bundles.test.ts src/meal-events.test.ts --max-concurrency 1`
-  - **30 pass, 35 skip, 0 fail; 65 tests**.
-  - The 35 skipped tests are PostgreSQL repository/canonical/correction/journal tests gated by missing `DATABASE_URL_TEST`.
+    - `bun test src/nutrition-bundle.test.ts src/calculation-bundles.test.ts src/meal-events.test.ts --max-concurrency 1`
+    - **30 pass, 35 skip, 0 fail; 65 tests**.
+    - The 35 skipped tests are PostgreSQL repository/canonical/correction/journal tests gated by missing `DATABASE_URL_TEST`.
 - Full local run without a DB:
-  - `bun test --max-concurrency 1`
-  - **444 pass, 83 skip, 0 fail; 527 tests across 33 files**.
-  - This is not a DB/MCP acceptance pass; all DB-gated suites remain skipped.
+    - `bun test --max-concurrency 1`
+    - **444 pass, 83 skip, 0 fail; 527 tests across 33 files**.
+    - This is not a DB/MCP acceptance pass; all DB-gated suites remain skipped.
 - `bun run typecheck`: **PASS** (`src/ typechecks clean`).
 - Targeted Prettier check from the approved plan: **FAIL** for:
-  - `src/calculation-bundles.ts`
-  - `src/mcp.ts`
-  - `src/calculation-bundles.test.ts`
+    - `src/calculation-bundles.ts`
+    - `src/mcp.ts`
+    - `src/calculation-bundles.test.ts`
 - `git diff --check`: **PASS**.
 - `DATABASE_URL_TEST`: **unset**. No DSN was fabricated. `test:db` would refuse to run before executing suites because it requires `DATABASE_URL_TEST` and matching `DATABASE_URL`.
 

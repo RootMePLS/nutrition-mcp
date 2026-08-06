@@ -28,7 +28,7 @@ public data appear more complete than it is.
   `perDay.length === 0`. Because every sum begins at zero, an empty selection
   emits `0` for calories, protein, carbs, and fat.
 - The existing unit test `rangeAverages > an empty range divides nothing by
-  zero` passes by pinning that behavior. The handoff explicitly calls it
+zero` passes by pinning that behavior. The handoff explicitly calls it
   "legacy 0" (lines 206-211).
 - The changed README and agent-driven documentation instead say range averages
   are `null` when no day in the window carries the nutrient. An empty range has
@@ -55,7 +55,7 @@ also a public schema/value defect in `get_nutrition_summary` averages.
   log/update progress payload.
 - The newly added unit test itself proves macro presence is independent
   (`sumMeals presence contract > presence is per-macro: a calorie-only meal
-  still has null protein`), but it does not require coverage disclosure for
+still has null protein`), but it does not require coverage disclosure for
   that difference.
 
 **Counterexample**
@@ -70,7 +70,7 @@ false disclosure reaches range averages and trends.
 **Why this blocks**
 
 D4 requires counts such that a partial sum is never mistaken for a complete
-one. A count based on *any* macro cannot honestly make that guarantee when the
+one. A count based on _any_ macro cannot honestly make that guarantee when the
 four nutrients have different presence. **Per-nutrient coverage/count semantics
 are required** (or an equivalently unambiguous per-nutrient coverage object),
 not a single `meals_calculated` field. The handoff's stated interpretation is
@@ -84,7 +84,7 @@ pass.
 - Range contains exactly the expected 12 files / 944 insertions / 49 deletions:
   S3 implementation/tests/widgets/docs plus the handoff.
 - Commits are focused: `aef1947 fix: preserve null core macros in public
-  aggregates`, `89c9758 docs: document totals presence contract`, and
+aggregates`, `89c9758 docs: document totals presence contract`, and
   `45be11d docs: record S3 TDD evidence`.
 - No changed `db/` file, migration, storage, consensus, provider, or S4
   provenance-status file/field was found. `git diff --check <range>` was clean.
@@ -104,8 +104,8 @@ pass.
 - `bun test src/mcp.test.ts src/widgets.test.ts` — **122 pass / 0 fail**.
 - Real PostgreSQL + `InMemoryTransport` matrix:
   `DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test
-  DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test
-  RUN_LEGACY_MEAL_DB_TESTS=1 bun test src/legacy-meal-tools.integration.test.ts`
+DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test
+RUN_LEGACY_MEAL_DB_TESTS=1 bun test src/legacy-meal-tools.integration.test.ts`
   — **11 pass / 0 fail**. It exercises summary, goal progress, trends, and CSV
   for pending/mixed/explicit-zero fixtures.
 - `bun run typecheck` — clean.

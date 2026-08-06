@@ -47,9 +47,9 @@ Unrelated mentions of Google Analytics, Google Fonts, `external_write_authorized
 
 1. Replace every current auth claim above with no-auth copy. The exact safe replacement sentence for the install/connection contexts is:
 
-   `Connect using a client that supports this server's remote HTTP MCP endpoint. This checkout does not implement OAuth, Google or email/password accounts, account registration, access or refresh tokens, or authorization codes.`
+    `Connect using a client that supports this server's remote HTTP MCP endpoint. This checkout does not implement OAuth, Google or email/password accounts, account registration, access or refresh tokens, or authorization codes.`
 
-   Adapt only surrounding grammar/HTML structure; do not represent a specific third-party client as compatible unless its unauthenticated connection path is actually demonstrated.
+    Adapt only surrounding grammar/HTML structure; do not represent a specific third-party client as compatible unless its unauthenticated connection path is actually demonstrated.
 
 2. In `public/index.html`, update both the JSON-LD answers and their visible FAQ duplicates consistently. Remove the OAuth eyebrow. Replace all Claude/ChatGPT/other-client instructions that select OAuth, open a login page, or sign in through Google/email-password with a truthful generic endpoint/configuration statement. Keep the self-host PostgreSQL edit already made.
 
@@ -61,12 +61,12 @@ Unrelated mentions of Google Analytics, Google Fonts, `external_write_authorized
 
 6. Re-run the complete case-insensitive tracked-file sweep after remediation:
 
-   ```bash
-   git grep -inE 'supabase|google-auth|oauth|account-registration' -- ':!.hermes' ':!db/migrations'
-   git grep -inE 'oauth|google|email|password|account|access.?token|refresh.?token|authorization.?code|supabase' -- public/index.html public/alternatives scripts/gen-alternatives.ts public/privacy.html public/terms.html
-   ```
+    ```bash
+    git grep -inE 'supabase|google-auth|oauth|account-registration' -- ':!.hermes' ':!db/migrations'
+    git grep -inE 'oauth|google|email|password|account|access.?token|refresh.?token|authorization.?code|supabase' -- public/index.html public/alternatives scripts/gen-alternatives.ts public/privacy.html public/terms.html
+    ```
 
-   The first command must return only the four explicitly justified README lines above. The second must contain no current capability/product/legal claim for OAuth, Google/email accounts, Supabase Auth, tokens, authorization codes, or registration; unrelated font/analytics/contact-email mentions need not be removed.
+    The first command must return only the four explicitly justified README lines above. The second must contain no current capability/product/legal claim for OAuth, Google/email accounts, Supabase Auth, tokens, authorization codes, or registration; unrelated font/analytics/contact-email mentions need not be removed.
 
 ## Non-blocking acceptance checks that passed
 

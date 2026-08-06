@@ -27,10 +27,10 @@ If `graphify-out/graph.json` exists by the time planning starts, query it before
 - Do not reset, clean, discard or overwrite any existing work.
 - No workflow writer process was active when this brief was created.
 - Verified current-working-tree gates:
-  - unit: 445 pass, 0 fail, 84 DB-gated skips;
-  - PostgreSQL DB gate: 82 pass, 0 fail, 0 skip across 7 suites;
-  - typecheck: pass;
-  - `git diff --check`: pass.
+    - unit: 445 pass, 0 fail, 84 DB-gated skips;
+    - PostgreSQL DB gate: 82 pass, 0 fail, 0 skip across 7 suites;
+    - typecheck: pass;
+    - `git diff --check`: pass.
 - Repository-wide format remains red because of historical plan markdown. Keep this separate from changed-file formatting.
 
 ## Confirmed implementation gaps

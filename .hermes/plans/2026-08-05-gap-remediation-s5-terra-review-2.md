@@ -31,6 +31,7 @@ This exactly matches the required immutable hash.
 **Severity:** blocking / durability data loss
 
 **Files:**
+
 - `src/db.ts:50-65`
 - `src/meal-captures.ts:362-481`, specifically `stagedByThisInvocation` remains non-null until `withTransaction` resolves at `:463`, then catch deletes it at `:476-480`.
 
@@ -42,12 +43,12 @@ I used a real PostgreSQL database and real temporary filesystem root. The test p
 
 ```json
 {
-  "rejection": "Error: injected lost COMMIT acknowledgement after server commit",
-  "dbRows": 1,
-  "storageKey": "capture/1f813801-a72b-42c0-be83-bd0cbac61d14/photo-4353a1de7e0dcc4e87350e22d5c9ee9f3e70e8ce9c31533ec991bee8870c4814",
-  "dbSha": "4353a1de7e0dcc4e87350e22d5c9ee9f3e70e8ce9c31533ec991bee8870c4814",
-  "exists": false,
-  "recomputedSha": null
+    "rejection": "Error: injected lost COMMIT acknowledgement after server commit",
+    "dbRows": 1,
+    "storageKey": "capture/1f813801-a72b-42c0-be83-bd0cbac61d14/photo-4353a1de7e0dcc4e87350e22d5c9ee9f3e70e8ce9c31533ec991bee8870c4814",
+    "dbSha": "4353a1de7e0dcc4e87350e22d5c9ee9f3e70e8ce9c31533ec991bee8870c4814",
+    "exists": false,
+    "recomputedSha": null
 }
 ```
 
@@ -71,9 +72,9 @@ Keep this strictly S5 remediation; do not change migrations, do not start S6, do
 2. Keep the current rollback cleanup for failures definitively before COMMIT (e.g. stage/INSERT failure): it must still remove the newly staged file and leave no media row.
 3. For an unknown COMMIT outcome, never delete immediately. Reconcile on a fresh usable connection: lock the capture row and query `(capture_id, sha256)` while that lock is held. If the committed row exists, retain the file. Only if the fresh locked reconciliation definitively proves the media row absent may it delete the newly staged key; if reconciliation itself is unavailable/ambiguous, retain the possible orphan rather than delete potentially referenced data. Do not issue `ROLLBACK` as if it proves a post-COMMIT failure was rolled back; discard/release the uncertain connection appropriately.
 4. Add real PostgreSQL + filesystem tests for both commit outcomes:
-   - proxy runs real COMMIT then loses its acknowledgement: attach rejects, but the one capture-media row and real file remain; recomputed on-disk SHA equals the row SHA;
-   - proxy rejects COMMIT before sending it: no row and no file remain;
-   - include a retry/reconciliation assertion so the retained committed file returns the original media identity.
+    - proxy runs real COMMIT then loses its acknowledgement: attach rejects, but the one capture-media row and real file remain; recomputed on-disk SHA equals the row SHA;
+    - proxy rejects COMMIT before sending it: no row and no file remain;
+    - include a retry/reconciliation assertion so the retained committed file returns the original media identity.
 5. Correct the `ON CONFLICT` branch. After reading the conflict row, retain the staged key only when it is exactly the row's referenced key. If storage keys differ, delete only the invocation-owned, newly staged, still-unreferenced key, under a capture lock/reconciliation that excludes a racing attach. Add a test with an injected/non-cooperating conflicting row with a different key, asserting the conflict row/file survives and the redundant staged key is removed. If the implementation instead intentionally retains this orphan, document the bounded orphan policy and demonstrate that it cannot grow unbounded; the current unconditional retention is not acceptable.
 6. Preserve and rerun all current F1 adversarial tests: wrong-user same-bytes, post-cancel, post-confirm with `meal_event_media` reference, injected duplicate failure, coordinated concurrent successes with rejected/failing participants, normal dedup, initial INSERT rollback, missing and corrupt existing-file healing. Every pre-existing-row case must assert capture row, event reference where applicable, actual file bytes, and recomputed SHA-256.
 

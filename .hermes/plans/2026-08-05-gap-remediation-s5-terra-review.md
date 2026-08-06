@@ -19,6 +19,7 @@ The normal lifecycle and all requested gates are green, but a rejected identical
 **Severity:** blocking / durability and authorization failure
 
 **Files:**
+
 - `src/meal-captures.ts:347-425`
 - specifically staging before ownership/state validation at `:349-354`, and unconditional cleanup at `:421-425`
 
@@ -40,11 +41,11 @@ Actual result:
 
 ```json
 {
-  "before": true,
-  "rejected": "Error: invalid meal capture: capture not found",
-  "after": false,
-  "dbRows": 1,
-  "storageKey": "capture/9ffc3df0-4a29-4fb3-8e77-fdfbbcd8d554/photo-ae23791219e59390237eb38ab667d0e9590eaa4c343eda697b24a186eadfdcc3"
+    "before": true,
+    "rejected": "Error: invalid meal capture: capture not found",
+    "after": false,
+    "dbRows": 1,
+    "storageKey": "capture/9ffc3df0-4a29-4fb3-8e77-fdfbbcd8d554/photo-ae23791219e59390237eb38ab667d0e9590eaa4c343eda697b24a186eadfdcc3"
 }
 ```
 
@@ -61,11 +62,11 @@ Keep the repair strictly in S5 scope; do not modify migrations or begin S6.
 3. On any failure, delete only a file proven to have been newly created by this invocation and still unreferenced. For the deterministic same-key case, a safer strategy is to avoid deleting it if an existing DB row/reference is present; where a separate temporary staging key is introduced, clean up that private staging key only.
 4. Preserve correct behavior for: initial stage/insert rollback (no row and no file), dedup retry (one row and one file), cross-user rejection, non-editable-state rejection, and concurrent identical success/failure.
 5. Add real PostgreSQL + filesystem tests that first attach valid bytes, then verify all of the following leave the original row and file intact:
-   - same capture and bytes from the wrong user;
-   - same owner and bytes after cancelling or confirming the capture;
-   - injected transaction failure on a second identical attach after the first has committed;
-   - if practical, a coordinated concurrent identical successful attach plus a failing/rejected attach.
-   Each case must assert the original file still exists and recomputes to its committed SHA-256, not just that the root file set is empty/non-empty.
+    - same capture and bytes from the wrong user;
+    - same owner and bytes after cancelling or confirming the capture;
+    - injected transaction failure on a second identical attach after the first has committed;
+    - if practical, a coordinated concurrent identical successful attach plus a failing/rejected attach.
+      Each case must assert the original file still exists and recomputes to its committed SHA-256, not just that the root file set is empty/non-empty.
 6. Rerun the exact S5 focused suites and full gate battery, report RED/GREEN/REFACTOR evidence, and hand off a new commit range. The fix must not delete or weaken existing normal lifecycle tests.
 
 ## Acceptance evidence that passed

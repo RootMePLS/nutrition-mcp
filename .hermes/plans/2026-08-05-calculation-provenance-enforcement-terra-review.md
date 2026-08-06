@@ -28,25 +28,25 @@
 ## Focused fixes plan for coder-kimi
 
 1. **Enforce and expose status across every write path**
-   - Files: `src/meal-events.ts`, `src/meal-captures.ts`, `src/mcp.ts`, `src/db.ts`, `src/meal-event-projection.ts`.
-   - Add shared pending/unavailable derivation at version persistence/readback; keep compatibility writes pending/compatibility and preserve SQL NULL/JSON null. Confirm capture may create pending, but its public response must include status, fingerprint (nullable), and nullable canonical data. Ensure legacy `log_meal`, bulk import, and `update_meal` never render missing nutrition as numeric zero while preserving explicit zero.
-   - Tests: add/update real MCP and legacy integration assertions for empty providers, failed/unavailable providers, missing canonical, compatibility writes, capture confirmation, and explicit zero vs NULL.
+    - Files: `src/meal-events.ts`, `src/meal-captures.ts`, `src/mcp.ts`, `src/db.ts`, `src/meal-event-projection.ts`.
+    - Add shared pending/unavailable derivation at version persistence/readback; keep compatibility writes pending/compatibility and preserve SQL NULL/JSON null. Confirm capture may create pending, but its public response must include status, fingerprint (nullable), and nullable canonical data. Ensure legacy `log_meal`, bulk import, and `update_meal` never render missing nutrition as numeric zero while preserving explicit zero.
+    - Tests: add/update real MCP and legacy integration assertions for empty providers, failed/unavailable providers, missing canonical, compatibility writes, capture confirmation, and explicit zero vs NULL.
 
 2. **Bind public bundle commit to the authenticated user**
-   - Files: `src/calculation-bundles.ts`, `src/mcp.ts`.
-   - Add a required user-scoped option/metadata to `commitCalculationBundle()` and include `user_id` in the locked version/root query (including dedupe path). Pass `userId` from the public handler. Reject cross-user/deleted events without mutation.
-   - Tests: `src/mcp-food-tracking.test.ts` or `src/calculation-bundles.integration.test.ts`: two-user cross-user commit/read rejection and row-count/current-version unchanged.
+    - Files: `src/calculation-bundles.ts`, `src/mcp.ts`.
+    - Add a required user-scoped option/metadata to `commitCalculationBundle()` and include `user_id` in the locked version/root query (including dedupe path). Pass `userId` from the public handler. Reject cross-user/deleted events without mutation.
+    - Tests: `src/mcp-food-tracking.test.ts` or `src/calculation-bundles.integration.test.ts`: two-user cross-user commit/read rejection and row-count/current-version unchanged.
 
 3. **Finish the public correction contract**
-   - Files: `src/mcp.ts`, `src/calculation-bundles.test.ts`, `src/mcp-food-tracking.test.ts`, `src/calculation-bundles.integration.test.ts`.
-   - Declare a strict output schema (or the repository’s established equivalent), test valid/invalid inputs, real MCP call, backend recomputation against a hostile canonical proposal, immutable prior rows, `current_version + 1`, same-key exact dedupe, same-key identity conflict rejection, user scope, deleted hiding, and pending-only external journal intent.
+    - Files: `src/mcp.ts`, `src/calculation-bundles.test.ts`, `src/mcp-food-tracking.test.ts`, `src/calculation-bundles.integration.test.ts`.
+    - Declare a strict output schema (or the repository’s established equivalent), test valid/invalid inputs, real MCP call, backend recomputation against a hostile canonical proposal, immutable prior rows, `current_version + 1`, same-key exact dedupe, same-key identity conflict rejection, user scope, deleted hiding, and pending-only external journal intent.
 
 4. **Harden provenance readback derivation**
-   - Files: `src/meal-events.ts` plus integration tests.
-   - Verify selected version belongs to the scoped active root and derive `ready` only from a complete consistent bundle/canonical/provider evidence set; distinguish missing evidence from persisted insufficient/failed/unavailable evidence. Assert every required provider field, raw payload, provenance, source ID, basis, units, errors, canonical audit evidence, algorithm version, fingerprint, current/historical selection, and deleted/cross-user behavior.
+    - Files: `src/meal-events.ts` plus integration tests.
+    - Verify selected version belongs to the scoped active root and derive `ready` only from a complete consistent bundle/canonical/provider evidence set; distinguish missing evidence from persisted insufficient/failed/unavailable evidence. Assert every required provider field, raw payload, provenance, source ID, basis, units, errors, canonical audit evidence, algorithm version, fingerprint, current/historical selection, and deleted/cross-user behavior.
 
 5. **Run the real gate before approval**
-   - Do not invent a DSN. Set a real disposable `DATABASE_URL_TEST` and matching `DATABASE_URL` only when available; run the focused DB/MCP/legacy suites serially, then full suite, typecheck, targeted Prettier, and `git diff --check`. Record exact pass/skip/fail counts. If the DB remains unavailable, keep the gate FAIL.
+    - Do not invent a DSN. Set a real disposable `DATABASE_URL_TEST` and matching `DATABASE_URL` only when available; run the focused DB/MCP/legacy suites serially, then full suite, typecheck, targeted Prettier, and `git diff --check`. Record exact pass/skip/fail counts. If the DB remains unavailable, keep the gate FAIL.
 
 ## Working-tree scope / hygiene
 

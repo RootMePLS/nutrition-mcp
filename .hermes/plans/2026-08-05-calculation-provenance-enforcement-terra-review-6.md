@@ -22,18 +22,18 @@ Current HEAD: `fdfa2e6 test: close acceptance gate gaps for meal event tooling`.
 Commands actually run:
 
 - `DATABASE_URL_TEST=postgres://localhost/nutrition_mcp_test DATABASE_URL=postgres://localhost/nutrition_mcp_test bun run test:db`
-  - **PASS: 81 pass, 0 fail, 0 skip, 81 tests across 7 DB suites.**
-  - Includes calculation bundle persistence/correction tests, event repository tests, capture tests, public legacy regression tests, and MCP food-tracking tests.
+    - **PASS: 81 pass, 0 fail, 0 skip, 81 tests across 7 DB suites.**
+    - Includes calculation bundle persistence/correction tests, event repository tests, capture tests, public legacy regression tests, and MCP food-tracking tests.
 - `bun run typecheck`
-  - **PASS: `src/ typechecks clean`.**
+    - **PASS: `src/ typechecks clean`.**
 - Targeted Prettier over changed feature/test files
-  - **FAIL: `src/mcp.ts` is not formatted.** Other checked files were clean.
+    - **FAIL: `src/mcp.ts` is not formatted.** Other checked files were clean.
 - `git diff --check`
-  - **PASS.**
+    - **PASS.**
 - `bun test --max-concurrency 1`
-  - **496 pass, 11 skip, 0 fail, 507 tests across 33 files.** The 11 skips are the opt-in legacy DB regression suite; this is not complete public coverage.
+    - **496 pass, 11 skip, 0 fail, 507 tests across 33 files.** The 11 skips are the opt-in legacy DB regression suite; this is not complete public coverage.
 - `DATABASE_URL_TEST=... DATABASE_URL=... RUN_LEGACY_MEAL_DB_TESTS=1 bun test --max-concurrency 1`
-  - **497 pass, 8 fail, 0 skip, 505 tests across 33 files.** All eight failures are in `src/legacy-meal-tools.integration.test.ts`; shared `m1`/`u1` state/order-sensitive fixture failures cause missing rows, stale descriptions, failed current-projection assertions, and duplicate import expectations. Therefore the full run is not deterministic/green.
+    - **497 pass, 8 fail, 0 skip, 505 tests across 33 files.** All eight failures are in `src/legacy-meal-tools.integration.test.ts`; shared `m1`/`u1` state/order-sensitive fixture failures cause missing rows, stale descriptions, failed current-projection assertions, and duplicate import expectations. Therefore the full run is not deterministic/green.
 
 The working tree contains many unrelated pre-existing dirty and untracked plan/source files. They were preserved. The requested review artifact is the only file Terra created.
 

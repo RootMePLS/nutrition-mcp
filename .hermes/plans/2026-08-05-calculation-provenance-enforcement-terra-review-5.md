@@ -14,8 +14,8 @@ Reviewed:
 ### Verification actually run
 
 - `DATABASE_URL_TEST=postgres://localhost/nutrition_mcp_test DATABASE_URL=postgres://localhost/nutrition_mcp_test bun run test:db`
-  - **PASS: 81 pass, 0 fail, 0 skip, 81 tests across 7 DB suites.**
-  - Suites executed: `db.integration.test.ts` 5, `meal-events.test.ts` 41, `calculation-bundles.integration.test.ts` 7, `meal-captures.integration.test.ts` 4, `mcp-food-tracking.test.ts` 8, `backup-policy.test.ts` 7, `legacy-meal-tools.integration.test.ts` 9.
+    - **PASS: 81 pass, 0 fail, 0 skip, 81 tests across 7 DB suites.**
+    - Suites executed: `db.integration.test.ts` 5, `meal-events.test.ts` 41, `calculation-bundles.integration.test.ts` 7, `meal-captures.integration.test.ts` 4, `mcp-food-tracking.test.ts` 8, `backup-policy.test.ts` 7, `legacy-meal-tools.integration.test.ts` 9.
 - `bun run typecheck`: **PASS** (`src/ typechecks clean`).
 - targeted Prettier on feature files: **PASS**.
 - `git diff --check`: **PASS**.

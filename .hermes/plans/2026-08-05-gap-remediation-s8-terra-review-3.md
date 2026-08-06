@@ -20,19 +20,19 @@ Change only `src/legacy-meal-tools.integration.test.ts`; do not modify runtime c
 1. Add `setSystemTime` to the existing `bun:test` import.
 2. At the beginning of this one serial test, derive a UTC date from the real clock, construct a same-day noon UTC instant, and freeze Bun's clock before `callTools`, for example:
 
-   ```ts
-   const frozenNow = new Date(
-       `${new Date().toISOString().slice(0, 10)}T12:00:00.000Z`,
-   );
-   setSystemTime(frozenNow);
-   const day = frozenNow.toISOString().slice(0, 10);
-   try {
-       await callTools(/* existing callback, unchanged assertions */);
-       // existing post-call assertions
-   } finally {
-       setSystemTime();
-   }
-   ```
+    ```ts
+    const frozenNow = new Date(
+        `${new Date().toISOString().slice(0, 10)}T12:00:00.000Z`,
+    );
+    setSystemTime(frozenNow);
+    const day = frozenNow.toISOString().slice(0, 10);
+    try {
+        await callTools(/* existing callback, unchanged assertions */);
+        // existing post-call assertions
+    } finally {
+        setSystemTime();
+    }
+    ```
 
 3. Preserve the current eight read operations/assertions and their dynamic `day` arguments exactly; merely move them inside the `try`. The repository already demonstrates the correct `setSystemTime()` reset pattern in `src/rate-limit.test.ts:16-24`.
 4. Run the explicit DB gate with both URLs, plus the existing focused and full unit gates. This freezes both the test's stored date and profile-less `get_meals_today`'s UTC "today" for the complete transport transaction, eliminating the rollover window and avoiding clock leakage into subsequent serial tests.
@@ -44,13 +44,13 @@ Change only `src/legacy-meal-tools.integration.test.ts`; do not modify runtime c
 - The auth matrix has four README historical/negative survivors plus semantically negative public/source wording. No current Supabase, OAuth, Google/email/password account, token, authorization-code, or registration capability claim survives. `public/privacy.html` and `public/terms.html` truthfully describe the lack of an account/authentication layer.
 - Every named-client survivor was audited line-by-line. They are limited to: MCP protocol examples; competitor facts that the competitor has no MCP connector/server; quoted search-query text; and conditional documentation referrals. None asserts compatibility of this endpoint.
 - `scripts/gen-alternatives.ts` is the sole source for all seven alternatives outputs. Two real generator-plus-Prettier runs produced identical SHA-256 lists and zero worktree drift before this review artifact:
-  - cronometer `3b2dd23410baeaab88416f3804377a65b9cbccbc6e7ebcf148627b159156e247`
-  - index `ae26fc7d5b570733e456ea965d2724925f1e6aa4e2adba49e2b3ef41960be720`
-  - lifesum `e892688248deec7a4802b04a0577244d0386ed825daf6c92bca7e49f59c3e62f`
-  - lose-it `8afcf0705bfa7f629a6b59a67c761086bac0304936f5b327dff0e479979b2274`
-  - macrofactor `1cee872d69c6d35ec59462624ecb0abeb8f339fbf56301bb325e5d5991e13d2f`
-  - myfitnesspal `c3c515014483c4c965b058d6cd04227e21e1da4171ffee37fa30956a86295c26`
-  - yazio `d334be633e76b1c4b5843e153ea132b81ac8f652673df2d456e8db95f04437e8`
+    - cronometer `3b2dd23410baeaab88416f3804377a65b9cbccbc6e7ebcf148627b159156e247`
+    - index `ae26fc7d5b570733e456ea965d2724925f1e6aa4e2adba49e2b3ef41960be720`
+    - lifesum `e892688248deec7a4802b04a0577244d0386ed825daf6c92bca7e49f59c3e62f`
+    - lose-it `8afcf0705bfa7f629a6b59a67c761086bac0304936f5b327dff0e479979b2274`
+    - macrofactor `1cee872d69c6d35ec59462624ecb0abeb8f339fbf56301bb325e5d5991e13d2f`
+    - myfitnesspal `c3c515014483c4c965b058d6cd04227e21e1da4171ffee37fa30956a86295c26`
+    - yazio `d334be633e76b1c4b5843e153ea132b81ac8f652673df2d456e8db95f04437e8`
 - New public prose is concrete, conditional where compatibility is not proved, and free of the former invented client/account promises. Humanizer quality is acceptable.
 
 ## Prior S8 acceptance rechecks — PASS

@@ -72,21 +72,21 @@ Audit: `.hermes/plans/2026-08-05-plan-vs-code-gap-audit.md` (Russian; UTF-8)
 ## 2. Global campaign rules (apply to every slice)
 
 1. **One slice per coder-kimi invocation.** The coder receives this plan plus the slice number. Reviewer-terra gates before the next slice.
-2. **TDD is mandatory and visible.** Every code slice shows RED (new test failing, command + failing output), GREEN (implementation, command + passing output), REFACTOR (cleanup with gates still green). Tests must fail for the *right reason* — reviewer-terra checks the RED failure message.
+2. **TDD is mandatory and visible.** Every code slice shows RED (new test failing, command + failing output), GREEN (implementation, command + passing output), REFACTOR (cleanup with gates still green). Tests must fail for the _right reason_ — reviewer-terra checks the RED failure message.
 3. **Gates and exact env.** PostgreSQL runs the disposable DB. Canonical env for every DB/MCP command:
-   ```bash
-   export DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test
-   export DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test
-   ```
-   (`scripts/test-db-gate.ts` refuses to run unless both are set and equal.)
-   Full gate battery, run before every commit that touches `src/`, `db/`, or `scripts/`:
-   ```bash
-   bun run typecheck                      # expect: src/ typechecks clean
-   bun run test:unit                      # expect: 0 fail; report pass/skip counts
-   bun run test:db                        # expect: 0 fail, 0 skip; report pass count and suite count
-   git diff --check                       # expect: silence
-   bunx prettier --check <changed files>  # expect: all matched files use Prettier code style
-   ```
+    ```bash
+    export DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test
+    export DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test
+    ```
+    (`scripts/test-db-gate.ts` refuses to run unless both are set and equal.)
+    Full gate battery, run before every commit that touches `src/`, `db/`, or `scripts/`:
+    ```bash
+    bun run typecheck                      # expect: src/ typechecks clean
+    bun run test:unit                      # expect: 0 fail; report pass/skip counts
+    bun run test:db                        # expect: 0 fail, 0 skip; report pass count and suite count
+    git diff --check                       # expect: silence
+    bunx prettier --check <changed files>  # expect: all matched files use Prettier code style
+    ```
 4. **Counts are reported separately** in every slice handoff: `unit: X pass / Y skip / 0 fail`, `db: Z pass / 0 skip / 0 fail across N suites`. Baselines: unit 445/84/0, db 82/0/0/7. Counts may only grow; a shrink without an explanation in the handoff is a terra FAIL.
 5. **Commit discipline.** Focused commits per logical task, conventional-commit style messages, no unrelated files staged (`git status --porcelain` reviewed before each commit). Push (`git push origin main`) only at slice end after the full gate battery is green.
 6. **Never**: restore flat `meals` or a compat view; fabricate provider rows; turn `NULL` into `0`; mark pending journal rows `synced`; import Telegram/provider/STT/OCR/vision code into the domain layer; reset/clean/discard working-tree state.
@@ -185,16 +185,21 @@ git status -sb                    # ## main...origin/main (no ahead/behind)
 **RED tests (write first, run, show failure):**
 
 Unit (no DB):
+
 ```ts
 // src/calculation-bundles.test.ts
 test("recomputeCalculationBundle groups consensus per scope", () => {
-    const out = recomputeCalculationBundle(bundleWith(eventResults, item0Results, item1Results));
-    expect(out.event.nutrients.calories.value).toBe(500);   // from event-scope providers only
+    const out = recomputeCalculationBundle(
+        bundleWith(eventResults, item0Results, item1Results),
+    );
+    expect(out.event.nutrients.calories.value).toBe(500); // from event-scope providers only
     expect(out.items.get(0)!.nutrients.calories.value).toBe(300);
     expect(out.items.get(1)!.nutrients.calories.value).toBe(200);
 });
 ```
+
 DB matrix (extend `src/calculation-bundles.integration.test.ts`), cases required:
+
 1. Bundle with event scope + items 0 and 1, all providers succeeded -> exactly 3 canonical rows (`scope_key` in `event`, `item:0`, `item:1`); each row's `source_result_ids` reference only provider rows with the same `ordinal` (assert via SQL join).
 2. **Negative isolation test:** an extreme item-scoped calorie value does NOT change the event canonical calories (assert event canonical equals consensus of event-scope providers alone).
 3. Mixed statuses: item 1 has only `failed`/`unavailable` providers -> item 1 canonical row exists with `status='pending'`/`consensus_status='insufficient_data'` and NULL nutrients; event and item 0 unaffected.
@@ -315,6 +320,7 @@ DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=post
 **RED tests:**
 
 Unit:
+
 ```ts
 test("sumMeals: fully pending selection yields null core macros", () => {
     const t = sumMeals([pendingMeal(), pendingMeal()]);
@@ -333,6 +339,7 @@ test("sumMeals: explicit zero is a real zero, not null", () => {
     expect(t.meals_calculated).toBe(1);
 });
 ```
+
 MCP integration (real transport + PostgreSQL, in `src/legacy-meal-tools.integration.test.ts`): `get_nutrition_summary`, `get_goal_progress`, `get_trends`, and `export_meals` for three fixtures — fully pending day, mixed day, explicit-zero meal. Assert `structuredContent` nulls/counts and CSV empty-cell behavior. **Remove/rewrite the existing assertions that pin `calories: 0` for pending meals** (audit: the old test enshrines the bug) — list every deleted assertion in the handoff.
 
 ```bash
@@ -379,6 +386,7 @@ DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=post
 - Test: `src/legacy-meal-tools.integration.test.ts` — MCP round-trips assert the new fields for (a) plain `log_meal` -> `compatibility`, `has_calculation_bundle:false`; (b) `update_meal` on a compatibility event -> same; (c) an event later completed by `commit_calculation_bundle` -> a follow-up read shows `complete` via provenance tool (cross-check).
 
 **RED:**
+
 ```bash
 DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test \
   RUN_LEGACY_MEAL_DB_TESTS=1 bun test src/legacy-meal-tools.integration.test.ts
@@ -423,16 +431,14 @@ DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=post
 **RED tests:**
 
 Repository-level (real PostgreSQL + tmp dir media root):
+
 1. attach happy path: file exists at generated key, on-disk SHA-256 recomputed == returned `sha256`, DB row matches (`storage_key`, `byte_size`, `sha256`).
 2. rollback cleanup: failure injected between staging and COMMIT -> DB row absent AND file absent.
 3. retry-safe: same bytes attached twice -> one DB row, one file, second call returns same identity without error.
 4. tampered hash: caller supplies wrong `sha256` -> rejected, nothing staged/persisted.
 5. capture state guard: attach on `confirmed`/`cancelled` capture -> `"capture is no longer editable"`.
 
-MCP-level (`InMemoryTransport` + real PostgreSQL):
-6. full public path: `start_meal_capture` -> `attach_meal_capture_media` -> `save_meal_capture_draft` (draft referencing the media) -> `confirm_meal_capture` succeeds and event aggregate carries the media row (this is the exact path the audit says is impossible today — confirmation currently rejects media-bearing drafts because the table can't be filled over MCP).
-7. cross-user attach rejected (distinct name from existing cross-user tests — see S6 dedup).
-8. malformed input matrix: oversized payload, disallowed MIME, invalid base64 -> structured errors, no rows/files.
+MCP-level (`InMemoryTransport` + real PostgreSQL): 6. full public path: `start_meal_capture` -> `attach_meal_capture_media` -> `save_meal_capture_draft` (draft referencing the media) -> `confirm_meal_capture` succeeds and event aggregate carries the media row (this is the exact path the audit says is impossible today — confirmation currently rejects media-bearing drafts because the table can't be filled over MCP). 7. cross-user attach rejected (distinct name from existing cross-user tests — see S6 dedup). 8. malformed input matrix: oversized payload, disallowed MIME, invalid base64 -> structured errors, no rows/files.
 
 ```bash
 DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test \
@@ -479,6 +485,7 @@ DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=post
 - Test: `src/mcp.test.ts` — exact runtime schema tests: call each capture tool over `InMemoryTransport` (DB-gated where needed -> place DB-dependent ones in `src/mcp-food-tracking.test.ts`), parse `structuredContent` with the declared schema, assert `.strict()` rejection of extra keys.
 
 **RED:**
+
 ```bash
 DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test \
   bun test src/mcp-food-tracking.test.ts   # RED: structuredContent undefined for capture tools
@@ -519,6 +526,7 @@ bun test src/mcp.test.ts                   # RED where transport-only schema che
 - Test: `src/readiness.test.ts` (unit: redaction never leaks password/user; error mapping), plus a DB-gated case in `src/db.integration.test.ts`: readiness ok against the live test DB; readiness fails against a wrong-port pool (`postgres://localhost:5439/nope`, short timeout) with a redacted message.
 
 **RED:**
+
 ```bash
 bun test src/readiness.test.ts   # RED: module missing
 DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test \
@@ -528,11 +536,13 @@ DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=post
 **GREEN boundary:** the two files + `src/index.ts` route wiring. **REFACTOR:** none expected.
 
 **Acceptance commands:** full gate battery, plus manual evidence in handoff:
+
 ```bash
 DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test bun src/index.ts &   # dev-only, kill after
 curl -s -o /dev/null -w '%{http_code}\n' localhost:3000/ready   # 200
 curl -s localhost:3000/health                                    # ok
 ```
+
 (Port per README/env; if the server reads `PORT`, use it. Kill the process afterwards.)
 
 **Documentation impact:** README: `/health` = liveness, `/ready` = DB readiness; troubleshooting line for 503.
@@ -566,11 +576,13 @@ curl -s localhost:3000/health                                    # ok
 - Test: none new beyond the rename keeping the suite green; this slice is proven by grep + gates.
 
 **RED-equivalent (evidence-first for a cleanup slice):**
+
 ```bash
 git grep -in supabase -- ':!supabase' ':!.hermes' | sort > /tmp/supabase-before.txt   # record
 ```
 
 **GREEN:** perform deletions/renames/edits. Then:
+
 ```bash
 git grep -in supabase -- ':!.hermes' ':!db/migrations'
 # Expected: zero hits, or only deliberate historical mentions in README's "older deployments" note —
@@ -609,6 +621,7 @@ git grep -in supabase -- ':!.hermes' ':!db/migrations'
 - Test: the smoke IS the test.
 
 **RED:** run the current smoke, record which paths are absent (grep list in handoff). **GREEN:**
+
 ```bash
 DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test \
   bun run scripts/mcp-smoke.ts
@@ -616,6 +629,7 @@ DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=post
 ```
 
 **Acceptance commands:** smoke run above + full gate battery (unchanged counts expected) + README chain copy-paste-verified against a fresh disposable DB:
+
 ```bash
 dropdb --if-exists nutrition_mcp_smoke && createdb nutrition_mcp_smoke
 for f in db/migrations/00{1,2,3,4,5}_*.sql; do psql postgres://localhost:5432/nutrition_mcp_smoke -v ON_ERROR_STOP=1 -f "$f"; done
@@ -714,13 +728,13 @@ Expected: everything green; DB gate reports 8 suites; counts strictly above the 
 
 ## Appendix A — Baseline numbers reviewer-terra holds every slice against
 
-| Gate | Baseline (post-S0) | Rule |
-| --- | --- | --- |
-| `bun run test:unit` | 445 pass / 84 skip / 0 fail | fail=0 always; pass count monotonically non-decreasing; skip only DB-gated |
-| `bun run test:db` | 82 pass / 0 skip / 0 fail / 7 suites | fail=0, skip=0 always; suites become 8 at S2 |
-| `bun run typecheck` | clean | always |
-| `git diff --check` | clean | always |
-| `bunx prettier --check <changed files>` | clean | every slice; repo-wide only from S10 |
+| Gate                                    | Baseline (post-S0)                   | Rule                                                                       |
+| --------------------------------------- | ------------------------------------ | -------------------------------------------------------------------------- |
+| `bun run test:unit`                     | 445 pass / 84 skip / 0 fail          | fail=0 always; pass count monotonically non-decreasing; skip only DB-gated |
+| `bun run test:db`                       | 82 pass / 0 skip / 0 fail / 7 suites | fail=0, skip=0 always; suites become 8 at S2                               |
+| `bun run typecheck`                     | clean                                | always                                                                     |
+| `git diff --check`                      | clean                                | always                                                                     |
+| `bunx prettier --check <changed files>` | clean                                | every slice; repo-wide only from S10                                       |
 
 ## Appendix B — What must never appear in any diff
 

@@ -14,26 +14,26 @@
 ## Commands actually run and exact results
 
 1. `DATABASE_URL_TEST=postgres://localhost/nutrition_mcp_test DATABASE_URL=postgres://localhost/nutrition_mcp_test bun run test:db`
-   - **PASS: 81 pass, 0 fail, 0 skip, 81 tests across 7 DB suites.**
-   - Suites and counts:
-     - `src/db.integration.test.ts`: 5/0/0, exit 0
-     - `src/meal-events.test.ts`: 41/0/0, exit 0
-     - `src/calculation-bundles.integration.test.ts`: 7/0/0, exit 0
-     - `src/meal-captures.integration.test.ts`: 4/0/0, exit 0
-     - `src/mcp-food-tracking.test.ts`: 8/0/0, exit 0
-     - `src/backup-policy.test.ts`: 7/0/0, exit 0
-     - `src/legacy-meal-tools.integration.test.ts`: 9/0/0, exit 0
-   - This is real PostgreSQL evidence for those suites, not evidence of the missing public calculation MCP matrix.
+    - **PASS: 81 pass, 0 fail, 0 skip, 81 tests across 7 DB suites.**
+    - Suites and counts:
+        - `src/db.integration.test.ts`: 5/0/0, exit 0
+        - `src/meal-events.test.ts`: 41/0/0, exit 0
+        - `src/calculation-bundles.integration.test.ts`: 7/0/0, exit 0
+        - `src/meal-captures.integration.test.ts`: 4/0/0, exit 0
+        - `src/mcp-food-tracking.test.ts`: 8/0/0, exit 0
+        - `src/backup-policy.test.ts`: 7/0/0, exit 0
+        - `src/legacy-meal-tools.integration.test.ts`: 9/0/0, exit 0
+    - This is real PostgreSQL evidence for those suites, not evidence of the missing public calculation MCP matrix.
 2. `bun run typecheck`
-   - **PASS: `src/ typechecks clean`.**
+    - **PASS: `src/ typechecks clean`.**
 3. `bunx prettier --check src/meal-events.ts src/calculation-bundles.ts src/mcp.ts src/nutrition-bundle-types.ts src/meal-types.ts src/calculation-bundles.test.ts src/mcp-food-tracking.test.ts src/legacy-meal-tools.integration.test.ts scripts/test-db-gate.ts scripts/mcp-smoke.ts`
-   - **PASS: All matched files use Prettier code style.**
+    - **PASS: All matched files use Prettier code style.**
 4. `bun test --max-concurrency 1`
-   - **PASS: 496 pass, 11 skip, 0 fail, 507 tests across 33 files.**
-   - The 11 skips are the opt-in destructive legacy DB regression suite; this ordinary run is not complete public legacy evidence.
+    - **PASS: 496 pass, 11 skip, 0 fail, 507 tests across 33 files.**
+    - The 11 skips are the opt-in destructive legacy DB regression suite; this ordinary run is not complete public legacy evidence.
 5. `DATABASE_URL_TEST=postgres://localhost/nutrition_mcp_test DATABASE_URL=postgres://localhost/nutrition_mcp_test RUN_LEGACY_MEAL_DB_TESTS=1 bun test --max-concurrency 1`
-   - **FAIL: 497 pass, 8 fail, 0 skip, 505 tests across 33 files.**
-   - All 8 failures are in `src/legacy-meal-tools.integration.test.ts`. Observed failures include missing `u1` rows (`rows[0]` undefined), stale `m1` projection instead of the expected current event, duplicate import retry returning `created: 2` instead of `created: 0, deduplicated: 2`, pending/null read receiving the wrong shared `m1` row, timezone fixture receiving the wrong shared row, and active-correction lookup finding no row. This proves the required full opt-in run is not deterministic/green despite the isolated DB gate passing.
+    - **FAIL: 497 pass, 8 fail, 0 skip, 505 tests across 33 files.**
+    - All 8 failures are in `src/legacy-meal-tools.integration.test.ts`. Observed failures include missing `u1` rows (`rows[0]` undefined), stale `m1` projection instead of the expected current event, duplicate import retry returning `created: 2` instead of `created: 0, deduplicated: 2`, pending/null read receiving the wrong shared `m1` row, timezone fixture receiving the wrong shared row, and active-correction lookup finding no row. This proves the required full opt-in run is not deterministic/green despite the isolated DB gate passing.
 6. Post-run hygiene: `exports/` is absent; `git diff --check` passes.
 
 ## Terra 6 blocker evaluation against live source/tests

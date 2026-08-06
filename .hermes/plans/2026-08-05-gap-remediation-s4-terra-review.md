@@ -60,20 +60,20 @@ The final code has direct mapping tests for compatibility, ready/complete, and i
 All commands were run by reviewer-terra at the reviewed HEAD.
 
 - `bun test src/mcp.test.ts src/import.test.ts src/csv.test.ts`
-  - PASS: 208 pass, 0 fail, 966 assertions.
+    - PASS: 208 pass, 0 fail, 966 assertions.
 - `bun run typecheck`
-  - PASS: `src/ typechecks clean`.
+    - PASS: `src/ typechecks clean`.
 - `bun run test:unit`
-  - PASS: 479 pass, 109 DB-gated skips, 0 fail, 588 tests.
+    - PASS: 479 pass, 109 DB-gated skips, 0 fail, 588 tests.
 - `DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test RUN_LEGACY_MEAL_DB_TESTS=1 bun test src/legacy-meal-tools.integration.test.ts`
-  - PASS: 16 pass, 0 fail, 279 assertions. This is the real PostgreSQL + InMemoryTransport legacy MCP suite, including all four S4-specific cases.
+    - PASS: 16 pass, 0 fail, 279 assertions. This is the real PostgreSQL + InMemoryTransport legacy MCP suite, including all four S4-specific cases.
 - `DATABASE_URL=postgres://localhost:5432/nutrition_mcp_test DATABASE_URL_TEST=postgres://localhost:5432/nutrition_mcp_test bun run test:db`
-  - PASS: 103 pass, 0 fail, 0 skip across 8 suites.
-  - Suite counts: db 5; meal-events 41; calculation-bundles 13; meal-captures 4; mcp-food-tracking 9; backup-policy 7; legacy-meal-tools 16; calculation-acceptance 8.
+    - PASS: 103 pass, 0 fail, 0 skip across 8 suites.
+    - Suite counts: db 5; meal-events 41; calculation-bundles 13; meal-captures 4; mcp-food-tracking 9; backup-policy 7; legacy-meal-tools 16; calculation-acceptance 8.
 - `bunx prettier --check README.md docs/food-tracking-agent-driven.md src/csv.test.ts src/db.ts src/import.test.ts src/import.ts src/legacy-meal-tools.integration.test.ts src/mcp.test.ts src/mcp.ts src/meal-events.ts .hermes/plans/2026-08-05-gap-remediation-s4-kimi-handoff.md`
-  - PASS: all matched files use Prettier style.
+    - PASS: all matched files use Prettier style.
 - `git diff --check ef97e1c..63a0e3e`
-  - PASS: silent / exit 0.
+    - PASS: silent / exit 0.
 
 ## Review decision
 

@@ -30,33 +30,33 @@ Audit basis: HEAD `fdfa2e6` (`test: close acceptance gate gaps for meal event to
 ### Write paths that can currently create incomplete/synthetic provenance
 
 1. **`log_meal` → `src/db.ts:compatibilityCommand()` → `createMealEvent()`**
-   - Creates a one-item compatibility event and synthesizes one `own`/`legacy-compat` provider row from optional legacy nutrient fields.
-   - It can therefore create a meal with one provider, null nutrients, and no three-provider bundle. `buildMealProgress()` and legacy formatters can display missing canonical values as zero because they use `?? 0`.
-   - This is a compatibility write, not evidence of a complete Hermes calculation bundle.
+    - Creates a one-item compatibility event and synthesizes one `own`/`legacy-compat` provider row from optional legacy nutrient fields.
+    - It can therefore create a meal with one provider, null nutrients, and no three-provider bundle. `buildMealProgress()` and legacy formatters can display missing canonical values as zero because they use `?? 0`.
+    - This is a compatibility write, not evidence of a complete Hermes calculation bundle.
 
 2. **`bulk_import_meals` → `runImport()` → `insertMeal()`**
-   - Uses the same compatibility command and therefore has the same incomplete/synthetic one-provider semantics for every imported row.
-   - It must not be silently upgraded into a provider caller or a fabricated three-provider bundle.
+    - Uses the same compatibility command and therefore has the same incomplete/synthetic one-provider semantics for every imported row.
+    - It must not be silently upgraded into a provider caller or a fabricated three-provider bundle.
 
 3. **`log_meal_event` → `src/mcp.ts` → `createMealEvent()`**
-   - `provider_results` is optional and defaults to `[]`.
-   - `src/meal-events.ts:insertVersionChildren()` still creates an event-scope canonical row for an empty set (`insufficient_data` with nullable nutrients), so persistence itself is atomic but the public command does not make the distinction between pending/incomplete and nutrition-ready explicit enough.
-   - Public output only exposes provider status summaries and a reduced canonical object; it does not expose raw/provenance evidence or a durable bundle-read status.
+    - `provider_results` is optional and defaults to `[]`.
+    - `src/meal-events.ts:insertVersionChildren()` still creates an event-scope canonical row for an empty set (`insufficient_data` with nullable nutrients), so persistence itself is atomic but the public command does not make the distinction between pending/incomplete and nutrition-ready explicit enough.
+    - Public output only exposes provider status summaries and a reduced canonical object; it does not expose raw/provenance evidence or a durable bundle-read status.
 
 4. **`confirm_meal_capture` → `src/meal-captures.ts:confirmMealCapture()` → `createMealEvent()`**
-   - `draft.provider_results ?? []` is passed through unchanged. A ready capture can therefore become a confirmed event with no provider rows and only an `insufficient_data` canonical result.
-   - Confirmation is correctly user-scoped, row-locked, atomic with event creation, and explicit-add authorized; the provenance gap is the missing bundle/readiness guard, not the transaction boundary.
+    - `draft.provider_results ?? []` is passed through unchanged. A ready capture can therefore become a confirmed event with no provider rows and only an `insufficient_data` canonical result.
+    - Confirmation is correctly user-scoped, row-locked, atomic with event creation, and explicit-add authorized; the provenance gap is the missing bundle/readiness guard, not the transaction boundary.
 
 5. **Legacy `update_meal` → `src/db.ts:updateMeal()` → `correctMealEvent()`**
-   - Reads the current projection, merges fields, and appends a correction containing the synthetic one-provider compatibility result. It does not use `commitCalculationCorrection()` and therefore has no calculation fingerprint/audit/canonical-bundle identity.
-   - It is still append-only and user-scoped, but it can make a current version appear nutritionally complete when it is only a compatibility correction.
+    - Reads the current projection, merges fields, and appends a correction containing the synthetic one-provider compatibility result. It does not use `commitCalculationCorrection()` and therefore has no calculation fingerprint/audit/canonical-bundle identity.
+    - It is still append-only and user-scoped, but it can make a current version appear nutritionally complete when it is only a compatibility correction.
 
 6. **`commit_calculation_bundle` → `commitCalculationBundle()`**
-   - This is the strongest path: complete validated bundle input, backend recomputation, raw/provider/canonical atomic persistence, fingerprint idempotency, and no external calls.
-   - It is not currently linked to the public create/capture flow by an enforced invariant, so a caller can create an event first and never commit its bundle.
+    - This is the strongest path: complete validated bundle input, backend recomputation, raw/provider/canonical atomic persistence, fingerprint idempotency, and no external calls.
+    - It is not currently linked to the public create/capture flow by an enforced invariant, so a caller can create an event first and never commit its bundle.
 
 7. **`commit_calculation_correction` is not a public MCP tool on HEAD**
-   - The repository correction function exists and is covered directly by integration tests, but the public MCP surface exposes no explicit correction-bundle command. Do not infer that the low-level function is reachable over MCP; either add an explicit public tool in this slice only if Dmitrii approves, or keep it as the internal seam used by a future correction boundary.
+    - The repository correction function exists and is covered directly by integration tests, but the public MCP surface exposes no explicit correction-bundle command. Do not infer that the low-level function is reachable over MCP; either add an explicit public tool in this slice only if Dmitrii approves, or keep it as the internal seam used by a future correction boundary.
 
 ### Read paths
 
@@ -78,9 +78,9 @@ Audit basis: HEAD `fdfa2e6` (`test: close acceptance gate gaps for meal event to
 For every active event version:
 
 1. The persisted event version has exactly one explicit provenance state derived from its stored provider rows and canonical row:
-   - `ready`: a complete calculation bundle was accepted through the bundle contract and canonical evidence is persisted;
-   - `pending`: the event is a legacy/compatibility or incomplete provider submission; provider rows and/or canonical row may be incomplete, but the state is explicit and readable;
-   - `unavailable`: the bundle evidence is present but no usable provider consensus exists, with failed/unavailable rows and errors retained.
+    - `ready`: a complete calculation bundle was accepted through the bundle contract and canonical evidence is persisted;
+    - `pending`: the event is a legacy/compatibility or incomplete provider submission; provider rows and/or canonical row may be incomplete, but the state is explicit and readable;
+    - `unavailable`: the bundle evidence is present but no usable provider consensus exists, with failed/unavailable rows and errors retained.
 2. A response may never present `pending`/`unavailable` nutrition as a numeric zero or claim it is `ready`.
 3. A `ready` response is allowed only when provider result rows, their raw/provenance fields, the version fingerprint, and the event-scope canonical row are all present and internally consistent. Canonical values are always recomputed by the backend, never copied from `canonical_proposal`.
 4. Missing nutrient values remain JSON `null`/SQL `NULL`; zero is a real stored value only when a provider explicitly supplied zero.
@@ -195,23 +195,23 @@ A forward migration is justified only if review proves a required public contrac
 ### Production targets
 
 - `src/meal-events.ts`
-  - Extend `MealEventAggregate` provider/canonical types with all persisted provenance fields.
-  - Update `insertVersionChildren()` and the shared provenance derivation so incomplete compatibility/provider writes are explicit pending/unavailable, not ready.
-  - Update `getMealEvent()` to preserve SQL `NULL`, return raw payload/provenance/source/basis/units, canonical source IDs/audit evidence/algorithm version, and support a user-scoped read seam (or add a separate user-scoped provenance repository function rather than exposing the current unscoped helper).
+    - Extend `MealEventAggregate` provider/canonical types with all persisted provenance fields.
+    - Update `insertVersionChildren()` and the shared provenance derivation so incomplete compatibility/provider writes are explicit pending/unavailable, not ready.
+    - Update `getMealEvent()` to preserve SQL `NULL`, return raw payload/provenance/source/basis/units, canonical source IDs/audit evidence/algorithm version, and support a user-scoped read seam (or add a separate user-scoped provenance repository function rather than exposing the current unscoped helper).
 - `src/calculation-bundles.ts`
-  - Reuse the shared read/derivation helper; ensure commit and correction results expose the same provenance status/readback shape.
-  - Keep backend `computeConsensus`, fingerprint/idempotency, immutable correction, and pending journal semantics unchanged.
+    - Reuse the shared read/derivation helper; ensure commit and correction results expose the same provenance status/readback shape.
+    - Keep backend `computeConsensus`, fingerprint/idempotency, immutable correction, and pending journal semantics unchanged.
 - `src/db.ts`
-  - Mark `compatibilityCommand()`'s generated provider result as explicitly legacy compatibility/pending through the agreed domain seam; do not add fake nutrition-local/MFP rows.
-  - Ensure `updateMeal()` correction continues to be user-scoped/append-only and cannot claim bundle-ready status.
+    - Mark `compatibilityCommand()`'s generated provider result as explicitly legacy compatibility/pending through the agreed domain seam; do not add fake nutrition-local/MFP rows.
+    - Ensure `updateMeal()` correction continues to be user-scoped/append-only and cannot claim bundle-ready status.
 - `src/meal-captures.ts`
-  - Keep the single transaction/row lock and explicit confirmation. Pass the draft through the common provenance policy; define whether a missing bundle is accepted as pending or rejected based on Dmitrii's decision.
+    - Keep the single transaction/row lock and explicit confirmation. Pass the draft through the common provenance policy; define whether a missing bundle is accepted as pending or rejected based on Dmitrii's decision.
 - `src/mcp.ts`
-  - Add strict public `get_calculation_provenance` schema/handler and output schema.
-  - Add provenance status/readback fields to public create/confirm/commit responses and tool descriptions.
-  - Ensure legacy progress/list formatters do not render `NULL` nutrient values as numeric zero when the meal is pending/missing/unavailable; retain real provider-supplied zero.
+    - Add strict public `get_calculation_provenance` schema/handler and output schema.
+    - Add provenance status/readback fields to public create/confirm/commit responses and tool descriptions.
+    - Ensure legacy progress/list formatters do not render `NULL` nutrient values as numeric zero when the meal is pending/missing/unavailable; retain real provider-supplied zero.
 - `src/meal-event-projection.ts`
-  - Preserve nullable canonical values and, if required by the approved public contract, carry a small provenance-status marker into compatibility `Meal` projections without duplicating provider SQL in MCP handlers.
+    - Preserve nullable canonical values and, if required by the approved public contract, carry a small provenance-status marker into compatibility `Meal` projections without duplicating provider SQL in MCP handlers.
 
 ### Tests to add/modify
 

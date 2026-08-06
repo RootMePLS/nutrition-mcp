@@ -48,13 +48,13 @@ Each pre-existing success/content/structured-content assertion remains. The comp
 - The no-auth sweep contains only the four README historical/negative survivors plus semantically negative public/source wording. No current OAuth, Google/email-password account, registration, token, authorization-code, or Supabase capability claim was found.
 - All **15/15** JSON-LD blocks across `public/index.html` and the seven alternatives outputs parsed successfully.
 - `scripts/gen-alternatives.ts` remained the source of all seven generated outputs. Two independent generator-plus-Prettier cycles produced identical output hashes and zero worktree drift:
-  - cronometer `3b2dd23410baeaab88416f3804377a65b9cbccbc6e7ebcf148627b159156e247`
-  - index `ae26fc7d5b570733e456ea965d2724925f1e6aa4e2adba49e2b3ef41960be720`
-  - lifesum `e892688248deec7a4802b04a0577244d0386ed825daf6c92bca7e49f59c3e62f`
-  - lose-it `8afcf0705bfa7f629a6b59a67c761086bac0304936f5b327dff0e479979b2274`
-  - macrofactor `1cee872d69c6d35ec59462624ecb0abeb8f339fbf56301bb325e5d5991e13d2f`
-  - myfitnesspal `c3c515014483c4c965b058d6cd04227e21e1da4171ffee37fa30956a86295c26`
-  - yazio `d334be633e76b1c4b5843e153ea132b81ac8f652673df2d456e8db95f04437e8`
+    - cronometer `3b2dd23410baeaab88416f3804377a65b9cbccbc6e7ebcf148627b159156e247`
+    - index `ae26fc7d5b570733e456ea965d2724925f1e6aa4e2adba49e2b3ef41960be720`
+    - lifesum `e892688248deec7a4802b04a0577244d0386ed825daf6c92bca7e49f59c3e62f`
+    - lose-it `8afcf0705bfa7f629a6b59a67c761086bac0304936f5b327dff0e479979b2274`
+    - macrofactor `1cee872d69c6d35ec59462624ecb0abeb8f339fbf56301bb325e5d5991e13d2f`
+    - myfitnesspal `c3c515014483c4c965b058d6cd04227e21e1da4171ffee37fa30956a86295c26`
+    - yazio `d334be633e76b1c4b5843e153ea132b81ac8f652673df2d456e8db95f04437e8`
 
 ## Independent gates — PASS
 
