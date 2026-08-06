@@ -18,6 +18,8 @@ import {
     setSupplementRegimenActive,
     resolveSupplementProduct,
     logSupplementIntake,
+    getSupplementIntakes,
+    getSupplementRegimenStatus,
     SupplementAliasAmbiguousError,
     SupplementIdempotencyConflictError,
     SupplementProductInactiveError,
@@ -2411,6 +2413,428 @@ describeDb(
             expect(await tableCount(pool, "supplement_product_versions")).toBe(
                 1,
             );
+        });
+    },
+);
+
+describeDb(
+    "supplement intake history + regimen status reads (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await pool.end();
+        });
+
+        beforeEach(async () => {
+            await resetSchema(pool);
+        });
+
+        async function seedProduct(
+            overrides: Record<string, unknown> = {},
+        ): Promise<string> {
+            const result = await createSupplementProduct(
+                pool,
+                validCreateCommand({
+                    idempotency_key: `product:${crypto.randomUUID()}`,
+                    ...overrides,
+                }),
+            );
+            return result.product.product_id;
+        }
+
+        async function seedRegimen(
+            productId: string,
+            overrides: Record<string, unknown> = {},
+        ) {
+            const result = await createSupplementRegimen(
+                pool,
+                validRegimenCommand(productId, overrides),
+            );
+            return result.regimen;
+        }
+
+        async function log(
+            productId: string,
+            overrides: Record<string, unknown> = {},
+        ) {
+            const result = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, overrides),
+            );
+            return result.intake;
+        }
+
+        test("getSupplementIntakes is user-scoped, newest-first, with filters, limit clamp, and per-fact projection", async () => {
+            const productA = await seedProduct();
+            const productB = await seedProduct({
+                display_name: "Creatine",
+                aliases: ["creatine"],
+            });
+            const regimen = await seedRegimen(productA);
+
+            const oldest = await log(productA, {
+                occurred_at: "2026-08-03T08:00:00.000Z",
+            });
+            const middle = await log(productA, {
+                occurred_at: "2026-08-04T08:00:00.000Z",
+                state_action: "missed",
+                regimen_id: regimen.regimen_id,
+                product_id: null,
+            });
+            const newest = await log(productA, {
+                occurred_at: "2026-08-05T08:00:00.000Z",
+                state_action: "cleared",
+                supersedes_intake_id: middle.intake_id,
+                reason: "corrected",
+            });
+            await log(productB, { occurred_at: "2026-08-05T09:00:00.000Z" });
+
+            const all = await getSupplementIntakes(pool, "u1");
+            expect(all.map((f) => f.intake_id)).toEqual([
+                // productB fact is 09:00 on the 5th — newest first.
+                all[0]!.intake_id,
+                newest.intake_id,
+                middle.intake_id,
+                oldest.intake_id,
+            ]);
+            expect(all[1]!.intake_id).toBe(newest.intake_id);
+            // Audit fields and per-fact projection: raw cleared stays audit,
+            // the visible state projects undefined.
+            expect(all[1]!.state_action).toBe("cleared");
+            expect(all[1]!.visible_state).toBe("undefined");
+            expect(all[1]!.supersedes_intake_id).toBe(middle.intake_id);
+            expect(all[1]!.reason).toBe("corrected");
+            expect(all[2]!.visible_state).toBe("missed");
+
+            // User scope: u2 has no intake history.
+            expect(await getSupplementIntakes(pool, "u2")).toEqual([]);
+
+            // Product / regimen filters.
+            const forB = await getSupplementIntakes(pool, "u1", {
+                productId: productB,
+            });
+            expect(forB).toHaveLength(1);
+            expect(forB[0]!.product_id).toBe(productB);
+
+            const forRegimen = await getSupplementIntakes(pool, "u1", {
+                regimenId: regimen.regimen_id,
+            });
+            expect(forRegimen.map((f) => f.intake_id)).toEqual([
+                middle.intake_id,
+            ]);
+
+            // Time range filter (strict ISO bounds, inclusive).
+            const ranged = await getSupplementIntakes(pool, "u1", {
+                from: "2026-08-04T00:00:00.000Z",
+                to: "2026-08-04T23:59:59.999Z",
+            });
+            expect(ranged.map((f) => f.intake_id)).toEqual([middle.intake_id]);
+
+            // Limit clamp.
+            const limited = await getSupplementIntakes(pool, "u1", {
+                limit: 2,
+            });
+            expect(limited).toHaveLength(2);
+
+            // Malformed range bounds are validation errors.
+            await expect(
+                getSupplementIntakes(pool, "u1", { from: "2026-08-04" }),
+            ).rejects.toBeInstanceOf(SupplementValidationError);
+        });
+
+        test("post-revision reads still show the bound version's snapshots", async () => {
+            const productId = await seedProduct();
+            const v1Fact = await log(productId, {
+                occurred_at: "2026-08-03T08:00:00.000Z",
+            });
+            await reviseSupplementProductLabel(pool, {
+                user_id: "u1",
+                product_id: productId,
+                display_name: "Impact Whey Protein (new formula)",
+                short_name: "Whey",
+                brand: "MyProtein",
+                form: "powder",
+                serving_amount: 32,
+                serving_unit: "g",
+                serving_description: "1 heaped scoop",
+                aliases: ["impact whey"],
+                nutrients: [
+                    { nutrient_key: "calories", amount: 128, unit: "kcal" },
+                    { nutrient_key: "protein_g", amount: 23, unit: "g" },
+                ],
+                label_evidence: { kind: "label_photo", verified_by: "user" },
+                label_source_kind: "user_verified_label",
+                revision_idempotency_key: `revise:${crypto.randomUUID()}`,
+                created_by: "test",
+            });
+
+            const facts = await getSupplementIntakes(pool, "u1");
+            expect(facts).toHaveLength(1);
+            expect(facts[0]!.intake_id).toBe(v1Fact.intake_id);
+            expect(facts[0]!.product_version).toBe(1);
+            expect(facts[0]!.product_display_name).toBe("Impact Whey Protein");
+            expect(
+                facts[0]!.nutrient_snapshots.find(
+                    (s) => s.nutrient_key === "protein_g",
+                )!.scaled_amount,
+            ).toBe(42);
+        });
+
+        test("daily regimen status derives exact per-occurrence states from real rows", async () => {
+            const productId = await seedProduct();
+            const regimen = await seedRegimen(productId, {
+                schedule: {
+                    timezone: "UTC",
+                    frequency: "daily",
+                    local_time: "08:00",
+                },
+                starts_on: "2026-08-01",
+                ends_on: null,
+            });
+            const regimenId = regimen.regimen_id;
+
+            const doneFact = await log(productId, {
+                product_id: null,
+                regimen_id: regimenId,
+                occurred_at: "2026-08-02T08:00:00.000Z",
+            });
+            await log(productId, {
+                product_id: null,
+                regimen_id: regimenId,
+                occurred_at: "2026-08-03T08:00:00.000Z",
+                state_action: "missed",
+            });
+            // 2026-08-04: done then cleared — the cycle returns to undefined.
+            const clearedDay = await log(productId, {
+                product_id: null,
+                regimen_id: regimenId,
+                occurred_at: "2026-08-04T08:00:00.000Z",
+            });
+            const clearedFact = await log(productId, {
+                product_id: null,
+                regimen_id: regimenId,
+                occurred_at: "2026-08-04T09:00:00.000Z",
+                state_action: "cleared",
+                supersedes_intake_id: clearedDay.intake_id,
+            });
+            // An ad-hoc fact (no regimen) on an occurrence date never claims
+            // the occurrence.
+            await log(productId, {
+                occurred_at: "2026-08-05T08:00:00.000Z",
+            });
+
+            const status = await getSupplementRegimenStatus(
+                pool,
+                "u1",
+                regimenId,
+                { from_date: "2026-08-01", to_date: "2026-08-05" },
+            );
+            expect(status.regimen.regimen_id).toBe(regimenId);
+            expect(
+                status.occurrences.map((o) => [
+                    o.local_date,
+                    o.local_time,
+                    o.visible_state,
+                ]),
+            ).toEqual([
+                ["2026-08-01", "08:00", "undefined"],
+                ["2026-08-02", "08:00", "done"],
+                ["2026-08-03", "08:00", "missed"],
+                ["2026-08-04", "08:00", "undefined"],
+                ["2026-08-05", "08:00", "undefined"],
+            ]);
+            expect(
+                status.occurrences.find((o) => o.local_date === "2026-08-02")!
+                    .latest_intake_id,
+            ).toBe(doneFact.intake_id);
+            // The latest fact by append order is the cleared one.
+            expect(
+                status.occurrences.find((o) => o.local_date === "2026-08-04")!
+                    .latest_intake_id,
+            ).toBe(clearedFact.intake_id);
+            expect(
+                status.occurrences.find((o) => o.local_date === "2026-08-01")!
+                    .latest_intake_id,
+            ).toBeNull();
+        });
+
+        test("weekly schedules filter ISO weekdays and the window clips to [starts_on, ends_on]", async () => {
+            const productId = await seedProduct();
+            const regimen = await seedRegimen(productId, {
+                schedule: {
+                    timezone: "UTC",
+                    frequency: "weekly",
+                    local_time: "21:15",
+                    weekdays: [1, 6], // Monday and Saturday
+                },
+                starts_on: "2026-08-03", // Monday
+                ends_on: "2026-08-09",
+            });
+
+            const status = await getSupplementRegimenStatus(
+                pool,
+                "u1",
+                regimen.regimen_id,
+                { from_date: "2026-08-01", to_date: "2026-08-31" },
+            );
+            expect(
+                status.occurrences.map((o) => [
+                    o.local_date,
+                    o.local_time,
+                    o.visible_state,
+                ]),
+            ).toEqual([
+                ["2026-08-03", "21:15", "undefined"],
+                ["2026-08-08", "21:15", "undefined"],
+            ]);
+        });
+
+        test("occurrence dates are matched in the regimen timezone, not UTC", async () => {
+            const productId = await seedProduct();
+            const regimen = await seedRegimen(productId, {
+                schedule: {
+                    timezone: "Europe/Berlin",
+                    frequency: "daily",
+                    local_time: "08:00",
+                },
+                starts_on: "2026-08-01",
+                ends_on: null,
+            });
+            // 23:30 local in Berlin (UTC+2 in August) is 21:30 UTC — the fact
+            // belongs to the 2026-08-03 local occurrence, not 2026-08-03 UTC.
+            const fact = await log(productId, {
+                product_id: null,
+                regimen_id: regimen.regimen_id,
+                occurred_at: "2026-08-03T23:30:00.000+02:00",
+            });
+
+            const status = await getSupplementRegimenStatus(
+                pool,
+                "u1",
+                regimen.regimen_id,
+                { from_date: "2026-08-01", to_date: "2026-08-04" },
+            );
+            const byDate = new Map(
+                status.occurrences.map((o) => [o.local_date, o]),
+            );
+            expect(byDate.get("2026-08-03")!.visible_state).toBe("done");
+            expect(byDate.get("2026-08-03")!.latest_intake_id).toBe(
+                fact.intake_id,
+            );
+            expect(byDate.get("2026-08-04")!.visible_state).toBe("undefined");
+        });
+
+        test("window rules: >92 days, inverted, and junk dates are rejected; reads write nothing", async () => {
+            const productId = await seedProduct();
+            const regimen = await seedRegimen(productId, {
+                schedule: {
+                    timezone: "UTC",
+                    frequency: "daily",
+                    local_time: "08:00",
+                },
+                starts_on: "2026-01-01",
+                ends_on: null,
+            });
+            await log(productId, {
+                product_id: null,
+                regimen_id: regimen.regimen_id,
+                occurred_at: "2026-08-02T08:00:00.000Z",
+            });
+
+            for (const window of [
+                { from_date: "2026-01-01", to_date: "2026-12-31" },
+                { from_date: "2026-08-05", to_date: "2026-08-01" },
+                { from_date: "2026-02-30", to_date: "2026-08-01" },
+                { from_date: "2026-08-01", to_date: "not-a-date" },
+            ]) {
+                await expect(
+                    getSupplementRegimenStatus(
+                        pool,
+                        "u1",
+                        regimen.regimen_id,
+                        window,
+                    ),
+                ).rejects.toBeInstanceOf(SupplementValidationError);
+            }
+
+            // A 92-day window is allowed; 93 is not.
+            const ok = await getSupplementRegimenStatus(
+                pool,
+                "u1",
+                regimen.regimen_id,
+                { from_date: "2026-08-01", to_date: "2026-10-31" },
+            );
+            expect(ok.occurrences.length).toBe(92);
+
+            // Reads make no domain writes.
+            const before = await sliceFiveWriteTableCounts(pool);
+            const regimensBefore = await tableCount(
+                pool,
+                "supplement_regimens",
+            );
+            await getSupplementRegimenStatus(pool, "u1", regimen.regimen_id, {
+                from_date: "2026-08-01",
+                to_date: "2026-08-05",
+            });
+            await getSupplementIntakes(pool, "u1");
+            expect(await sliceFiveWriteTableCounts(pool)).toEqual(before);
+            expect(await tableCount(pool, "supplement_regimens")).toBe(
+                regimensBefore,
+            );
+        });
+
+        test("an inactive regimen stays readable; unknown/cross-user regimens fail closed", async () => {
+            const productId = await seedProduct();
+            const regimen = await seedRegimen(productId, {
+                schedule: {
+                    timezone: "UTC",
+                    frequency: "daily",
+                    local_time: "08:00",
+                },
+                starts_on: "2026-08-01",
+                ends_on: null,
+            });
+            await log(productId, {
+                product_id: null,
+                regimen_id: regimen.regimen_id,
+                occurred_at: "2026-08-02T08:00:00.000Z",
+            });
+            await setSupplementRegimenActive(
+                pool,
+                "u1",
+                regimen.regimen_id,
+                false,
+            );
+
+            const status = await getSupplementRegimenStatus(
+                pool,
+                "u1",
+                regimen.regimen_id,
+                { from_date: "2026-08-01", to_date: "2026-08-03" },
+            );
+            expect(status.regimen.active).toBe(false);
+            expect(
+                status.occurrences.find((o) => o.local_date === "2026-08-02")!
+                    .visible_state,
+            ).toBe("done");
+
+            await expect(
+                getSupplementRegimenStatus(pool, "u1", crypto.randomUUID(), {
+                    from_date: "2026-08-01",
+                    to_date: "2026-08-03",
+                }),
+            ).rejects.toBeInstanceOf(SupplementRegimenNotFoundError);
+            await expect(
+                getSupplementRegimenStatus(pool, "u2", regimen.regimen_id, {
+                    from_date: "2026-08-01",
+                    to_date: "2026-08-03",
+                }),
+            ).rejects.toBeInstanceOf(SupplementRegimenNotFoundError);
         });
     },
 );

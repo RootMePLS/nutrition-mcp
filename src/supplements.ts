@@ -27,15 +27,19 @@ import { Pool, type PoolClient } from "pg";
 import { withTransaction } from "./db.js";
 import { isStrictIsoTimestamp, sha256Hex } from "./meal-types.js";
 import { escapeLikePattern } from "./search.js";
+import { dateInTz } from "./tz.js";
 import {
+    deriveRegimenOccurrences,
     deriveSupplementIntakeIdempotencyFingerprint,
     deriveSupplementRegimenIdempotencyFingerprint,
     isSupplementProductCategory,
     normalizeSupplementAlias,
     projectIntakeVisibleState,
+    reduceOccurrenceState,
     stableStringify,
     validateLabelNutrients,
     validateRegimenSchedule,
+    type IntakeFactForProjection,
     type RegimenSchedule,
     type SupplementIntakeStateAction,
     type SupplementIntakeVisibleState,
@@ -2022,4 +2026,181 @@ export async function logSupplementIntake(
             throw err;
         }
     }
+}
+
+// ===========================================================================
+// INTAKE HISTORY & REGIMEN STATUS READS (Slice 5, read-only)
+// ===========================================================================
+// Both reads are pure queries: they derive, never persist. "Unmarked" is a
+// derived `undefined` occurrence in the result — never a stored row — and
+// nothing here marks, schedules, or reminds.
+
+export async function getSupplementIntakes(
+    pool: Queryable,
+    userId: string,
+    options: {
+        productId?: string;
+        regimenId?: string;
+        from?: string;
+        to?: string;
+        limit?: number;
+    } = {},
+): Promise<SupplementIntakeFactReadback[]> {
+    const errors: string[] = [];
+    if (options.from !== undefined && !isStrictIsoTimestamp(options.from)) {
+        errors.push("from must be a strict ISO-8601 timestamp");
+    }
+    if (options.to !== undefined && !isStrictIsoTimestamp(options.to)) {
+        errors.push("to must be a strict ISO-8601 timestamp");
+    }
+    if (errors.length > 0) {
+        throw new SupplementValidationError(errors);
+    }
+
+    const limit = Math.min(Math.max(options.limit ?? 100, 1), 500);
+    const params: unknown[] = [userId];
+    let where = "WHERE user_id = $1";
+    if (options.productId !== undefined) {
+        params.push(options.productId);
+        where += ` AND product_id = $${params.length}`;
+    }
+    if (options.regimenId !== undefined) {
+        params.push(options.regimenId);
+        where += ` AND regimen_id = $${params.length}`;
+    }
+    if (options.from !== undefined) {
+        params.push(options.from);
+        where += ` AND occurred_at >= $${params.length}`;
+    }
+    if (options.to !== undefined) {
+        params.push(options.to);
+        where += ` AND occurred_at <= $${params.length}`;
+    }
+    params.push(limit);
+    const { rows } = await pool.query(
+        `${INTAKE_SELECT} ${where}
+         ORDER BY occurred_at DESC, id DESC
+         LIMIT $${params.length}`,
+        params,
+    );
+    const readbacks: SupplementIntakeFactReadback[] = [];
+    for (const row of rows as IntakeFactRow[]) {
+        readbacks.push(await assembleIntakeReadback(pool, row));
+    }
+    return readbacks;
+}
+
+export interface RegimenOccurrenceStatus {
+    local_date: string;
+    local_time: string;
+    /** Exactly undefined|done|missed — never a stored row. */
+    visible_state: SupplementIntakeVisibleState;
+    latest_intake_id: string | null;
+}
+
+export interface SupplementRegimenStatusReadback {
+    regimen: SupplementRegimenReadback;
+    occurrences: RegimenOccurrenceStatus[];
+}
+
+/** Status windows are bounded: at most 92 inclusive days. */
+const REGIMEN_STATUS_MAX_WINDOW_DAYS = 92;
+
+function validateStatusWindow(window: {
+    from_date: string;
+    to_date: string;
+}): void {
+    const errors: string[] = [];
+    if (!isLocalDateString(window.from_date)) {
+        errors.push("from_date must be a real YYYY-MM-DD date");
+    }
+    if (!isLocalDateString(window.to_date)) {
+        errors.push("to_date must be a real YYYY-MM-DD date");
+    }
+    if (errors.length === 0) {
+        if (window.to_date < window.from_date) {
+            errors.push("to_date must be on or after from_date");
+        } else {
+            const days =
+                (Date.parse(`${window.to_date}T00:00:00Z`) -
+                    Date.parse(`${window.from_date}T00:00:00Z`)) /
+                    86400000 +
+                1;
+            if (days > REGIMEN_STATUS_MAX_WINDOW_DAYS) {
+                errors.push(
+                    `the status window must be at most ${REGIMEN_STATUS_MAX_WINDOW_DAYS} days`,
+                );
+            }
+        }
+    }
+    if (errors.length > 0) {
+        throw new SupplementValidationError(errors);
+    }
+}
+
+export async function getSupplementRegimenStatus(
+    pool: Queryable,
+    userId: string,
+    regimenId: string,
+    window: { from_date: string; to_date: string },
+): Promise<SupplementRegimenStatusReadback> {
+    validateStatusWindow(window);
+    const row = await readRegimenRow(pool, regimenId);
+    // Unknown id or another user's regimen: identical closed failure.
+    if (!row || row.user_id !== userId) {
+        throw new SupplementRegimenNotFoundError();
+    }
+
+    const occurrences = deriveRegimenOccurrences(
+        row.schedule,
+        row.starts_on,
+        row.ends_on,
+        window.from_date,
+        window.to_date,
+    );
+
+    // Facts claim an occurrence only via regimen binding + local date in the
+    // regimen's timezone. Ad-hoc facts (regimen_id NULL) never claim one.
+    const { rows: factRows } = await pool.query(
+        `SELECT id, regimen_id, occurred_at, state_action, created_at
+         FROM supplement_intake_events
+         WHERE regimen_id = $1 AND user_id = $2
+         ORDER BY created_at, id`,
+        [regimenId, userId],
+    );
+    const factsByLocalDate = new Map<string, IntakeFactForProjection[]>();
+    for (const fact of factRows as IntakeFactForProjection[]) {
+        const localDate = dateInTz(fact.occurred_at, row.schedule.timezone);
+        const list = factsByLocalDate.get(localDate) ?? [];
+        list.push(fact);
+        factsByLocalDate.set(localDate, list);
+    }
+
+    return {
+        regimen: await assembleRegimenReadback(pool, row),
+        occurrences: occurrences.map((occurrence) => {
+            const facts = factsByLocalDate.get(occurrence.local_date) ?? [];
+            const ordered = [...facts].sort((a, b) => {
+                const at =
+                    a.created_at instanceof Date
+                        ? a.created_at.getTime()
+                        : Date.parse(a.created_at);
+                const bt =
+                    b.created_at instanceof Date
+                        ? b.created_at.getTime()
+                        : Date.parse(b.created_at);
+                if (at !== bt) return at - bt;
+                return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+            });
+            return {
+                local_date: occurrence.local_date,
+                local_time: occurrence.local_time,
+                visible_state: reduceOccurrenceState(facts),
+                latest_intake_id:
+                    ordered.length === 0
+                        ? null
+                        : ordered[ordered.length - 1]!.id,
+            };
+        }),
+    };
 }
