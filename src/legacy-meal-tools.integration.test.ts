@@ -1660,6 +1660,50 @@ describeDb("legacy meal MCP tools use the event projection", () => {
     );
 
     test.serial(
+        "commit_calculation_bundle succeeds for a version created by update_meal",
+        async () => {
+            let mealId = "";
+            await callTools(async (call) => {
+                const logged = await call("log_meal", {
+                    description: "bundle-after-update meal",
+                    meal_type: "lunch",
+                    calories: 400,
+                    logged_at: "2026-08-05T12:00:00.000Z",
+                    idempotency_key: "bundle-after-update",
+                });
+                expect(logged.isError).not.toBe(true);
+                const row = await pool.query(
+                    "SELECT id FROM meal_events WHERE user_id = $1 AND idempotency_key = $2",
+                    ["u1", "bundle-after-update"],
+                );
+                mealId = row.rows[0]!.id as string;
+
+                const updated = await call("update_meal", {
+                    id: mealId,
+                    calories: 505,
+                });
+                expect(updated.isError).not.toBe(true);
+
+                // Version 2 exists via the compatibility correction; the
+                // explicit bundle for v2 must commit, not crash.
+                const committed = await call("commit_calculation_bundle", {
+                    bundle: publicBundle(mealId, 2, 505, "after-update"),
+                });
+                expect(committed.isError).not.toBe(true);
+                const output = CALCULATION_BUNDLE_OUTPUT_SCHEMA.parse(
+                    committed.structuredContent,
+                );
+                expect(output).toMatchObject({
+                    event_id: mealId,
+                    version: 2,
+                    deduplicated: false,
+                    compatibility: false,
+                });
+            });
+        },
+    );
+
+    test.serial(
         "account cleanup removes every event child and preserves unrelated user data",
         async () => {
             const u1 = await seedProjectionEvent(pool, {
