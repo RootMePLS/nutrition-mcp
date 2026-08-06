@@ -106,3 +106,144 @@ describe("rankReuseVariations", () => {
         expect(rankReuseVariations([])).toEqual([]);
     });
 });
+
+
+// ---------------------------------------------------------------------------
+// Slice 4 pure layer: reuse idempotency identity equality and eligibility
+// classification contracts. No DB.
+// ---------------------------------------------------------------------------
+
+import {
+    classifyReuseEligibility,
+    reuseIdentityMatches,
+} from "./meal-reuse.js";
+
+describe("slice 4 pure reuse helpers", () => {
+    describe("reuseIdentityMatches (millisecond-equal identity)", () => {
+        const stored = {
+            source_event_id: "11111111-1111-1111-1111-111111111111",
+            source_version: 2,
+            reported_at: "2026-08-06T10:00:00.123+00:00",
+            consumed_at: "2026-08-06T08:30:00.000Z",
+        };
+
+        test("identical values match", () => {
+            expect(reuseIdentityMatches(stored, { ...stored })).toBe(true);
+        });
+
+        test("Z vs +00:00 ISO variants of the same instant match", () => {
+            expect(
+                reuseIdentityMatches(stored, {
+                    ...stored,
+                    reported_at: "2026-08-06T10:00:00.123Z",
+                }),
+            ).toBe(true);
+            expect(
+                reuseIdentityMatches(stored, {
+                    ...stored,
+                    consumed_at: "2026-08-06T08:30:00.000+00:00",
+                }),
+            ).toBe(true);
+        });
+
+        test("sub-millisecond precision variants of the same ms match", () => {
+            // timestamptz round-trips keep microseconds; identity compares
+            // Date.parse millisecond values, so sub-ms differences are inert.
+            expect(
+                reuseIdentityMatches(stored, {
+                    ...stored,
+                    reported_at: "2026-08-06T10:00:00.123456Z",
+                }),
+            ).toBe(true);
+        });
+
+        test("different source_event_id does not match", () => {
+            expect(
+                reuseIdentityMatches(stored, {
+                    ...stored,
+                    source_event_id: "22222222-2222-2222-2222-222222222222",
+                }),
+            ).toBe(false);
+        });
+
+        test("different source_version does not match", () => {
+            expect(
+                reuseIdentityMatches(stored, { ...stored, source_version: 1 }),
+            ).toBe(false);
+        });
+
+        test("different reported_at does not match", () => {
+            expect(
+                reuseIdentityMatches(stored, {
+                    ...stored,
+                    reported_at: "2026-08-06T10:00:01.123Z",
+                }),
+            ).toBe(false);
+        });
+
+        test("different consumed_at does not match", () => {
+            expect(
+                reuseIdentityMatches(stored, {
+                    ...stored,
+                    consumed_at: "2026-08-06T08:30:00.001Z",
+                }),
+            ).toBe(false);
+        });
+    });
+
+    describe("classifyReuseEligibility (deriveAggregateProvenance verdict)", () => {
+        test("ready + non-compatibility is eligible", () => {
+            expect(
+                classifyReuseEligibility({
+                    provenance_status: "ready",
+                    compatibility: false,
+                }),
+            ).toEqual({ eligible: true });
+        });
+
+        test("compatibility wins over a ready status", () => {
+            expect(
+                classifyReuseEligibility({
+                    provenance_status: "ready",
+                    compatibility: true,
+                }),
+            ).toEqual({ eligible: false, category: "compatibility" });
+        });
+
+        test("compatibility wins over a pending status", () => {
+            expect(
+                classifyReuseEligibility({
+                    provenance_status: "pending",
+                    compatibility: true,
+                }),
+            ).toEqual({ eligible: false, category: "compatibility" });
+        });
+
+        test("pending maps to the pending category", () => {
+            expect(
+                classifyReuseEligibility({
+                    provenance_status: "pending",
+                    compatibility: false,
+                }),
+            ).toEqual({ eligible: false, category: "pending" });
+        });
+
+        test("unavailable maps to the unavailable category", () => {
+            expect(
+                classifyReuseEligibility({
+                    provenance_status: "unavailable",
+                    compatibility: false,
+                }),
+            ).toEqual({ eligible: false, category: "unavailable" });
+        });
+
+        test("missing maps to the missing category", () => {
+            expect(
+                classifyReuseEligibility({
+                    provenance_status: "missing",
+                    compatibility: false,
+                }),
+            ).toEqual({ eligible: false, category: "missing" });
+        });
+    });
+});

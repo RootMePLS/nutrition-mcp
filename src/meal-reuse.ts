@@ -238,3 +238,105 @@ export async function searchReuseCandidates(
         variations,
     };
 }
+
+
+// ---------------------------------------------------------------------------
+// Slice 4: confirmed meal-reuse mutation — pure contracts.
+//
+// Domain errors carry a readonly stable `code`; the MCP layer maps them to
+// stable public messages (mirroring the Slice 2 supplement tools). The pure
+// helpers below are the ONLY place identity equality and eligibility
+// classification are defined; the transactional service and its tests build
+// on them. No DB code in this section.
+// ---------------------------------------------------------------------------
+
+export class MealReuseSourceNotFoundError extends Error {
+    readonly code = "meal_reuse_source_not_found";
+    constructor() {
+        super("no reusable meal event with this id exists for this user");
+        this.name = "MealReuseSourceNotFoundError";
+    }
+}
+
+export class MealReuseSourceVersionError extends Error {
+    readonly code = "meal_reuse_source_version_not_current_or_historical";
+    constructor() {
+        super(
+            "requested source version is neither the current nor a persisted historical version",
+        );
+        this.name = "MealReuseSourceVersionError";
+    }
+}
+
+export type MealReuseIneligibleCategory =
+    | "compatibility"
+    | "pending"
+    | "unavailable"
+    | "missing";
+
+export class MealReuseSourceIneligibleError extends Error {
+    readonly code = "meal_reuse_source_ineligible";
+    constructor(readonly category: MealReuseIneligibleCategory) {
+        super(
+            `meal_reuse_source_ineligible: ${category} — source version lacks complete ready provider/canonical evidence; nothing was created and no value was fabricated`,
+        );
+        this.name = "MealReuseSourceIneligibleError";
+    }
+}
+
+export class MealReuseIdempotencyConflictError extends Error {
+    readonly code = "idempotency_conflict";
+    constructor() {
+        super(
+            "idempotency_conflict: this reuse idempotency key was already used with a different source event/version or timestamps",
+        );
+        this.name = "MealReuseIdempotencyConflictError";
+    }
+}
+
+/**
+ * Millisecond-equal reuse identity comparison. timestamptz round-trips lose
+ * sub-ms precision and ISO string variants (`Z` vs `+00:00`) differ
+ * textually, so identity equality compares `Date.parse` millisecond values,
+ * never strings.
+ */
+export function reuseIdentityMatches(
+    stored: {
+        source_event_id: string;
+        source_version: number;
+        reported_at: string;
+        consumed_at: string;
+    },
+    incoming: {
+        source_event_id: string;
+        source_version: number;
+        reported_at: string;
+        consumed_at: string;
+    },
+): boolean {
+    return (
+        stored.source_event_id === incoming.source_event_id &&
+        stored.source_version === incoming.source_version &&
+        Date.parse(stored.reported_at) === Date.parse(incoming.reported_at) &&
+        Date.parse(stored.consumed_at) === Date.parse(incoming.consumed_at)
+    );
+}
+
+/**
+ * Map the real persisted `deriveAggregateProvenance` verdict to a reuse
+ * eligibility decision. A compatibility version (no bundle fingerprint) is
+ * never eligible even when the status derivation says otherwise; otherwise
+ * only an exact `ready` status is eligible.
+ */
+export function classifyReuseEligibility(derived: {
+    provenance_status: "ready" | "pending" | "unavailable" | "missing";
+    compatibility: boolean;
+}): { eligible: true } | { eligible: false; category: MealReuseIneligibleCategory } {
+    if (derived.compatibility === true) {
+        return { eligible: false, category: "compatibility" };
+    }
+    if (derived.provenance_status !== "ready") {
+        return { eligible: false, category: derived.provenance_status };
+    }
+    return { eligible: true };
+}
