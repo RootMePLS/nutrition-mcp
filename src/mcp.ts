@@ -6408,7 +6408,7 @@ export function registerTools(
                 idempotentHint: true,
                 openWorldHint: false,
             },
-            inputSchema: {
+            inputSchema: z.strictObject({
                 product_id: z.string().uuid(),
                 product_version: z.number().int().min(1).nullable().optional(),
                 dose_servings: z.number().positive().finite(),
@@ -6425,7 +6425,7 @@ export function registerTools(
                     .max(255)
                     .nullable()
                     .optional(),
-            },
+            }),
             outputSchema: {
                 regimen: z.object(SUPPLEMENT_REGIMEN_OUTPUT_SCHEMA),
                 deduplicated: z.boolean(),
@@ -6492,11 +6492,11 @@ export function registerTools(
                 idempotentHint: true,
                 openWorldHint: false,
             },
-            inputSchema: {
+            inputSchema: z.strictObject({
                 include_inactive: z.boolean().optional(),
                 product_id: z.string().uuid().optional(),
                 limit: z.number().int().min(1).max(200).optional(),
-            },
+            }),
             outputSchema: {
                 regimens: z.array(z.object(SUPPLEMENT_REGIMEN_OUTPUT_SCHEMA)),
             },
@@ -6546,10 +6546,10 @@ export function registerTools(
                 idempotentHint: true,
                 openWorldHint: false,
             },
-            inputSchema: {
+            inputSchema: z.strictObject({
                 regimen_id: z.string().uuid(),
                 active: z.boolean(),
-            },
+            }),
             outputSchema: {
                 regimen: z.object(SUPPLEMENT_REGIMEN_OUTPUT_SCHEMA),
                 changed: z.boolean(),
@@ -6600,10 +6600,10 @@ export function registerTools(
                 idempotentHint: true,
                 openWorldHint: false,
             },
-            inputSchema: {
+            inputSchema: z.strictObject({
                 product_id: z.string().uuid().optional(),
                 alias: z.string().min(1).optional(),
-            },
+            }),
             outputSchema: RESOLVE_PRODUCT_OUTPUT_SCHEMA,
         },
         async ({ product_id, alias }) => {
@@ -6650,7 +6650,7 @@ export function registerTools(
                 idempotentHint: true,
                 openWorldHint: false,
             },
-            inputSchema: {
+            inputSchema: z.strictObject({
                 product_id: z.string().uuid().optional(),
                 alias: z.string().min(1).optional(),
                 product_version: z.number().int().min(1).optional(),
@@ -6664,7 +6664,7 @@ export function registerTools(
                 reason: z.string().max(1000).nullable().optional(),
                 supersedes_intake_id: z.string().uuid().nullable().optional(),
                 idempotency_key: z.string().min(1).max(255),
-            },
+            }),
             outputSchema: {
                 intake: z.object(SUPPLEMENT_INTAKE_FACT_OUTPUT_SCHEMA),
                 deduplicated: z.boolean(),
@@ -6734,7 +6734,7 @@ export function registerTools(
                 idempotentHint: true,
                 openWorldHint: false,
             },
-            inputSchema: {
+            inputSchema: z.strictObject({
                 product_id: z.string().uuid().optional(),
                 regimen_id: z.string().uuid().optional(),
                 from: z
@@ -6752,7 +6752,7 @@ export function registerTools(
                     })
                     .optional(),
                 limit: z.number().int().min(1).max(500).optional(),
-            },
+            }),
             outputSchema: {
                 intakes: z.array(
                     z.object(SUPPLEMENT_INTAKE_FACT_OUTPUT_SCHEMA),
@@ -6806,11 +6806,11 @@ export function registerTools(
                 idempotentHint: true,
                 openWorldHint: false,
             },
-            inputSchema: {
+            inputSchema: z.strictObject({
                 regimen_id: z.string().uuid(),
                 from_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
                 to_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-            },
+            }),
             outputSchema: REGIMEN_STATUS_OUTPUT_SCHEMA,
         },
         async ({ regimen_id, from_date, to_date }) => {

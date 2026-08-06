@@ -1024,6 +1024,7 @@ describeDb(
             });
         });
 
+
         test("malformed payloads are rejected at the schema/handler boundary with zero writes", async () => {
             await withSupplementTools(pool, "u1", async ({ call }) => {
                 const productId = await createProduct(call);
@@ -1173,6 +1174,75 @@ describeDb(
                 }
 
                 expect(await domainCounts()).toEqual(before);
+            });
+        });
+
+        test("all seven slice-5 tools reject unknown top-level keys with strict advertised schemas and zero writes", async () => {
+            await withSupplementTools(pool, "u1", async ({ call, listTools }) => {
+                const productId = await createProduct(call);
+                const regimenId = await createRegimen(call, productId);
+
+                const STRICT_TOOLS: Record<string, Record<string, unknown>> = {
+                    create_supplement_regimen: validRegimenArgs(productId),
+                    list_supplement_regimens: {},
+                    set_supplement_regimen_active: {
+                        regimen_id: regimenId,
+                        active: true,
+                    },
+                    resolve_supplement_product: { product_id: productId },
+                    log_supplement_intake: validIntakeArgs({
+                        product_id: productId,
+                    }),
+                    get_supplement_intakes: {},
+                    get_supplement_regimen_status: {
+                        regimen_id: regimenId,
+                        from_date: "2026-08-01",
+                        to_date: "2026-08-07",
+                    },
+                };
+
+                // Advertised JSON schema must forbid unknown top-level keys.
+                const tools = await listTools();
+                const byName = new Map(tools.map((t) => [t.name, t]));
+                for (const name of Object.keys(STRICT_TOOLS)) {
+                    const schema = byName.get(name)!.inputSchema as {
+                        additionalProperties?: boolean;
+                    };
+                    expect(
+                        schema.additionalProperties,
+                        `${name} advertises additionalProperties: false`,
+                    ).toBe(false);
+                }
+
+                // Runtime: a valid payload plus one bogus top-level key is a
+                // validation error for every tool, and mutation errors write
+                // nothing to any domain table.
+                const before = await domainCounts();
+                for (const [name, valid] of Object.entries(STRICT_TOOLS)) {
+                    const res = await call(name, {
+                        ...valid,
+                        bogus_top_level_key: "rejected",
+                    });
+                    expect(res.isError, `${name} rejects unknown key`).toBe(
+                        true,
+                    );
+                    expect(res.content[0]?.text ?? "").toContain(
+                        "bogus_top_level_key",
+                    );
+                }
+                expect(await domainCounts()).toEqual(before);
+
+                // Valid payloads are preserved: the same read-only calls
+                // succeed without the bogus key.
+                for (const name of [
+                    "list_supplement_regimens",
+                    "resolve_supplement_product",
+                    "get_supplement_intakes",
+                    "get_supplement_regimen_status",
+                ]) {
+                    const ok = await call(name, STRICT_TOOLS[name]);
+                    expect(ok.isError, `${name} valid payload ok`).toBeFalsy();
+                }
             });
         });
 
