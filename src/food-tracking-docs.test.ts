@@ -1,5 +1,9 @@
 import { expect, test } from "bun:test";
 import { readdirSync } from "node:fs";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { registerTools } from "./mcp.js";
 
 const docs = await Bun.file("docs/food-tracking-agent-driven.md").text();
 const readme = await Bun.file("README.md").text();
@@ -29,7 +33,68 @@ const requiredContractPhrases = [
     "DATABASE_URL_TEST",
     "undefined → done → missed → undefined",
     "no scheduler",
+    "reuse_meal_calculation",
+    "create_supplement_product",
+    "revise_supplement_product_label",
+    "search_supplement_products",
+    "supplement_label",
+    "label-compat-v1",
 ];
+
+async function advertisedToolNames(): Promise<string[]> {
+    const server = new McpServer(
+        { name: "docs-inventory", version: "0.0.0" },
+        { capabilities: { tools: {}, resources: {} } },
+    );
+    registerTools(server, "docs-inventory-user", true, null);
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "docs-client", version: "0.0.0" });
+    await Promise.all([server.connect(st), client.connect(ct)]);
+    const { tools } = await client.listTools();
+    await client.close();
+    await server.close();
+    return tools.map((t) => t.name);
+}
+
+test("README tools table has one row for every live MCP registration", async () => {
+    const names = await advertisedToolNames();
+    // Release 1 head: 66 public tools. A later slice may add tools, but a
+    // tool may never ship without a README inventory row.
+    expect(names.length).toBeGreaterThanOrEqual(66);
+    for (const name of names) {
+        expect(readme).toContain(`| \`${name}\``);
+    }
+});
+
+test("docs make no stale pre-slice-6/7 claims", () => {
+    expect(readme).not.toContain("arrives with the sports-snack slice");
+    expect(docs).not.toContain(
+        "no MCP tools are registered for these tables yet",
+    );
+});
+
+const releaseOneDenials = [
+    "does not deliver or schedule weekly reports",
+    "no cron, scheduler, or reminders",
+    "no OCR or image parsing",
+    "never re-runs or calls external nutrition providers",
+    "ships no MyFitnessPal writer",
+    "no medical, dosage, or interaction advice",
+    "never marks an intake automatically",
+];
+
+test("README and docs explicitly deny unshipped scope", () => {
+    for (const denial of releaseOneDenials) {
+        expect(docs).toContain(denial);
+    }
+    for (const denial of [
+        "does not deliver or schedule weekly reports",
+        "no OCR or image parsing",
+        "no medical, dosage, or interaction advice",
+    ]) {
+        expect(readme).toContain(denial);
+    }
+});
 
 test("agent-driven food-tracking docs state the shipped boundary", () => {
     for (const phrase of requiredContractPhrases) {
@@ -38,7 +103,7 @@ test("agent-driven food-tracking docs state the shipped boundary", () => {
 });
 
 test("agent-driven docs enumerate the forward migration chain", async () => {
-    expect(migrationFiles.length).toBeGreaterThanOrEqual(7);
+    expect(migrationFiles.length).toBeGreaterThanOrEqual(10);
     for (const migration of migrationFiles) {
         expect(docs).toContain(migration);
         expect(

@@ -211,6 +211,27 @@ accepted, and rejected calls write nothing — never a fabricated zero. An
 identical retry converges on the original event; the same key with a changed
 source, version, or timestamp is a stable `idempotency_conflict`.
 
+## Supplement product catalogue
+
+`create_supplement_product` registers a supplement or sports-nutrition product
+from a verified label only: category `supplement | sports_nutrition`, names and
+aliases, serving, the supplied generic nutrient facts (`nutrient_key`, amount,
+explicit unit — an explicit numeric zero is real data; an unknown nutrient is
+omitted, never zero), label evidence, and optional label-defined limits. It
+creates immutable label version 1 and returns the product readback; replaying
+the same idempotency key with the same label returns the original product, and
+a different label under the same key is a conflict — concurrent first-time
+creates are DB-serialized by migrations `008`/`009`.
+`revise_supplement_product_label` appends an immutable label version N+1 and
+advances the current pointer in one transaction; historical versions, intake
+snapshots, and a regimen's pinned version are never rewritten, and deleted
+products cannot be revised. `get_supplement_product`,
+`list_supplement_products`, and `search_supplement_products` are read-only and
+user-scoped: deleted products are excluded (or fail closed as not found), and
+case-insensitive search matches only the CURRENT label version's display name,
+short name, and aliases — historical-version aliases stop matching after a
+revision, and ambiguity is explicit rather than silently resolved.
+
 ## Supplement regimens and append-only intake facts
 
 A supplement regimen is declarative intent, created only by the explicit
@@ -245,9 +266,22 @@ ambiguity returns candidates (or fails the log with
 `supplement_alias_ambiguous`) with zero writes, and a direct product id
 removes ambiguity authoritatively. Unknown, cross-user, or deleted products
 and regimens fail closed with the same not-found shape, so existence never
-leaks. Caloric sports-nutrition meal-event linkage shipped with the
-sports-snack slice; the reporting boundary and data-flag reads shipped with
-the reporting slice described next.
+leaks. A confirmed `done` intake of a caloric `sports_nutrition` product atomically —
+in the same transaction as the intake fact and snapshots — creates one linked
+`snack` meal event through the ordinary append-only event path and one
+bidirectional intake↔event link row. The snack's evidence is transparently
+label-derived, not a calculation: a single `own` provider result
+(`algorithm_version` `label-compat-v1`) whose provenance is
+`{ kind: "supplement_label", product_id, product_version, servings }`, carrying
+only the food-compatible nutrient keys scaled from the immutable snapshot of
+the bound label version (an explicit label zero scales to zero; unknown stays
+absent). The public `get_calculation_provenance` re-read reports
+`compatibility: true` with `bundle_fingerprint: null` — a label snack never
+claims to be a ready three-provider calculation, and no provider is called.
+Retries converge on the same event (`snack:suppl-intake:<intake_id>`); a
+rolled-back intake leaves no event or link. Ordinary `supplement` products and
+`missed`/`cleared` facts never create a meal event. The reporting boundary and
+data-flag reads shipped with the reporting slice described next.
 
 ## Reporting boundary and non-medical data flags
 
@@ -283,6 +317,20 @@ not `synced`, and no external ID or success claim may be invented. Local event
 persistence is independent of any later external attempt. A correction uses a
 separate correction journal identity and remains pending under the same rule.
 
+## Release 1 scope boundary
+
+This repository stores, validates, and reads back nutrition truth; the agent
+host owns everything conversational and external.
+It does not deliver or schedule weekly reports — the reporting tools are query
+boundaries only. There
+is no cron, scheduler, or reminders, and the server
+never marks an intake automatically; a due regimen occurrence is only ever derived as `undefined` in
+a read result. It has no OCR or image parsing and offers
+no medical, dosage, or interaction advice — the data flags are transparent recorded facts. Reuse
+and snack linkage copy stored evidence and
+never re-runs or calls external nutrition providers, and it ships no MyFitnessPal writer: explicit
+authorization records a pending journal intent only.
+
 ## Migrations, upgrade, and test gate
 
 Apply the forward-only migrations in this exact order:
@@ -300,8 +348,8 @@ Apply the forward-only migrations in this exact order:
    lineage and supplement/sports-nutrition catalogue substrate (products,
    immutable label versions, aliases, generic nutrients, label limits,
    declarative regimens, append-only intake facts, nutrient snapshots, and
-   intake↔snack links). Schema only: no MCP tools are registered for these
-   tables yet.
+   intake↔snack links). The public tools over these tables shipped in the
+   catalogue, regimen/intake, snack-linkage, and reporting slices.
 7. `db/migrations/007_ownership_lineage_integrity.sql` — additive integrity
    hardening over the 006 substrate: composite candidate keys and foreign
    keys that make cross-user reuse lineage, mismatched provider-source
