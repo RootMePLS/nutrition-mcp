@@ -190,6 +190,27 @@ as `failed`/`unavailable` and does not erase the local event. Unique keys and
 server-derived capture/correction identities make identical retries converge
 without duplicate roots, versions, provider rows, or journal intents.
 
+## Confirmed meal reuse
+
+`reuse_meal_calculation` is the explicit-confirmation mutation that creates a
+NEW meal event from one precise prior event/version (the exact pair surfaced
+by `search_meals` reuse candidates). The server — inside one transaction —
+locks the caller's reuse idempotency identity and the requested source
+event/version, enforces fail-closed eligibility against the persisted
+provenance policy (only an active, caller-owned source whose requested version
+re-derives fully ready, non-compatibility evidence is reusable; absent,
+deleted, cross-user, nonexistent-version, compatibility, pending, and
+unavailable sources are rejected with stable errors that never reveal another
+user's data or existence), then copies the server-read source items, provider
+evidence, and canonical facts byte-for-byte into a fresh root + version 1 with
+the supplied fresh reported/consumed timestamps. It records immutable lineage
+(source event/version, source canonical result, source bundle fingerprint,
+confirmation flag) plus per-provider source mappings in the reuse lineage
+tables. No providers are called, caller-supplied nutrition values are never
+accepted, and rejected calls write nothing — never a fabricated zero. An
+identical retry converges on the original event; the same key with a changed
+source, version, or timestamp is a stable `idempotency_conflict`.
+
 ## MyFitnessPal sync journal
 
 An explicit add confirmation authorizes a possible MyFitnessPal write and
