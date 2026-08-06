@@ -3147,8 +3147,11 @@ describeDb(
             );
             expect(verRows).toHaveLength(1);
             expect(
-                (verRows[0] as { calculation_bundle_fingerprint: string | null })
-                    .calculation_bundle_fingerprint,
+                (
+                    verRows[0] as {
+                        calculation_bundle_fingerprint: string | null;
+                    }
+                ).calculation_bundle_fingerprint,
             ).toBeNull();
 
             const { rows: provRows } = await pool.query(
@@ -3157,8 +3160,9 @@ describeDb(
                 [result.snack_event_id, result.snack_version],
             );
             expect(provRows).toHaveLength(1);
-            const provenance = (provRows[0] as { provenance: Record<string, unknown> })
-                .provenance;
+            const provenance = (
+                provRows[0] as { provenance: Record<string, unknown> }
+            ).provenance;
             expect(provenance.kind).toBe("supplement_label");
             expect(provenance.product_version).toBe(1);
             expect(typeof provenance.intake_id).toBe("string");

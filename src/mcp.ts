@@ -6643,7 +6643,7 @@ export function registerTools(
         {
             title: "Log Supplement Intake",
             description:
-                "Append one immutable supplement intake fact for the user: exactly one selector (direct product_id, a unique alias, or an active regimen_id which supplies the pinned product/version), positive servings, a strict occurred_at timestamp, and state_action done|missed|cleared. Facts are never updated or deleted; a correction appends a new fact (optionally superseding an earlier one with a reason). The public visible state is exactly undefined|done|missed (cleared projects undefined). A done fact immutably snapshots the bound label version's nutrients scaled by servings; missed/cleared facts snapshot nothing. This version performs NO caloric meal-event linkage for sports nutrition (that arrives with a later slice). Data only — no dosage or medical advice. Replaying the same idempotency_key returns the original fact; the same key with a different fact is a conflict.",
+                "Append one immutable supplement intake fact for the user: exactly one selector (direct product_id, a unique alias, or an active regimen_id which supplies the pinned product/version), positive servings, a strict occurred_at timestamp, and state_action done|missed|cleared. Facts are never updated or deleted; a correction appends a new fact (optionally superseding an earlier one with a reason). The public visible state is exactly undefined|done|missed (cleared projects undefined). A done fact immutably snapshots the bound label version's nutrients scaled by servings; missed/cleared facts snapshot nothing. A done sports_nutrition intake atomically creates a snack meal event with the bound label's scaled nutrients (single \"own\" provider, no multi-provider consensus). A supplement-category intake or non-done action creates no meal event. Data only — no dosage or medical advice. Replaying the same idempotency_key returns the original fact; the same key with a different fact is a conflict.",
             annotations: {
                 readOnlyHint: false,
                 destructiveHint: false,
@@ -6668,6 +6668,8 @@ export function registerTools(
             outputSchema: {
                 intake: z.object(SUPPLEMENT_INTAKE_FACT_OUTPUT_SCHEMA),
                 deduplicated: z.boolean(),
+                snack_event_id: z.string().optional(),
+                snack_version: z.number().optional(),
             },
         },
         async ({
@@ -6699,10 +6701,15 @@ export function registerTools(
                         idempotency_key,
                         actor: userId,
                     }).catch(supplementToolError);
-                    const structuredContent = {
+                    const structuredContent: Record<string, unknown> = {
                         intake: result.intake,
                         deduplicated: result.deduplicated,
                     };
+                    if (result.snack_event_id !== undefined) {
+                        structuredContent.snack_event_id =
+                            result.snack_event_id;
+                        structuredContent.snack_version = result.snack_version;
+                    }
                     return {
                         content: [
                             {
