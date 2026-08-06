@@ -14,6 +14,7 @@ const MIGRATION_003 = "db/migrations/003_meal_captures.sql";
 const MIGRATION_004 = "db/migrations/004_calculation_bundles.sql";
 const MIGRATION_005 = "db/migrations/005_calculation_corrections.sql";
 const MIGRATION_006 = "db/migrations/006_meal_reuse_and_supplements.sql";
+const MIGRATION_007 = "db/migrations/007_ownership_lineage_integrity.sql";
 
 const MIGRATION_006_TABLES = [
     "meal_event_reuse_sources",
@@ -97,6 +98,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_004);
         await applyMigration(client, MIGRATION_005);
         await applyMigration(client, MIGRATION_006);
+        await applyMigration(client, MIGRATION_007);
 
         const tables = await tableNames(client);
         for (const table of NEW_TABLES) {
@@ -140,6 +142,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_004);
         await applyMigration(client, MIGRATION_005);
         await applyMigration(client, MIGRATION_006);
+        await applyMigration(client, MIGRATION_007);
 
         const tables = await tableNames(client);
         expect(tables).not.toContain(LEGACY_TABLE);
@@ -167,6 +170,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_004);
         await applyMigration(client, MIGRATION_005);
         await applyMigration(client, MIGRATION_006);
+        await applyMigration(client, MIGRATION_007);
 
         const tables = await tableNames(client);
         for (const table of NEW_TABLES) {
@@ -183,6 +187,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_004);
         await applyMigration(client, MIGRATION_005);
         await applyMigration(client, MIGRATION_006);
+        await applyMigration(client, MIGRATION_007);
         const event = await createMealEvent(
             pool,
             {
@@ -259,8 +264,10 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         );
 
         await applyMigration(client, MIGRATION_006);
-        // Rerunning 006 must be safe (additive/idempotent like 003-005).
+        await applyMigration(client, MIGRATION_007);
+        // Rerunning 006 and 007 must be safe (additive/idempotent like 003-005).
         await applyMigration(client, MIGRATION_006);
+        await applyMigration(client, MIGRATION_007);
 
         // Existing alcohol profile state survives the upgrade untouched.
         const { rows: profiles } = await client.query(
@@ -381,6 +388,455 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         expect(Array.isArray(stats.timezone_list)).toBe(true);
     });
 });
+
+// Migration chain applied by the ownership/lineage integrity suite. The
+// adversarial tests below must pass against this exact head.
+const INTEGRITY_CHAIN = [
+    MIGRATION_001,
+    MIGRATION_002,
+    MIGRATION_003,
+    MIGRATION_004,
+    MIGRATION_005,
+    MIGRATION_006,
+    MIGRATION_007,
+];
+
+// Reviewer-terra finding 2: direct persistence must not be able to create
+// cross-user or provenance-invalid reuse/supplement facts. Every adversarial
+// insert below targets the real database constraint boundary, never an
+// application-level validator.
+describeDb(
+    "migration 007 ownership/lineage integrity (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+        let client: PoolClient;
+
+        beforeAll(async () => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST, max: 1 });
+            client = await pool.connect();
+        });
+
+        afterAll(async () => {
+            client.release();
+            await pool.end();
+        });
+
+        async function applyIntegrityChain(): Promise<void> {
+            await resetSchema(client);
+            for (const migration of INTEGRITY_CHAIN) {
+                await applyMigration(client, migration);
+            }
+        }
+
+        async function seedEvent(
+            userId: string,
+            idempotencyKey: string,
+        ): Promise<{ eventId: string; providerResultId: string }> {
+            const event = await createMealEvent(
+                pool,
+                {
+                    user_id: userId,
+                    idempotency_key: idempotencyKey,
+                    reported_at: "2026-08-05T12:00:00.000Z",
+                    items: [{ ordinal: 0, raw_item_text: "oats" }],
+                    inputs: [],
+                    media: [],
+                    provider_results: [
+                        {
+                            provider: "own",
+                            status: "succeeded",
+                            request_fingerprint: `fp-${idempotencyKey}`,
+                            algorithm_version: "v1",
+                            nutrients: { calories: 100 },
+                            raw_payload: { calories: 100 },
+                        },
+                    ],
+                    parser_policy_version: "test",
+                    created_by: "test",
+                },
+                client,
+            );
+            const { rows } = await client.query(
+                "SELECT id FROM meal_event_nutrition_results WHERE event_id = $1",
+                [event.event_id],
+            );
+            return { eventId: event.event_id, providerResultId: rows[0].id };
+        }
+
+        async function seedProduct(
+            userId: string,
+            displayName: string,
+        ): Promise<string> {
+            const { rows: products } = await client.query(
+                `INSERT INTO supplement_products (user_id, category)
+             VALUES ($1, 'supplement') RETURNING id`,
+                [userId],
+            );
+            const productId = products[0].id as string;
+            await client.query(
+                `INSERT INTO supplement_product_versions
+                (product_id, version, user_id, display_name, label_evidence, created_by)
+             VALUES ($1, 1, $2, $3, '{}', 'test')`,
+                [productId, userId, displayName],
+            );
+            return productId;
+        }
+
+        test("reuse lineage user_id must own both target and source events", async () => {
+            await applyIntegrityChain();
+            const target = await seedEvent("u1", "integrity-target");
+            const ownSource = await seedEvent("u1", "integrity-own-source");
+            const foreign = await seedEvent("u2", "integrity-foreign");
+
+            // Cross-user source: lineage claims u1 but the source belongs to u2.
+            await expect(
+                client.query(
+                    `INSERT INTO meal_event_reuse_sources
+                    (event_id, version, user_id, source_event_id, source_version,
+                     reuse_idempotency_key, confirmation_received, created_by)
+                 VALUES ($1, 1, 'u1', $2, 1, 'r-cross-source', true, 'test')`,
+                    [target.eventId, foreign.eventId],
+                ),
+            ).rejects.toThrow();
+
+            // Mismatched target owner: lineage claims u2 but target belongs to u1.
+            await expect(
+                client.query(
+                    `INSERT INTO meal_event_reuse_sources
+                    (event_id, version, user_id, source_event_id, source_version,
+                     reuse_idempotency_key, confirmation_received, created_by)
+                 VALUES ($1, 1, 'u2', $2, 1, 'r-cross-target', true, 'test')`,
+                    [target.eventId, foreign.eventId],
+                ),
+            ).rejects.toThrow();
+
+            // Valid same-user lineage is accepted.
+            await client.query(
+                `INSERT INTO meal_event_reuse_sources
+                (event_id, version, user_id, source_event_id, source_version,
+                 reuse_idempotency_key, confirmation_received, created_by)
+             VALUES ($1, 1, 'u1', $2, 1, 'r-valid', true, 'test')`,
+                [target.eventId, ownSource.eventId],
+            );
+            const { rows } = await client.query(
+                "SELECT count(*)::int AS n FROM meal_event_reuse_sources",
+            );
+            expect(rows[0].n).toBe(1);
+        });
+
+        test("reuse provider sources must match the declared target/source event+version pair", async () => {
+            await applyIntegrityChain();
+            const target = await seedEvent("u1", "ps-target");
+            const source = await seedEvent("u1", "ps-source");
+            const other = await seedEvent("u1", "ps-other");
+            await client.query(
+                `INSERT INTO meal_event_reuse_sources
+                (event_id, version, user_id, source_event_id, source_version,
+                 reuse_idempotency_key, confirmation_received, created_by)
+             VALUES ($1, 1, 'u1', $2, 1, 'r-ps', true, 'test')`,
+                [target.eventId, source.eventId],
+            );
+
+            // Target provider result must belong to the declared target pair.
+            await expect(
+                client.query(
+                    `INSERT INTO meal_event_reuse_provider_sources
+                    (event_id, version, target_provider_result_id,
+                     source_provider_result_id, source_request_fingerprint,
+                     source_event_id, source_version)
+                 VALUES ($1, 1, $2, $3, 'fp-ps-source', $4, 1)`,
+                    [
+                        target.eventId,
+                        other.providerResultId,
+                        source.providerResultId,
+                        source.eventId,
+                    ],
+                ),
+            ).rejects.toThrow();
+
+            // Source provider result must belong to the declared source pair.
+            await expect(
+                client.query(
+                    `INSERT INTO meal_event_reuse_provider_sources
+                    (event_id, version, target_provider_result_id,
+                     source_provider_result_id, source_request_fingerprint,
+                     source_event_id, source_version)
+                 VALUES ($1, 1, $2, $3, 'fp-ps-other', $4, 1)`,
+                    [
+                        target.eventId,
+                        target.providerResultId,
+                        other.providerResultId,
+                        source.eventId,
+                    ],
+                ),
+            ).rejects.toThrow();
+
+            // Declared source pair must equal the lineage row's source pair.
+            await expect(
+                client.query(
+                    `INSERT INTO meal_event_reuse_provider_sources
+                    (event_id, version, target_provider_result_id,
+                     source_provider_result_id, source_request_fingerprint,
+                     source_event_id, source_version)
+                 VALUES ($1, 1, $2, $3, 'fp-ps-other', $4, 1)`,
+                    [
+                        target.eventId,
+                        target.providerResultId,
+                        other.providerResultId,
+                        other.eventId,
+                    ],
+                ),
+            ).rejects.toThrow();
+
+            // The recorded source request fingerprint must be the source
+            // result's real fingerprint, not a caller-invented one.
+            await expect(
+                client.query(
+                    `INSERT INTO meal_event_reuse_provider_sources
+                    (event_id, version, target_provider_result_id,
+                     source_provider_result_id, source_request_fingerprint,
+                     source_event_id, source_version)
+                 VALUES ($1, 1, $2, $3, 'fp-invented', $4, 1)`,
+                    [
+                        target.eventId,
+                        target.providerResultId,
+                        source.providerResultId,
+                        source.eventId,
+                    ],
+                ),
+            ).rejects.toThrow();
+
+            // Valid correlated mapping is accepted.
+            await client.query(
+                `INSERT INTO meal_event_reuse_provider_sources
+                (event_id, version, target_provider_result_id,
+                 source_provider_result_id, source_request_fingerprint,
+                 source_event_id, source_version)
+             VALUES ($1, 1, $2, $3, 'fp-ps-source', $4, 1)`,
+                [
+                    target.eventId,
+                    target.providerResultId,
+                    source.providerResultId,
+                    source.eventId,
+                ],
+            );
+            const { rows } = await client.query(
+                "SELECT count(*)::int AS n FROM meal_event_reuse_provider_sources",
+            );
+            expect(rows[0].n).toBe(1);
+        });
+
+        test("product children, regimens, and intakes must share the product owner", async () => {
+            await applyIntegrityChain();
+            const productU1 = await seedProduct("u1", "Creatine");
+            await seedProduct("u2", "Whey");
+
+            // Alias user_id must equal the product version owner.
+            await expect(
+                client.query(
+                    `INSERT INTO supplement_product_aliases
+                    (product_id, version, user_id, alias, normalized_alias)
+                 VALUES ($1, 1, 'u2', 'creatine', 'creatine')`,
+                    [productU1],
+                ),
+            ).rejects.toThrow();
+            await client.query(
+                `INSERT INTO supplement_product_aliases
+                (product_id, version, user_id, alias, normalized_alias)
+             VALUES ($1, 1, 'u1', 'creatine', 'creatine')`,
+                [productU1],
+            );
+
+            // Regimen user_id must equal the product version owner.
+            await expect(
+                client.query(
+                    `INSERT INTO supplement_regimens
+                    (user_id, product_id, product_version, dose_servings,
+                     schedule, timezone, starts_on, created_by)
+                 VALUES ('u2', $1, 1, 1,
+                     '{"timezone":"UTC","frequency":"daily","local_time":"08:00"}',
+                     'UTC', '2026-08-01', 'test')`,
+                    [productU1],
+                ),
+            ).rejects.toThrow();
+            const { rows: regimens } = await client.query(
+                `INSERT INTO supplement_regimens
+                (user_id, product_id, product_version, dose_servings,
+                 schedule, timezone, starts_on, created_by)
+             VALUES ('u1', $1, 1, 1,
+                 '{"timezone":"UTC","frequency":"daily","local_time":"08:00"}',
+                 'UTC', '2026-08-01', 'test')
+             RETURNING id`,
+                [productU1],
+            );
+            const regimenId = regimens[0].id as string;
+
+            // Intake user_id must equal the product version owner.
+            await expect(
+                client.query(
+                    `INSERT INTO supplement_intake_events
+                    (user_id, product_id, product_version, servings,
+                     occurred_at, state_action, actor, idempotency_key)
+                 VALUES ('u2', $1, 1, 1, now(), 'done', 'test', 'i-cross')`,
+                    [productU1],
+                ),
+            ).rejects.toThrow();
+
+            // Intake user_id must equal the bound regimen owner.
+            await expect(
+                client.query(
+                    `INSERT INTO supplement_intake_events
+                    (user_id, product_id, product_version, regimen_id, servings,
+                     occurred_at, state_action, actor, idempotency_key)
+                 VALUES ('u2', $1, 1, $2, 1, now(), 'done', 'test', 'i-cross-reg')`,
+                    [productU1, regimenId],
+                ),
+            ).rejects.toThrow();
+
+            // Valid same-user intake bound to the regimen is accepted.
+            await client.query(
+                `INSERT INTO supplement_intake_events
+                (user_id, product_id, product_version, regimen_id, servings,
+                 occurred_at, state_action, actor, idempotency_key)
+             VALUES ('u1', $1, 1, $2, 1, now(), 'done', 'test', 'i-valid')`,
+                [productU1, regimenId],
+            );
+        });
+
+        test("intake snapshots and meal links bind product/version data to their actual intake and user", async () => {
+            await applyIntegrityChain();
+            const productU1 = await seedProduct("u1", "Creatine");
+            const foreignEvent = await seedEvent("u2", "link-foreign");
+            const ownEvent = await seedEvent("u1", "link-own");
+            await client.query(
+                `INSERT INTO supplement_product_nutrients
+                (product_id, version, nutrient_key, display_name, amount, unit, source_evidence)
+             VALUES ($1, 1, 'creatine_g', 'Creatine', 5, 'g', '{}')`,
+                [productU1],
+            );
+            const { rows: intakes } = await client.query(
+                `INSERT INTO supplement_intake_events
+                (user_id, product_id, product_version, servings,
+                 occurred_at, state_action, actor, idempotency_key)
+             VALUES ('u1', $1, 1, 2, now(), 'done', 'test', 'snap-intake')
+             RETURNING id`,
+                [productU1],
+            );
+            const intakeId = intakes[0].id as string;
+
+            // Snapshot user must equal the actual intake owner.
+            await expect(
+                client.query(
+                    `INSERT INTO supplement_intake_nutrient_snapshots
+                    (intake_id, user_id, product_id, product_version,
+                     nutrient_key, unit, original_amount, scaled_amount)
+                 VALUES ($1, 'u2', $2, 1, 'creatine_g', 'g', 5, 10)`,
+                    [intakeId, productU1],
+                ),
+            ).rejects.toThrow();
+
+            // Snapshot product/version must equal the actual intake's pair.
+            await expect(
+                client.query(
+                    `INSERT INTO supplement_intake_nutrient_snapshots
+                    (intake_id, user_id, product_id, product_version,
+                     nutrient_key, unit, original_amount, scaled_amount)
+                 VALUES ($1, 'u1', $2, 2, 'creatine_g', 'g', 5, 10)`,
+                    [intakeId, productU1],
+                ),
+            ).rejects.toThrow();
+
+            // Snapshot nutrient must exist on that exact product version label.
+            await expect(
+                client.query(
+                    `INSERT INTO supplement_intake_nutrient_snapshots
+                    (intake_id, user_id, product_id, product_version,
+                     nutrient_key, unit, original_amount, scaled_amount)
+                 VALUES ($1, 'u1', $2, 1, 'vitamin_d_iu', 'iu', 1000, 2000)`,
+                    [intakeId, productU1],
+                ),
+            ).rejects.toThrow();
+
+            // Valid correlated snapshot is accepted.
+            await client.query(
+                `INSERT INTO supplement_intake_nutrient_snapshots
+                (intake_id, user_id, product_id, product_version,
+                 nutrient_key, unit, original_amount, scaled_amount)
+             VALUES ($1, 'u1', $2, 1, 'creatine_g', 'g', 5, 10)`,
+                [intakeId, productU1],
+            );
+
+            // Meal link user must equal the actual intake owner.
+            await expect(
+                client.query(
+                    `INSERT INTO supplement_intake_meal_links
+                    (user_id, intake_id, event_id, version, product_id,
+                     product_version, idempotency_fingerprint)
+                 VALUES ('u2', $1, $2, 1, $3, 1, 'linkfp-1')`,
+                    [intakeId, ownEvent.eventId, productU1],
+                ),
+            ).rejects.toThrow();
+
+            // Meal link event must belong to the same user as the link/intake.
+            await expect(
+                client.query(
+                    `INSERT INTO supplement_intake_meal_links
+                    (user_id, intake_id, event_id, version, product_id,
+                     product_version, idempotency_fingerprint)
+                 VALUES ('u1', $1, $2, 1, $3, 1, 'linkfp-2')`,
+                    [intakeId, foreignEvent.eventId, productU1],
+                ),
+            ).rejects.toThrow();
+
+            // Valid same-user link to the user's own snack event is accepted.
+            await client.query(
+                `INSERT INTO supplement_intake_meal_links
+                (user_id, intake_id, event_id, version, product_id,
+                 product_version, idempotency_fingerprint)
+             VALUES ('u1', $1, $2, 1, $3, 1, 'linkfp-3')`,
+                [intakeId, ownEvent.eventId, productU1],
+            );
+            const { rows } = await client.query(
+                `SELECT
+                (SELECT count(*)::int FROM supplement_intake_nutrient_snapshots) AS snapshots,
+                (SELECT count(*)::int FROM supplement_intake_meal_links) AS links`,
+            );
+            expect(rows[0]).toEqual({ snapshots: 1, links: 1 });
+        });
+
+        test("007 hardening constraints exist and the chain stays rerunnable", async () => {
+            await applyIntegrityChain();
+
+            const expectedConstraints = [
+                "meal_reuse_sources_target_owner_fk",
+                "meal_reuse_sources_source_owner_fk",
+                "reuse_provider_sources_target_result_fk",
+                "reuse_provider_sources_source_pair_fk",
+                "reuse_provider_sources_source_result_fk",
+                "reuse_provider_sources_source_fp_fk",
+                "supplement_aliases_same_user_fk",
+                "supplement_regimens_same_user_product_fk",
+                "supplement_intake_same_user_product_fk",
+                "supplement_intake_same_user_regimen_fk",
+                "intake_snapshots_intake_fk",
+                "intake_snapshots_product_nutrient_fk",
+                "intake_meal_links_intake_fk",
+                "intake_meal_links_event_owner_fk",
+            ];
+            const { rows } = await client.query(
+                `SELECT conname FROM pg_constraint
+             WHERE connamespace = 'public'::regnamespace AND conname = ANY($1)`,
+                [expectedConstraints],
+            );
+            expect(rows.map((r) => r.conname).sort()).toEqual(
+                [...expectedConstraints].sort(),
+            );
+
+            // Rerunning the head migration must be safe (additive/idempotent).
+            await applyMigration(client, MIGRATION_007);
+        });
+    },
+);
 
 describeDb("database readiness probe (requires DATABASE_URL_TEST)", () => {
     test("readiness succeeds against the live test database", async () => {

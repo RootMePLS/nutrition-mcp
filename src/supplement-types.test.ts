@@ -95,6 +95,40 @@ describe("label nutrients: unknown is absent, explicit zero is real data", () =>
         expect(errors).toEqual([]);
     });
 
+    // Regression for reviewer-terra finding 1: identity is the tuple
+    // (nutrient_key, unit), never a concatenated string. Concatenation
+    // collides for valid distinct facts and must not reject them.
+    test("distinct (key, unit) tuples never collide under concatenation", () => {
+        const errors = validateLabelNutrients([
+            { nutrient_key: "ab", amount: 1, unit: "c" },
+            { nutrient_key: "a", amount: 2, unit: "bc" },
+        ]);
+        expect(errors).toEqual([]);
+    });
+
+    test("tuple identity is exact: only the same trimmed key AND same trimmed unit duplicates", () => {
+        const errors = validateLabelNutrients([
+            { nutrient_key: "ab", amount: 1, unit: "c" },
+            { nutrient_key: "a", amount: 2, unit: "bc" },
+            { nutrient_key: "ab", amount: 3, unit: "c" },
+        ]);
+        expect(errors.length).toBe(1);
+        expect(errors[0]).toContain("duplicate nutrient identity");
+        // A same key with a different unit is still a distinct fact.
+        expect(
+            validateLabelNutrients([
+                { nutrient_key: "ab", amount: 1, unit: "c" },
+                { nutrient_key: "ab", amount: 2, unit: "c " },
+            ]).length,
+        ).toBe(1);
+        expect(
+            validateLabelNutrients([
+                { nutrient_key: "ab", amount: 1, unit: "c" },
+                { nutrient_key: "ab", amount: 2, unit: "mg" },
+            ]),
+        ).toEqual([]);
+    });
+
     test("malformed payloads fail safely instead of throwing", () => {
         for (const payload of [null, undefined, 42, "x", {}]) {
             expect(validateLabelNutrients(payload).length).toBeGreaterThan(0);

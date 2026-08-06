@@ -1,6 +1,15 @@
 import { expect, test } from "bun:test";
+import { readdirSync } from "node:fs";
 
 const docs = await Bun.file("docs/food-tracking-agent-driven.md").text();
+const readme = await Bun.file("README.md").text();
+
+// Every migration file that actually exists on disk, in chain order. Docs
+// tests derive the required chain from the directory so a new migration can
+// never ship without README/docs truth.
+const migrationFiles = readdirSync("db/migrations")
+    .filter((name) => name.endsWith(".sql"))
+    .sort();
 
 const requiredContractPhrases = [
     "Hermes (the agent host) owns",
@@ -27,19 +36,25 @@ test("agent-driven food-tracking docs state the shipped boundary", () => {
 });
 
 test("agent-driven docs enumerate the forward migration chain", async () => {
-    const migrations = [
-        "001_initial_schema.sql",
-        "002_food_tracking.sql",
-        "003_meal_captures.sql",
-        "004_calculation_bundles.sql",
-        "005_calculation_corrections.sql",
-        "006_meal_reuse_and_supplements.sql",
-    ];
-    for (const migration of migrations) {
+    expect(migrationFiles.length).toBeGreaterThanOrEqual(7);
+    for (const migration of migrationFiles) {
         expect(docs).toContain(migration);
         expect(
             (await Bun.file(`db/migrations/${migration}`).text()).trim(),
         ).not.toBe("");
+    }
+});
+
+test("README operator migration instructions cover the real migration head", () => {
+    // Reviewer-terra finding 3: a clean setup following the README must apply
+    // every migration that exists, through the current head — not a stale
+    // 001-005 prefix. The chain is derived from the directory so this test
+    // fails the moment a new migration ships without README truth.
+    for (const migration of migrationFiles) {
+        expect(readme).toContain(migration);
+        // Each migration must appear in an actual operator command, not only
+        // in prose: the psql apply line is the operator contract.
+        expect(readme).toContain(`-f db/migrations/${migration}`);
     }
 });
 

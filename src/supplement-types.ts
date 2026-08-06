@@ -65,7 +65,12 @@ export function validateLabelNutrients(nutrients: unknown): string[] {
     if (!Array.isArray(nutrients)) {
         return ["label nutrients must be an array"];
     }
-    const identities = new Set<string>();
+    // Collision-free tuple identity: nutrient_key maps to the set of units
+    // seen for that exact key. No string concatenation or delimiter is
+    // involved, so distinct pairs such as ("ab","c") and ("a","bc") can
+    // never alias, matching the SQL uniqueness tuple
+    // (product_id, version, nutrient_key, unit).
+    const identities = new Map<string, Set<string>>();
     let duplicateSeen = false;
     for (const entry of nutrients as SupplementLabelNutrientInput[]) {
         if (entry === null || typeof entry !== "object") {
@@ -94,14 +99,17 @@ export function validateLabelNutrients(nutrients: unknown): string[] {
             typeof entry.nutrient_key === "string" &&
             typeof entry.unit === "string"
         ) {
-            const identity = `${entry.nutrient_key.trim()}${entry.unit.trim()}`;
-            if (identities.has(identity) && !duplicateSeen) {
+            const key = entry.nutrient_key.trim();
+            const unit = entry.unit.trim();
+            const unitsForKey = identities.get(key) ?? new Set<string>();
+            if (unitsForKey.has(unit) && !duplicateSeen) {
                 errors.push(
                     "duplicate nutrient identity (nutrient_key + unit) within one label",
                 );
                 duplicateSeen = true;
             }
-            identities.add(identity);
+            unitsForKey.add(unit);
+            identities.set(key, unitsForKey);
         }
     }
     return errors;

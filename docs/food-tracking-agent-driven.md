@@ -220,6 +220,11 @@ Apply the forward-only migrations in this exact order:
    declarative regimens, append-only intake facts, nutrient snapshots, and
    intake↔snack links). Schema only: no MCP tools are registered for these
    tables yet.
+7. `db/migrations/007_ownership_lineage_integrity.sql` — additive integrity
+   hardening over the 006 substrate: composite candidate keys and foreign
+   keys that make cross-user reuse lineage, mismatched provider-source
+   mappings, cross-user product/regimen/intake rows, and uncorrelated intake
+   snapshots/meal links impossible at the database boundary.
 
 For a new database:
 
@@ -230,9 +235,10 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/003_meal_captures.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/004_calculation_bundles.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/005_calculation_corrections.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/006_meal_reuse_and_supplements.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/007_ownership_lineage_integrity.sql
 ```
 
-`004`, `005`, and `006` are additive and rerunnable. `002` is forward-only and
+`004`, `005`, `006`, and `007` are additive and rerunnable. `002` is forward-only and
 irreversible because of the legacy reset. The disposable integration database
 is selected explicitly; do not treat skipped PostgreSQL tests as a pass:
 

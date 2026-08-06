@@ -43,6 +43,8 @@ const migrations = [
     "db/migrations/003_meal_captures.sql",
     "db/migrations/004_calculation_bundles.sql",
     "db/migrations/005_calculation_corrections.sql",
+    "db/migrations/006_meal_reuse_and_supplements.sql",
+    "db/migrations/007_ownership_lineage_integrity.sql",
 ];
 
 // Reset and materialize the complete schema before every child process. This
