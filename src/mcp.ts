@@ -31,6 +31,7 @@ import type {
     PreparedMealDraft,
 } from "./meal-capture-types.js";
 import { computeConsensus } from "./meal-consensus.js";
+import { searchReuseCandidates } from "./meal-reuse.js";
 import { NUTRIENT_FIELDS, type NutrientField } from "./meal-types.js";
 import {
     validateCalculationBundle,
@@ -126,6 +127,90 @@ const CALCULATION_BUNDLE_INPUT_SCHEMA = z.object({
         .nullable()
         .optional(),
 });
+
+// Slice 3: typed structuredContent for search_meals — read-only lexical
+// reusable-meal discovery (90-day frequency-ranked variations, each with up
+// to two most-recent source candidates carrying persisted provenance truth).
+// Mirrors ReuseDiscovery in src/meal-reuse.ts; every nullable field is an
+// explicit required anyOf[type, null] so absence is never fabricated.
+export const SEARCH_MEALS_OUTPUT_SCHEMA = z
+    .object({
+        match_mode: z.literal("lexical"),
+        window_days: z.literal(90),
+        generated_at: z.string(),
+        total_matches_90d: z.number().int().min(0),
+        variations: z.array(
+            z
+                .object({
+                    variation_key: z.string(),
+                    label: z.string(),
+                    occurrences_90d: z.number().int().min(0),
+                    last_consumed_at: z.string(),
+                    candidates: z.array(
+                        z
+                            .object({
+                                source_event_id: z.string().uuid(),
+                                source_version: z.number().int().min(1),
+                                current_version: z.number().int().min(1),
+                                is_current: z.boolean(),
+                                consumed_at: z.string(),
+                                meal_type: z.string().nullable(),
+                                components: z.array(
+                                    z
+                                        .object({
+                                            ordinal: z.number().int().min(0),
+                                            raw_item_text: z.string(),
+                                            normalized_name: z
+                                                .string()
+                                                .nullable(),
+                                            quantity: z.number().nullable(),
+                                            portion_value: z
+                                                .number()
+                                                .nullable(),
+                                            portion_unit: z.string().nullable(),
+                                            notes: z.string().nullable(),
+                                        })
+                                        .strict(),
+                                ),
+                                canonical: z
+                                    .object({
+                                        status: z.enum([
+                                            "pending",
+                                            "ready",
+                                            "low_confidence",
+                                        ]),
+                                        consensus_status: z.enum([
+                                            "two_agree_one_outlier",
+                                            "all_agree",
+                                            "no_consensus",
+                                            "insufficient_data",
+                                        ]),
+                                        calories: z.number().nullable(),
+                                        protein_g: z.number().nullable(),
+                                        carbs_g: z.number().nullable(),
+                                        fat_g: z.number().nullable(),
+                                        fiber_g: z.number().nullable(),
+                                        sugar_g: z.number().nullable(),
+                                        alcohol_g: z.number().nullable(),
+                                    })
+                                    .strict()
+                                    .nullable(),
+                                provenance_status: z.enum([
+                                    "ready",
+                                    "pending",
+                                    "unavailable",
+                                    "missing",
+                                ]),
+                                compatibility: z.boolean(),
+                                bundle_fingerprint: z.string().nullable(),
+                            })
+                            .strict(),
+                    ),
+                })
+                .strict(),
+        ),
+    })
+    .strict();
 
 export function recomputeCanonical(bundle: CalculationBundle) {
     const errors = validateCalculationBundle(bundle);
@@ -2467,7 +2552,7 @@ export function registerTools(
         {
             title: "Search Past Meals",
             description:
-                "Search the user's past logged meals by keyword (case-insensitive match on description and notes), newest first, grouped into recurring variations with counts, last-logged date, and typical macros. Use this BEFORE logging a meal from a photo: past variations reveal ingredients that aren't visible in the picture (raisins vs banana, milk vs water, added honey or oil) — turn each difference between variations into a question for the user rather than picking one silently, and ask those questions one at a time across several turns instead of batching them. Also use it for requests like 'log my usual breakfast': search, interview the user to pin down the variation and the amount, then log_meal. For a restaurant meal, search the restaurant name as well as the dish — a past visit to the same venue is stronger evidence than anything on the web. Pass short food keywords, not full sentences, and include the food name in every language the user may have logged in — always add an English alternative alongside the conversation language, e.g. [\"вівсянка\", \"oatmeal\"].",
+                "Search the user's past logged meals by keyword (case-insensitive match on description and notes), newest first, grouped into recurring variations with counts, last-logged date, and typical macros. Use this BEFORE logging a meal from a photo: past variations reveal ingredients that aren't visible in the picture (raisins vs banana, milk vs water, added honey or oil) — turn each difference between variations into a question for the user rather than picking one silently, and ask those questions one at a time across several turns instead of batching them. Also use it for requests like 'log my usual breakfast': search, interview the user to pin down the variation and the amount, then log_meal. For a restaurant meal, search the restaurant name as well as the dish — a past visit to the same venue is stronger evidence than anything on the web. Pass short food keywords, not full sentences, and include the food name in every language the user may have logged in — always add an English alternative alongside the conversation language, e.g. [\"вівсянка\", \"oatmeal\"]. Also returns machine-readable structuredContent: recurring variations ranked by frequency over exactly the last 90 days (recency tie-break), each with up to two most-recent source candidates (event/version, ordered components, consumed time, canonical nutrition status, provenance status) for explaining a possible reuse of a past confirmed calculation. Matching is lexical keyword matching (case-insensitive ILIKE over stored components/notes) — not a similarity or AI-based search. This tool never writes; creating a new event from a past one is a separate explicit mutation.",
             annotations: {
                 readOnlyHint: true,
                 destructiveHint: false,
@@ -2497,6 +2582,7 @@ export function registerTools(
                     .optional()
                     .describe("Max matching entries to analyze (default 50)."),
             },
+            outputSchema: SEARCH_MEALS_OUTPUT_SCHEMA.shape,
         },
         async ({ queries, days, limit }) => {
             return withAnalytics(
@@ -2514,6 +2600,16 @@ export function registerTools(
                         limit: limit ?? 50,
                         sinceIso,
                     });
+                    // Slice 3: structured reuse discovery is computed
+                    // independently of the text-path days/limit inputs on a
+                    // fixed, uncapped 90-day window (read-only).
+                    const reuse = SEARCH_MEALS_OUTPUT_SCHEMA.parse(
+                        await searchReuseCandidates(
+                            mealEventsPool,
+                            userId,
+                            queries,
+                        ),
+                    );
                     if (meals.length === 0) {
                         const label = queries.map((q) => `"${q}"`).join(" / ");
                         return {
@@ -2523,6 +2619,7 @@ export function registerTools(
                                     text: `No past meals matching ${label} in the last ${windowDays} days. If logging from a photo, proceed with your own portion assumptions — but with no past variations to draw on, you have MORE to ask about, not less. Interview the user one question per message about the amount eaten and about ingredients the photo cannot show (oil, butter, sugar, sauce, what a drink was made with) before calling log_meal.`,
                                 },
                             ],
+                            structuredContent: reuse,
                         };
                     }
                     return {
@@ -2536,6 +2633,7 @@ export function registerTools(
                                 ),
                             },
                         ],
+                        structuredContent: reuse,
                     };
                 },
                 { userId },
