@@ -1616,7 +1616,11 @@ describeDb(
                                 amount: 120,
                                 unit: "kcal",
                             },
-                            { nutrient_key: "protein_g", amount: 21, unit: "g" },
+                            {
+                                nutrient_key: "protein_g",
+                                amount: 21,
+                                unit: "g",
+                            },
                             {
                                 nutrient_key: "vitamin_d",
                                 amount: 5,
@@ -1653,14 +1657,11 @@ describeDb(
                         }),
                     );
 
-                    const res = await call(
-                        "get_supplement_nutrition_summary",
-                        {
-                            from_date: "2026-08-03",
-                            to_date: "2026-08-03",
-                            timezone: "UTC",
-                        },
-                    );
+                    const res = await call("get_supplement_nutrition_summary", {
+                        from_date: "2026-08-03",
+                        to_date: "2026-08-03",
+                        timezone: "UTC",
+                    });
                     expect(res.isError).toBeFalsy();
                     // structuredContent matching the advertised outputSchema
                     // is enforced by the SDK on every call; a mismatch would
@@ -1949,14 +1950,11 @@ describeDb(
                 );
             });
             await withSupplementTools(pool, "u2", async ({ call }) => {
-                const summary = await call(
-                    "get_supplement_nutrition_summary",
-                    {
-                        from_date: "2026-08-03",
-                        to_date: "2026-08-03",
-                        timezone: "UTC",
-                    },
-                );
+                const summary = await call("get_supplement_nutrition_summary", {
+                    from_date: "2026-08-03",
+                    to_date: "2026-08-03",
+                    timezone: "UTC",
+                });
                 expect(summary.isError).toBeFalsy();
                 const s = summary.structuredContent as {
                     food: { meal_event_count: number; nutrients: unknown[] };

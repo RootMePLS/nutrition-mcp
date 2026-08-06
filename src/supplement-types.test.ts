@@ -687,7 +687,6 @@ describe("occurrence state reduction (latest fact wins by append order)", () => 
     });
 });
 
-
 // ---------------------------------------------------------------------------
 // Slice 7: effective-done fact selection — the single correction-aware state
 // authority for the reporting reads. Pure; no database.
@@ -725,7 +724,10 @@ describe("effective-done fact selection (Slice 7)", () => {
         });
 
         test("done then cleared on the same regimen-local date excludes the done fact", () => {
-            const done = contributionFact({ id: "f1", regimen_id: "regimen-1" });
+            const done = contributionFact({
+                id: "f1",
+                regimen_id: "regimen-1",
+            });
             const cleared = contributionFact({
                 id: "f2",
                 regimen_id: "regimen-1",
@@ -738,7 +740,10 @@ describe("effective-done fact selection (Slice 7)", () => {
         });
 
         test("done, cleared, done: the latest done wins and the first done is excluded", () => {
-            const first = contributionFact({ id: "f1", regimen_id: "regimen-1" });
+            const first = contributionFact({
+                id: "f1",
+                regimen_id: "regimen-1",
+            });
             const cleared = contributionFact({
                 id: "f2",
                 regimen_id: "regimen-1",
@@ -775,7 +780,10 @@ describe("effective-done fact selection (Slice 7)", () => {
                 regimen_id: "regimen-1",
                 occurred_at: "2026-08-02T08:00:00.000Z",
             });
-            const result = selectEffectiveDoneFacts([day1, day1Clear, day2], LA);
+            const result = selectEffectiveDoneFacts(
+                [day1, day1Clear, day2],
+                LA,
+            );
             expect(result.included.map((x) => x.id)).toEqual(["f3"]);
             expect(result.excludedByCorrection).toBe(1);
         });
@@ -875,7 +883,10 @@ describe("effective-done fact selection (Slice 7)", () => {
         });
 
         test("missed never contributes, but a missed correction still supersedes a done fact", () => {
-            const missed = contributionFact({ id: "f1", state_action: "missed" });
+            const missed = contributionFact({
+                id: "f1",
+                state_action: "missed",
+            });
             const onlyMissed = selectEffectiveDoneFacts([missed], new Map());
             expect(onlyMissed.included).toEqual([]);
             expect(onlyMissed.excludedByCorrection).toBe(0);
@@ -945,7 +956,6 @@ describe("effective-done fact selection (Slice 7)", () => {
         });
     });
 });
-
 
 // ---------------------------------------------------------------------------
 // Slice 7: combined-total grouping — exact (nutrient_key, unit) merge with
@@ -1019,7 +1029,8 @@ describe("combined nutrient contributions (Slice 7)", () => {
         const combined = combineNutrientContributions(
             [
                 { nutrient_key: "fat_g", unit: "g", amount: 0 },
-                { nutrient_key: "sugar_g", unit: "g", amount: 12 }],
+                { nutrient_key: "sugar_g", unit: "g", amount: 12 },
+            ],
             [
                 { nutrient_key: "fat_g", unit: "g", amount: 3 },
                 { nutrient_key: "sugar_g", unit: "g", amount: 0 },
@@ -1068,10 +1079,8 @@ describe("combined nutrient contributions (Slice 7)", () => {
                 { nutrient_key: "alcohol_g", unit: "g", amount: 4 },
             ],
         );
-        expect(combined.map((row) => `${row.nutrient_key}/${row.unit}`)).toEqual([
-            "alcohol_g/g",
-            "calories/kcal",
-            "sugar_g/g",
-        ]);
+        expect(
+            combined.map((row) => `${row.nutrient_key}/${row.unit}`),
+        ).toEqual(["alcohol_g/g", "calories/kcal", "sugar_g/g"]);
     });
 });

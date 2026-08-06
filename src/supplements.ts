@@ -2410,7 +2410,6 @@ export async function getSupplementRegimenStatus(
     };
 }
 
-
 // ===========================================================================
 // NUTRITION SUMMARY READ (Slice 7, read-only)
 // ===========================================================================
@@ -2735,7 +2734,6 @@ export async function getSupplementNutritionSummary(
     };
 }
 
-
 // ===========================================================================
 // SUPPLEMENT DATA FLAGS READ (Slice 7, read-only)
 // ===========================================================================
@@ -2890,9 +2888,7 @@ export async function getSupplementDataFlags(
                         display_name: contribution.display_name,
                         recorded_amount: contribution.amount,
                     }))
-                    .sort((a, b) =>
-                        a.product_id.localeCompare(b.product_id),
-                    );
+                    .sort((a, b) => a.product_id.localeCompare(b.product_id));
                 duplicateExposures.push({
                     nutrient_key,
                     unit,
@@ -3037,9 +3033,7 @@ export async function getSupplementDataFlags(
                     factsByLocalDate.get(occurrence.local_date) ?? [],
                 );
                 if (state !== "undefined") continue;
-                const [y, mo, d] = occurrence.local_date
-                    .split("-")
-                    .map(Number);
+                const [y, mo, d] = occurrence.local_date.split("-").map(Number);
                 const [hh, mi] = occurrence.local_time.split(":").map(Number);
                 const due = zonedWallClockToUtc(
                     y!,

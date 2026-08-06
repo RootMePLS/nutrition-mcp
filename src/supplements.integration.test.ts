@@ -3391,7 +3391,6 @@ describeDb(
     },
 );
 
-
 // ---------------------------------------------------------------------------
 // Slice 7: supplement nutrition summary — bounded date-range/timezone read
 // separating food, supplement/sports, and compatible combined totals. Real
@@ -3479,11 +3478,7 @@ describeDb("supplement nutrition summary (requires DATABASE_URL_TEST)", () => {
                 },
             ],
         });
-        await commitBundle(
-            pool,
-            userId,
-            readyBundle(eventId, 1, nutrients),
-        );
+        await commitBundle(pool, userId, readyBundle(eventId, 1, nutrients));
         return eventId;
     }
 
@@ -3768,7 +3763,9 @@ describeDb("supplement nutrition summary (requires DATABASE_URL_TEST)", () => {
     test("buckets both sides by the explicit request timezone", async () => {
         const productId = await seedProduct({
             category: "supplement",
-            nutrients: [{ nutrient_key: "calories", amount: 100, unit: "kcal" }],
+            nutrients: [
+                { nutrient_key: "calories", amount: 100, unit: "kcal" },
+            ],
         });
         // A: 23:30 Los Angeles on 08-01 (06:30 UTC on 08-02).
         await log(productId, {
@@ -3839,7 +3836,9 @@ describeDb("supplement nutrition summary (requires DATABASE_URL_TEST)", () => {
     test("applies the effective-done rule with disclosed counts", async () => {
         const productId = await seedProduct({
             category: "supplement",
-            nutrients: [{ nutrient_key: "calories", amount: 120, unit: "kcal" }],
+            nutrients: [
+                { nutrient_key: "calories", amount: 120, unit: "kcal" },
+            ],
         });
         const regimen = await createSupplementRegimen(
             pool,
@@ -3927,9 +3926,7 @@ describeDb("supplement nutrition summary (requires DATABASE_URL_TEST)", () => {
                 category: "supplement",
                 display_name: "U2 Creatine",
                 aliases: ["u2-creatine"],
-                nutrients: [
-                    { nutrient_key: "creatine", amount: 5, unit: "g" },
-                ],
+                nutrients: [{ nutrient_key: "creatine", amount: 5, unit: "g" }],
                 idempotency_key: `product:${crypto.randomUUID()}`,
             }),
         );
@@ -3950,11 +3947,7 @@ describeDb("supplement nutrition summary (requires DATABASE_URL_TEST)", () => {
             await getSupplementNutritionSummary(pool, "u1", UTC_WINDOW),
         ).toEqual(before);
         // u2 sees only u2.
-        const u2 = await getSupplementNutritionSummary(
-            pool,
-            "u2",
-            UTC_WINDOW,
-        );
+        const u2 = await getSupplementNutritionSummary(pool, "u2", UTC_WINDOW);
         expect(u2.food.nutrients).toEqual([
             {
                 nutrient_key: "calories",
@@ -4038,9 +4031,7 @@ describeDb("supplement nutrition summary (requires DATABASE_URL_TEST)", () => {
         ).rejects.toBeInstanceOf(SupplementValidationError);
         expect(await domainCounts()).toEqual(before);
     });
-
 });
-
 
 // ---------------------------------------------------------------------------
 // Slice 7: supplement data flags — transparent, data-only flags over a
@@ -4496,12 +4487,7 @@ describeDb("supplement data flags (requires DATABASE_URL_TEST)", () => {
         // done 07-29 and the future 08-02/08-03 are absent.
         expect(
             flags.unmarked_active_regimen_occurrences.map((o) => o.local_date),
-        ).toEqual([
-            "2026-07-28",
-            "2026-07-30",
-            "2026-07-31",
-            "2026-08-01",
-        ]);
+        ).toEqual(["2026-07-28", "2026-07-30", "2026-07-31", "2026-08-01"]);
         const first = flags.unmarked_active_regimen_occurrences[0]!;
         expect(first.regimen_id).toBe(regimenId);
         expect(first.product_id).toBe(productId);
@@ -4545,9 +4531,7 @@ describeDb("supplement data flags (requires DATABASE_URL_TEST)", () => {
             ...window,
             as_of: "2026-08-01T11:59:00.000Z",
         });
-        expect(
-            oneMinuteEarly.unmarked_active_regimen_occurrences,
-        ).toEqual([]);
+        expect(oneMinuteEarly.unmarked_active_regimen_occurrences).toEqual([]);
     });
 
     test("weekly schedules and regimen timezone are respected", async () => {
@@ -4574,18 +4558,16 @@ describeDb("supplement data flags (requires DATABASE_URL_TEST)", () => {
             as_of: "2026-08-06T00:00:00.000Z",
         });
         // Mon/Thu in Pacific/Auckland: 07-27 (Mon), 07-30 (Thu), 08-03 (Mon).
-        expect(flags.unmarked_active_regimen_occurrences).toEqual([
-            "2026-07-27",
-            "2026-07-30",
-            "2026-08-03",
-        ].map((local_date) => ({
-            regimen_id: regimenId,
-            product_id: productId,
-            product_display_name: "Impact Whey Protein",
-            local_date,
-            local_time: "09:00",
-            timezone: "Pacific/Auckland",
-        })));
+        expect(flags.unmarked_active_regimen_occurrences).toEqual(
+            ["2026-07-27", "2026-07-30", "2026-08-03"].map((local_date) => ({
+                regimen_id: regimenId,
+                product_id: productId,
+                product_display_name: "Impact Whey Protein",
+                local_date,
+                local_time: "09:00",
+                timezone: "Pacific/Auckland",
+            })),
+        );
     });
 
     test("inactive regimens and ended windows derive nothing", async () => {

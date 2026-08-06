@@ -508,7 +508,6 @@ export function selectEffectiveDoneFacts(
     };
 }
 
-
 // ---------------------------------------------------------------------------
 // COMBINED NUTRIENT TOTALS (Slice 7 reporting reads)
 // ---------------------------------------------------------------------------
