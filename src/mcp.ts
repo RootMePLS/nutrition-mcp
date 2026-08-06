@@ -46,6 +46,29 @@ import {
     type CalculationBundleOutput,
 } from "./calculation-bundles.js";
 
+// MCP-advertised shape for append_meal_capture_message's `message` param.
+// Mirrors validateCaptureMessage (src/meal-capture-types.ts): the server
+// rejects payloads missing these fields with 400 "invalid meal capture", so
+// the tool schema must declare them. Loose object: platform-specific extra
+// keys are retained in raw_metadata flows and must not be rejected here.
+const CAPTURE_MESSAGE_INPUT_SCHEMA = z.looseObject({
+    external_message_id: z
+        .string()
+        .min(1)
+        .describe(
+            "Stable per-message identifier from the source platform; replays with the same id are deduplicated.",
+        ),
+    kind: z.enum(["text", "answer", "photo", "audio"]),
+    received_at: z
+        .string()
+        .refine((s) => !Number.isNaN(Date.parse(s)), {
+            message: "received_at must be a parseable timestamp",
+        })
+        .describe("ISO 8601 timestamp when the message was received."),
+    text: z.string().nullable().optional(),
+    raw_metadata: z.record(z.string(), z.unknown()).optional(),
+});
+
 const CALCULATION_BUNDLE_INPUT_SCHEMA = z.object({
     event_id: z.string().uuid(),
     version: z.number().int().min(1),
@@ -5067,7 +5090,7 @@ export function registerTools(
                 "Retain raw agent-supplied message metadata for a durable capture. No media download or interpretation occurs here.",
             inputSchema: {
                 capture_id: z.string().min(1),
-                message: z.record(z.string(), z.unknown()),
+                message: CAPTURE_MESSAGE_INPUT_SCHEMA,
             },
             outputSchema: CAPTURE_STATE_OUTPUT_SCHEMA,
         },

@@ -2162,3 +2162,47 @@ describe("capture lifecycle output contracts (S6)", () => {
         ).toThrow();
     });
 });
+
+// Schema-advertisement contract for the capture/bundle tools: clients must be
+// able to see required fields + enums from tools/list alone (no 400 guessing).
+describe("MCP tool input schema advertisement", () => {
+    async function listToolSchemas() {
+        const server = new McpServer(
+            { name: "schema-test", version: "0.0.0" },
+            { capabilities: { tools: {}, resources: {} } },
+        );
+        registerTools(server, "u1", true, null);
+        const [ct, st] = InMemoryTransport.createLinkedPair();
+        const client = new Client({ name: "c", version: "0.0.0" });
+        await Promise.all([server.connect(st), client.connect(ct)]);
+        const { tools } = await client.listTools();
+        await client.close();
+        await server.close();
+        return new Map(tools.map((t) => [t.name, t.inputSchema]));
+    }
+
+    test("append_meal_capture_message requires message identity fields", async () => {
+        const schemas = await listToolSchemas();
+        const schema = schemas.get("append_meal_capture_message") as any;
+        expect(schema.required).toEqual(
+            expect.arrayContaining(["capture_id", "message"]),
+        );
+        const message = schema.properties.message;
+        expect(message.required).toEqual(
+            expect.arrayContaining([
+                "external_message_id",
+                "kind",
+                "received_at",
+            ]),
+        );
+        expect(message.properties.kind.enum).toEqual([
+            "text",
+            "answer",
+            "photo",
+            "audio",
+        ]);
+        expect(message.properties.received_at.description).toMatch(/ISO/i);
+        // Extra keys (e.g. platform metadata) must stay allowed.
+        expect(message.additionalProperties).not.toBe(false);
+    });
+});
