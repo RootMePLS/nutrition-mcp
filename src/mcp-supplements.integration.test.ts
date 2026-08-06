@@ -13,6 +13,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Pool } from "pg";
 import { flushAnalytics } from "./analytics.js";
 import { registerTools } from "./mcp.js";
+import {
+    commitBundle,
+    readyBundle,
+    seedMealEvent,
+} from "./meal-reuse.fixtures.js";
 
 // ---------------------------------------------------------------------------
 // Slice 2 public MCP vertical path: the five supplement product tools through
@@ -60,6 +65,8 @@ const SUPPLEMENT_TOOL_NAMES = [
     "log_supplement_intake",
     "get_supplement_intakes",
     "get_supplement_regimen_status",
+    "get_supplement_nutrition_summary",
+    "get_supplement_data_flags",
 ];
 
 // Truthful read/write annotations: reads never write, mutations do.
@@ -71,6 +78,8 @@ const SUPPLEMENT_READ_ONLY_TOOLS = new Set([
     "resolve_supplement_product",
     "get_supplement_intakes",
     "get_supplement_regimen_status",
+    "get_supplement_nutrition_summary",
+    "get_supplement_data_flags",
 ]);
 
 async function resetSchema(pool: Pool): Promise<void> {
@@ -213,7 +222,7 @@ describeDb("supplement product MCP tools (requires DATABASE_URL_TEST)", () => {
         await flushAnalytics();
     });
 
-    test("listTools advertises the twelve supplement tools with schemas and truthful annotations", async () => {
+    test("listTools advertises the fourteen supplement tools with schemas and truthful annotations", async () => {
         await withSupplementTools(pool, "u1", async ({ listTools }) => {
             const tools = await listTools();
             const byName = new Map(tools.map((t) => [t.name, t]));
@@ -666,6 +675,11 @@ const SLICE_FIVE_TOOL_NAMES = [
     "log_supplement_intake",
     "get_supplement_intakes",
     "get_supplement_regimen_status",
+];
+
+const SLICE_SEVEN_TOOL_NAMES = [
+    "get_supplement_nutrition_summary",
+    "get_supplement_data_flags",
 ];
 
 const DOMAIN_TABLES = [
@@ -1204,6 +1218,17 @@ describeDb(
                             from_date: "2026-08-01",
                             to_date: "2026-08-07",
                         },
+                        get_supplement_nutrition_summary: {
+                            from_date: "2026-08-01",
+                            to_date: "2026-08-07",
+                            timezone: "UTC",
+                        },
+                        get_supplement_data_flags: {
+                            from_date: "2026-08-01",
+                            to_date: "2026-08-07",
+                            timezone: "UTC",
+                            as_of: "2026-08-06T00:00:00.000Z",
+                        },
                     };
 
                     // Advertised JSON schema must forbid unknown top-level keys.
@@ -1244,6 +1269,8 @@ describeDb(
                         "resolve_supplement_product",
                         "get_supplement_intakes",
                         "get_supplement_regimen_status",
+                        "get_supplement_nutrition_summary",
+                        "get_supplement_data_flags",
                     ]) {
                         const ok = await call(name, STRICT_TOOLS[name]);
                         expect(
@@ -1291,11 +1318,32 @@ describeDb(
                     from_date: "2026-08-01",
                     to_date: "2026-08-05",
                 });
+                await call("get_supplement_nutrition_summary", {
+                    from_date: "2026-08-01",
+                    to_date: "2026-08-05",
+                    timezone: "UTC",
+                });
+                await call("get_supplement_data_flags", {
+                    from_date: "2026-08-01",
+                    to_date: "2026-08-05",
+                    timezone: "UTC",
+                    as_of: "2026-08-06T00:00:00.000Z",
+                });
                 // Error paths of read tools write nothing either.
                 await call("get_supplement_regimen_status", {
                     regimen_id: crypto.randomUUID(),
                     from_date: "2026-08-01",
                     to_date: "2026-08-05",
+                });
+                await call("get_supplement_nutrition_summary", {
+                    from_date: "2026-13-40",
+                    to_date: "2026-08-05",
+                    timezone: "UTC",
+                });
+                await call("get_supplement_data_flags", {
+                    from_date: "2026-08-01",
+                    to_date: "2026-08-05",
+                    timezone: "Not/AZone",
                 });
                 expect(await domainCounts()).toEqual(before);
             });
@@ -1530,6 +1578,415 @@ describeDb(
                         /dosage advice|should take|recommended dose|consult|interaction/i,
                     );
                 }
+            });
+        });
+
+        test("the slice-7 reporting/flag descriptions carry data facts only, never advice", async () => {
+            await withSupplementTools(pool, "u1", async ({ listTools }) => {
+                const tools = await listTools();
+                const byName = new Map(tools.map((t) => [t.name, t]));
+                const disclaimer =
+                    "Data facts only — this server does not provide medical, dosage, or interaction advice.";
+                for (const name of SLICE_SEVEN_TOOL_NAMES) {
+                    const description = byName.get(name)!.description ?? "";
+                    // The mandated disclaimer suffix is the only place the
+                    // advice vocabulary may appear — as a negation.
+                    expect(
+                        description.endsWith(disclaimer),
+                        `${name} ends with the data-facts disclaimer`,
+                    ).toBe(true);
+                    const body = description.slice(0, -disclaimer.length);
+                    expect(body).not.toMatch(
+                        /should take|overdose|unsafe|interaction|recommend|deficiency|toxicity|dosage advice|recommended dose|consult/i,
+                    );
+                }
+            });
+        });
+
+        test("get_supplement_nutrition_summary returns separated structured totals through the public transport", async () => {
+            await withSupplementTools(
+                pool,
+                "u1",
+                async ({ call, listTools }) => {
+                    const productId = await createProduct(call, {
+                        category: "supplement",
+                        nutrients: [
+                            {
+                                nutrient_key: "calories",
+                                amount: 120,
+                                unit: "kcal",
+                            },
+                            { nutrient_key: "protein_g", amount: 21, unit: "g" },
+                            {
+                                nutrient_key: "vitamin_d",
+                                amount: 5,
+                                unit: "µg",
+                            },
+                        ],
+                    });
+                    const logged = await call(
+                        "log_supplement_intake",
+                        validIntakeArgs({
+                            product_id: productId,
+                            occurred_at: "2026-08-03T13:00:00.000Z",
+                        }),
+                    );
+                    expect(logged.isError).toBeFalsy();
+                    // One food event through the real write path fixtures.
+                    const eventId = await seedMealEvent(pool, "u1", {
+                        idempotencyKey: "sum-transport-food",
+                        consumedAt: "2026-08-03T12:00:00.000Z",
+                        items: [
+                            {
+                                ordinal: 0,
+                                raw_item_text: "oats",
+                                normalized_name: "oats",
+                            },
+                        ],
+                    });
+                    await commitBundle(
+                        pool,
+                        "u1",
+                        readyBundle(eventId, 1, {
+                            calories: 500,
+                            protein_g: 30,
+                        }),
+                    );
+
+                    const res = await call(
+                        "get_supplement_nutrition_summary",
+                        {
+                            from_date: "2026-08-03",
+                            to_date: "2026-08-03",
+                            timezone: "UTC",
+                        },
+                    );
+                    expect(res.isError).toBeFalsy();
+                    // structuredContent matching the advertised outputSchema
+                    // is enforced by the SDK on every call; a mismatch would
+                    // surface as an error result above.
+                    const tools = await listTools();
+                    const advertised = tools.find(
+                        (t) => t.name === "get_supplement_nutrition_summary",
+                    )!;
+                    expect(advertised.outputSchema).toBeDefined();
+                    expect(res.structuredContent).toEqual({
+                        from_date: "2026-08-03",
+                        to_date: "2026-08-03",
+                        timezone: "UTC",
+                        food: {
+                            meal_event_count: 1,
+                            linked_snack_event_count_excluded: 0,
+                            nutrients: [
+                                {
+                                    nutrient_key: "calories",
+                                    unit: "kcal",
+                                    amount: 500,
+                                    events_with_value: 1,
+                                },
+                                {
+                                    nutrient_key: "protein_g",
+                                    unit: "g",
+                                    amount: 30,
+                                    events_with_value: 1,
+                                },
+                            ],
+                        },
+                        supplements: {
+                            intake_fact_count_in_range: 1,
+                            effective_done_intake_count: 1,
+                            excluded_by_correction_count: 0,
+                            nutrients: [
+                                {
+                                    nutrient_key: "calories",
+                                    unit: "kcal",
+                                    amount: 240,
+                                    intakes_with_value: 1,
+                                },
+                                {
+                                    nutrient_key: "protein_g",
+                                    unit: "g",
+                                    amount: 42,
+                                    intakes_with_value: 1,
+                                },
+                                {
+                                    nutrient_key: "vitamin_d",
+                                    unit: "µg",
+                                    amount: 10,
+                                    intakes_with_value: 1,
+                                },
+                            ],
+                        },
+                        combined: [
+                            {
+                                nutrient_key: "calories",
+                                unit: "kcal",
+                                food_amount: 500,
+                                supplement_amount: 240,
+                                total: 740,
+                            },
+                            {
+                                nutrient_key: "protein_g",
+                                unit: "g",
+                                food_amount: 30,
+                                supplement_amount: 42,
+                                total: 72,
+                            },
+                            {
+                                nutrient_key: "vitamin_d",
+                                unit: "µg",
+                                food_amount: null,
+                                supplement_amount: 10,
+                                total: 10,
+                            },
+                        ],
+                    });
+                    // Text content mirrors the structured payload.
+                    expect(res.content[0]!.text).toContain(
+                        '"linked_snack_event_count_excluded": 0',
+                    );
+                },
+            );
+        });
+
+        test("get_supplement_data_flags returns deterministic data-only flags through the public transport", async () => {
+            await withSupplementTools(pool, "u1", async ({ call }) => {
+                const productA = await createProduct(call, {
+                    category: "supplement",
+                    display_name: "Vitamin D Tabs",
+                    aliases: ["vitd-a"],
+                    nutrients: [
+                        { nutrient_key: "vitamin_d", amount: 10, unit: "µg" },
+                    ],
+                    label_limits: [
+                        {
+                            nutrient_key: "vitamin_d",
+                            unit: "µg",
+                            maximum_amount: 15,
+                        },
+                    ],
+                });
+                const productB = await createProduct(call, {
+                    category: "supplement",
+                    display_name: "Vitamin D Drops",
+                    aliases: ["vitd-b"],
+                    nutrients: [
+                        { nutrient_key: "vitamin_d", amount: 20, unit: "µg" },
+                    ],
+                });
+                const regimenId = await createRegimen(call, productA, {
+                    schedule: {
+                        timezone: "UTC",
+                        frequency: "daily",
+                        local_time: "08:00",
+                    },
+                    starts_on: "2026-08-01",
+                    ends_on: null,
+                });
+                // Ad-hoc done intakes: they never claim regimen occurrences.
+                await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({
+                        product_id: productA,
+                        servings: 1,
+                        occurred_at: "2026-08-03T08:00:00.000Z",
+                    }),
+                );
+                await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({
+                        product_id: productB,
+                        servings: 1,
+                        occurred_at: "2026-08-03T09:00:00.000Z",
+                    }),
+                );
+
+                const args = {
+                    from_date: "2026-08-01",
+                    to_date: "2026-08-07",
+                    timezone: "UTC",
+                    as_of: "2026-08-03T12:00:00.000Z",
+                };
+                const first = await call("get_supplement_data_flags", args);
+                expect(first.isError).toBeFalsy();
+                const flags = first.structuredContent as {
+                    duplicate_nutrient_exposures: unknown[];
+                    label_limit_comparisons: unknown[];
+                    unmarked_active_regimen_occurrences: unknown[];
+                };
+                const expectedProducts = [
+                    {
+                        product_id: productA,
+                        display_name: "Vitamin D Tabs",
+                        recorded_amount: 10,
+                    },
+                    {
+                        product_id: productB,
+                        display_name: "Vitamin D Drops",
+                        recorded_amount: 20,
+                    },
+                ].sort((a, b) => a.product_id.localeCompare(b.product_id));
+                expect(flags.duplicate_nutrient_exposures).toEqual([
+                    {
+                        nutrient_key: "vitamin_d",
+                        unit: "µg",
+                        product_count: 2,
+                        products: expectedProducts,
+                    },
+                ]);
+                expect(flags.label_limit_comparisons).toEqual([
+                    {
+                        product_id: productA,
+                        product_version: 1,
+                        display_name: "Vitamin D Tabs",
+                        nutrient_key: "vitamin_d",
+                        unit: "µg",
+                        local_date: "2026-08-03",
+                        recorded_total: 10,
+                        label_limit_maximum: 15,
+                        exceeds_label_limit: false,
+                    },
+                ]);
+                expect(flags.unmarked_active_regimen_occurrences).toEqual(
+                    ["2026-08-01", "2026-08-02", "2026-08-03"].map(
+                        (local_date) => ({
+                            regimen_id: regimenId,
+                            product_id: productA,
+                            product_display_name: "Vitamin D Tabs",
+                            local_date,
+                            local_time: "08:00",
+                            timezone: "UTC",
+                        }),
+                    ),
+                );
+
+                // Determinism: fixed as_of + fixed seeds → byte-identical
+                // structured output across consecutive calls.
+                const second = await call("get_supplement_data_flags", args);
+                expect(JSON.stringify(second.structuredContent)).toBe(
+                    JSON.stringify(first.structuredContent),
+                );
+
+                // No advice vocabulary anywhere in the structured keys.
+                const keys: string[] = [];
+                const collect = (value: unknown): void => {
+                    if (Array.isArray(value)) {
+                        value.forEach(collect);
+                    } else if (value !== null && typeof value === "object") {
+                        for (const [k, v] of Object.entries(value)) {
+                            keys.push(k);
+                            collect(v);
+                        }
+                    }
+                };
+                collect(first.structuredContent);
+                for (const key of keys) {
+                    expect(key).not.toMatch(
+                        /should take|overdose|unsafe|interaction|recommend|deficiency|toxicity|dose|advice/i,
+                    );
+                }
+            });
+        });
+
+        test("both new tools reject malformed payloads with stable validation errors and zero writes", async () => {
+            await withSupplementTools(pool, "u1", async ({ call }) => {
+                const before = await domainCounts();
+                const window = {
+                    from_date: "2026-08-01",
+                    to_date: "2026-08-05",
+                    timezone: "UTC",
+                };
+                for (const name of SLICE_SEVEN_TOOL_NAMES) {
+                    // Strict schema: unknown top-level keys are rejected.
+                    const unknownKey = await call(name, {
+                        ...window,
+                        bogus_top_level_key: "rejected",
+                    });
+                    expect(unknownKey.isError, `${name} unknown key`).toBe(
+                        true,
+                    );
+                    expect(unknownKey.content[0]?.text ?? "").toContain(
+                        "bogus_top_level_key",
+                    );
+
+                    for (const bad of [
+                        { ...window, from_date: "2026-13-40" },
+                        {
+                            ...window,
+                            from_date: "2026-08-05",
+                            to_date: "2026-08-01",
+                        },
+                        { ...window, timezone: "Not/AZone" },
+                    ]) {
+                        const res = await call(name, bad);
+                        expect(res.isError, `${name} rejects`).toBe(true);
+                        expect(res.content[0]!.text).toContain(
+                            "supplement_validation_failed",
+                        );
+                    }
+                }
+                // Bad as_of is rejected by schema refinement on the flags tool.
+                const badAsOf = await call("get_supplement_data_flags", {
+                    ...window,
+                    as_of: "not-a-timestamp",
+                });
+                expect(badAsOf.isError).toBe(true);
+                expect(await domainCounts()).toEqual(before);
+            });
+        });
+
+        test("both new tools are user-scoped through the transport", async () => {
+            await withSupplementTools(pool, "u1", async ({ call }) => {
+                const productId = await createProduct(call, {
+                    category: "supplement",
+                });
+                await call(
+                    "log_supplement_intake",
+                    validIntakeArgs({
+                        product_id: productId,
+                        occurred_at: "2026-08-03T13:00:00.000Z",
+                    }),
+                );
+            });
+            await withSupplementTools(pool, "u2", async ({ call }) => {
+                const summary = await call(
+                    "get_supplement_nutrition_summary",
+                    {
+                        from_date: "2026-08-03",
+                        to_date: "2026-08-03",
+                        timezone: "UTC",
+                    },
+                );
+                expect(summary.isError).toBeFalsy();
+                const s = summary.structuredContent as {
+                    food: { meal_event_count: number; nutrients: unknown[] };
+                    supplements: {
+                        intake_fact_count_in_range: number;
+                        nutrients: unknown[];
+                    };
+                    combined: unknown[];
+                };
+                expect(s.food.meal_event_count).toBe(0);
+                expect(s.food.nutrients).toEqual([]);
+                expect(s.supplements.intake_fact_count_in_range).toBe(0);
+                expect(s.supplements.nutrients).toEqual([]);
+                expect(s.combined).toEqual([]);
+
+                const flags = await call("get_supplement_data_flags", {
+                    from_date: "2026-08-01",
+                    to_date: "2026-08-07",
+                    timezone: "UTC",
+                    as_of: "2026-08-06T00:00:00.000Z",
+                });
+                expect(flags.isError).toBeFalsy();
+                const f = flags.structuredContent as {
+                    duplicate_nutrient_exposures: unknown[];
+                    label_limit_comparisons: unknown[];
+                    unmarked_active_regimen_occurrences: unknown[];
+                };
+                expect(f.duplicate_nutrient_exposures).toEqual([]);
+                expect(f.label_limit_comparisons).toEqual([]);
+                expect(f.unmarked_active_regimen_occurrences).toEqual([]);
             });
         });
     },

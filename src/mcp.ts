@@ -471,6 +471,8 @@ import {
     logSupplementIntake,
     getSupplementIntakes,
     getSupplementRegimenStatus,
+    getSupplementNutritionSummary,
+    getSupplementDataFlags,
     SupplementAliasAmbiguousError,
     SupplementIdempotencyConflictError,
     SupplementProductInactiveError,
@@ -2079,6 +2081,90 @@ const REGIMEN_STATUS_OUTPUT_SCHEMA = {
             local_time: z.string(),
             visible_state: z.enum(["undefined", "done", "missed"]),
             latest_intake_id: z.string().nullable(),
+        }),
+    ),
+};
+
+const SUPPLEMENT_NUTRITION_SUMMARY_OUTPUT_SCHEMA = {
+    from_date: z.string(),
+    to_date: z.string(),
+    timezone: z.string(),
+    food: z.object({
+        meal_event_count: z.number().int(),
+        linked_snack_event_count_excluded: z.number().int(),
+        nutrients: z.array(
+            z.object({
+                nutrient_key: z.string(),
+                unit: z.string(),
+                amount: z.number(),
+                events_with_value: z.number().int(),
+            }),
+        ),
+    }),
+    supplements: z.object({
+        intake_fact_count_in_range: z.number().int(),
+        effective_done_intake_count: z.number().int(),
+        excluded_by_correction_count: z.number().int(),
+        nutrients: z.array(
+            z.object({
+                nutrient_key: z.string(),
+                unit: z.string(),
+                amount: z.number(),
+                intakes_with_value: z.number().int(),
+            }),
+        ),
+    }),
+    combined: z.array(
+        z.object({
+            nutrient_key: z.string(),
+            unit: z.string(),
+            food_amount: z.number().nullable(),
+            supplement_amount: z.number().nullable(),
+            total: z.number(),
+        }),
+    ),
+};
+
+const SUPPLEMENT_DATA_FLAGS_OUTPUT_SCHEMA = {
+    from_date: z.string(),
+    to_date: z.string(),
+    timezone: z.string(),
+    as_of: z.string(),
+    duplicate_nutrient_exposures: z.array(
+        z.object({
+            nutrient_key: z.string(),
+            unit: z.string(),
+            product_count: z.number().int(),
+            products: z.array(
+                z.object({
+                    product_id: z.string(),
+                    display_name: z.string(),
+                    recorded_amount: z.number(),
+                }),
+            ),
+        }),
+    ),
+    label_limit_comparisons: z.array(
+        z.object({
+            product_id: z.string(),
+            product_version: z.number().int(),
+            display_name: z.string(),
+            nutrient_key: z.string(),
+            unit: z.string(),
+            local_date: z.string(),
+            recorded_total: z.number(),
+            label_limit_maximum: z.number(),
+            exceeds_label_limit: z.boolean(),
+        }),
+    ),
+    unmarked_active_regimen_occurrences: z.array(
+        z.object({
+            regimen_id: z.string(),
+            product_id: z.string(),
+            product_display_name: z.string(),
+            local_date: z.string(),
+            local_time: z.string(),
+            timezone: z.string(),
         }),
     ),
 };
@@ -6833,6 +6919,126 @@ export function registerTools(
                     const structuredContent = {
                         regimen: result.regimen,
                         occurrences: result.occurrences,
+                    };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "get_supplement_nutrition_summary",
+        {
+            title: "Get Supplement Nutrition Summary",
+            description:
+                "Read-only bounded date-range summary in an explicit IANA timezone: food contribution (from meal events, excluding supplement-linked snack events so nothing is counted twice), supplement/sports-nutrition contribution (from immutable done-intake label snapshots, correction-aware), and a combined total — grouped strictly by exact nutrient key + unit with no unit conversion. Absent values stay absent; an explicit stored zero stays 0. Derives and delivers nothing on a schedule. Data facts only — this server does not provide medical, dosage, or interaction advice.",
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: z.strictObject({
+                from_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+                to_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+                timezone: z.string().min(1),
+            }),
+            outputSchema: SUPPLEMENT_NUTRITION_SUMMARY_OUTPUT_SCHEMA,
+        },
+        async ({ from_date, to_date, timezone }) => {
+            return withAnalytics(
+                "get_supplement_nutrition_summary",
+                async () => {
+                    const result = await getSupplementNutritionSummary(
+                        mealEventsPool,
+                        userId,
+                        { from_date, to_date, timezone },
+                    ).catch(supplementToolError);
+                    const structuredContent: Record<string, unknown> = {
+                        from_date: result.from_date,
+                        to_date: result.to_date,
+                        timezone: result.timezone,
+                        food: result.food,
+                        supplements: result.supplements,
+                        combined: result.combined,
+                    };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "get_supplement_data_flags",
+        {
+            title: "Get Supplement Data Flags",
+            description:
+                "Read-only transparent data flags over a bounded date window: (1) the same nutrient key + unit recorded from two or more distinct products, (2) recorded daily totals compared against a product label's own explicitly stored maximum where one exists, (3) derived past-due occurrences of active regimens with no recorded state. These are recorded-data facts with no interpretation. Data facts only — this server does not provide medical, dosage, or interaction advice.",
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: z.strictObject({
+                from_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+                to_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+                timezone: z.string().min(1),
+                as_of: z
+                    .string()
+                    .refine(isStrictIsoTimestamp, {
+                        message:
+                            "as_of must be a strict ISO-8601 timestamp with an explicit offset",
+                    })
+                    .optional(),
+            }),
+            outputSchema: SUPPLEMENT_DATA_FLAGS_OUTPUT_SCHEMA,
+        },
+        async ({ from_date, to_date, timezone, as_of }) => {
+            return withAnalytics(
+                "get_supplement_data_flags",
+                async () => {
+                    const result = await getSupplementDataFlags(
+                        mealEventsPool,
+                        userId,
+                        { from_date, to_date, timezone, as_of },
+                    ).catch(supplementToolError);
+                    const structuredContent: Record<string, unknown> = {
+                        from_date: result.from_date,
+                        to_date: result.to_date,
+                        timezone: result.timezone,
+                        as_of: result.as_of,
+                        duplicate_nutrient_exposures:
+                            result.duplicate_nutrient_exposures,
+                        label_limit_comparisons: result.label_limit_comparisons,
+                        unmarked_active_regimen_occurrences:
+                            result.unmarked_active_regimen_occurrences,
                     };
                     return {
                         content: [
