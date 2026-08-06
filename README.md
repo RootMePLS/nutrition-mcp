@@ -130,6 +130,9 @@ Create the database named by `DATABASE_URL`, then apply the migrations in order:
 ```bash
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/001_initial_schema.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/002_food_tracking.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/003_meal_captures.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/004_calculation_bundles.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/005_calculation_corrections.sql
 ```
 
 Migration `002_food_tracking.sql` is **destructive**: it deletes the legacy
@@ -164,7 +167,7 @@ Use `start_meal_capture`, `append_meal_capture_message`, `answer_meal_capture`, 
 
 All nine capture lifecycle tools — `start_meal_capture`, `append_meal_capture_message`, `answer_meal_capture`, `save_meal_capture_draft`, `get_meal_capture`, `cancel_meal_capture`, `expire_meal_capture`, `confirm_meal_capture`, and `attach_meal_capture_media` — declare an `outputSchema` and return machine-checkable `structuredContent` alongside their human-readable text, so clients can consume typed capture state without parsing the text payload.
 
-Migration order for a new or test database is `001_initial_schema.sql`, `002_food_tracking.sql`, then `003_meal_captures.sql`.
+Migration order for a new or test database is `001_initial_schema.sql`, `002_food_tracking.sql`, `003_meal_captures.sql`, `004_calculation_bundles.sql`, then `005_calculation_corrections.sql`.
 
 ```bash
 bun install
