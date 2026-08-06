@@ -11,6 +11,8 @@ import {
     deriveSupplementRegimenIdempotencyFingerprint,
     deriveRegimenOccurrences,
     reduceOccurrenceState,
+    selectEffectiveDoneFacts,
+    type IntakeFactForContribution,
     type RegimenSchedule,
     type SupplementRegimenIdempotencyIdentity,
     type IntakeFactForProjection,
@@ -681,5 +683,264 @@ describe("occurrence state reduction (latest fact wins by append order)", () => 
         for (const state of states) {
             expect(["undefined", "done", "missed"]).toContain(state);
         }
+    });
+});
+
+
+// ---------------------------------------------------------------------------
+// Slice 7: effective-done fact selection — the single correction-aware state
+// authority for the reporting reads. Pure; no database.
+// ---------------------------------------------------------------------------
+
+describe("effective-done fact selection (Slice 7)", () => {
+    let seq = 0;
+    function contributionFact(
+        overrides: Partial<IntakeFactForContribution> & { id: string },
+    ): IntakeFactForContribution {
+        // Monotonic created_at default so append order is explicit unless a
+        // test overrides it.
+        const created = new Date(
+            Date.parse("2026-08-01T00:00:00Z") + seq++ * 60000,
+        ).toISOString();
+        return {
+            regimen_id: null,
+            product_id: "product-1",
+            occurred_at: "2026-08-01T08:00:00.000Z",
+            state_action: "done",
+            supersedes_intake_id: null,
+            ...overrides,
+            created_at: overrides.created_at ?? created,
+        };
+    }
+
+    const LA = new Map([["regimen-1", "America/Los_Angeles"]]);
+
+    describe("regimen-bound facts: occurrence identity is (regimen, regimen-timezone local date), latest fact wins", () => {
+        test("a single done fact is included", () => {
+            const f = contributionFact({ id: "f1", regimen_id: "regimen-1" });
+            const result = selectEffectiveDoneFacts([f], LA);
+            expect(result.included.map((x) => x.id)).toEqual(["f1"]);
+            expect(result.excludedByCorrection).toBe(0);
+        });
+
+        test("done then cleared on the same regimen-local date excludes the done fact", () => {
+            const done = contributionFact({ id: "f1", regimen_id: "regimen-1" });
+            const cleared = contributionFact({
+                id: "f2",
+                regimen_id: "regimen-1",
+                state_action: "cleared",
+                supersedes_intake_id: "f1",
+            });
+            const result = selectEffectiveDoneFacts([done, cleared], LA);
+            expect(result.included).toEqual([]);
+            expect(result.excludedByCorrection).toBe(1);
+        });
+
+        test("done, cleared, done: the latest done wins and the first done is excluded", () => {
+            const first = contributionFact({ id: "f1", regimen_id: "regimen-1" });
+            const cleared = contributionFact({
+                id: "f2",
+                regimen_id: "regimen-1",
+                state_action: "cleared",
+                supersedes_intake_id: "f1",
+            });
+            const relogged = contributionFact({
+                id: "f3",
+                regimen_id: "regimen-1",
+            });
+            const result = selectEffectiveDoneFacts(
+                [first, cleared, relogged],
+                LA,
+            );
+            expect(result.included.map((x) => x.id)).toEqual(["f3"]);
+            expect(result.excludedByCorrection).toBe(1);
+        });
+
+        test("facts on different regimen-local dates are independent occurrences", () => {
+            const day1 = contributionFact({
+                id: "f1",
+                regimen_id: "regimen-1",
+                occurred_at: "2026-08-01T08:00:00.000Z",
+            });
+            const day1Clear = contributionFact({
+                id: "f2",
+                regimen_id: "regimen-1",
+                occurred_at: "2026-08-01T09:00:00.000Z",
+                state_action: "cleared",
+                supersedes_intake_id: "f1",
+            });
+            const day2 = contributionFact({
+                id: "f3",
+                regimen_id: "regimen-1",
+                occurred_at: "2026-08-02T08:00:00.000Z",
+            });
+            const result = selectEffectiveDoneFacts([day1, day1Clear, day2], LA);
+            expect(result.included.map((x) => x.id)).toEqual(["f3"]);
+            expect(result.excludedByCorrection).toBe(1);
+        });
+
+        test("bucketing uses the regimen timezone, not UTC", () => {
+            // Both instants share 2026-08-01 in America/Los_Angeles even
+            // though the correction's UTC wall clock reads 2026-08-02.
+            const done = contributionFact({
+                id: "f1",
+                regimen_id: "regimen-1",
+                occurred_at: "2026-08-01T23:30:00-07:00",
+                created_at: "2026-08-02T06:30:00Z",
+            });
+            const cleared = contributionFact({
+                id: "f2",
+                regimen_id: "regimen-1",
+                occurred_at: "2026-08-02T06:29:00Z",
+                state_action: "cleared",
+                supersedes_intake_id: "f1",
+                created_at: "2026-08-02T06:31:00Z",
+            });
+            const result = selectEffectiveDoneFacts([done, cleared], LA);
+            expect(result.included).toEqual([]);
+            expect(result.excludedByCorrection).toBe(1);
+        });
+
+        test("a regimen-bound fact without a timezone entry fails closed", () => {
+            const f = contributionFact({ id: "f1", regimen_id: "unknown" });
+            expect(() => selectEffectiveDoneFacts([f], LA)).toThrow();
+        });
+    });
+
+    describe("ad-hoc facts: a done fact stands unless a later fact names it via supersedes_intake_id", () => {
+        test("a single done fact is included", () => {
+            const f = contributionFact({ id: "f1" });
+            const result = selectEffectiveDoneFacts([f], new Map());
+            expect(result.included.map((x) => x.id)).toEqual(["f1"]);
+            expect(result.excludedByCorrection).toBe(0);
+        });
+
+        test("done superseded by cleared is excluded", () => {
+            const done = contributionFact({ id: "f1" });
+            const cleared = contributionFact({
+                id: "f2",
+                state_action: "cleared",
+                supersedes_intake_id: "f1",
+            });
+            const result = selectEffectiveDoneFacts([done, cleared], new Map());
+            expect(result.included).toEqual([]);
+            expect(result.excludedByCorrection).toBe(1);
+        });
+
+        test("done superseded by done: only the superseding fact contributes", () => {
+            const original = contributionFact({ id: "f1" });
+            const correction = contributionFact({
+                id: "f2",
+                supersedes_intake_id: "f1",
+            });
+            const result = selectEffectiveDoneFacts(
+                [original, correction],
+                new Map(),
+            );
+            expect(result.included.map((x) => x.id)).toEqual(["f2"]);
+            expect(result.excludedByCorrection).toBe(1);
+        });
+
+        test("a correction chain of three leaves only the newest fact", () => {
+            const first = contributionFact({ id: "f1" });
+            const second = contributionFact({
+                id: "f2",
+                supersedes_intake_id: "f1",
+            });
+            const third = contributionFact({
+                id: "f3",
+                supersedes_intake_id: "f2",
+            });
+            const result = selectEffectiveDoneFacts(
+                [first, second, third],
+                new Map(),
+            );
+            expect(result.included.map((x) => x.id)).toEqual(["f3"]);
+            expect(result.excludedByCorrection).toBe(2);
+        });
+
+        test("an ad-hoc cleared fact without a supersedes link removes nothing", () => {
+            const done = contributionFact({ id: "f1" });
+            const orphanClear = contributionFact({
+                id: "f2",
+                state_action: "cleared",
+            });
+            const result = selectEffectiveDoneFacts(
+                [done, orphanClear],
+                new Map(),
+            );
+            expect(result.included.map((x) => x.id)).toEqual(["f1"]);
+            expect(result.excludedByCorrection).toBe(0);
+        });
+
+        test("missed never contributes, but a missed correction still supersedes a done fact", () => {
+            const missed = contributionFact({ id: "f1", state_action: "missed" });
+            const onlyMissed = selectEffectiveDoneFacts([missed], new Map());
+            expect(onlyMissed.included).toEqual([]);
+            expect(onlyMissed.excludedByCorrection).toBe(0);
+
+            const done = contributionFact({ id: "f2" });
+            const missedCorrection = contributionFact({
+                id: "f3",
+                state_action: "missed",
+                supersedes_intake_id: "f2",
+            });
+            const result = selectEffectiveDoneFacts(
+                [done, missedCorrection],
+                new Map(),
+            );
+            expect(result.included).toEqual([]);
+            expect(result.excludedByCorrection).toBe(1);
+        });
+    });
+
+    describe("append-order authority: (created_at, id), identical timestamps tie-break by id", () => {
+        test("ad-hoc: the fact with the greater id is the later fact on identical created_at", () => {
+            const at = "2026-08-03T10:00:00Z";
+            const done = contributionFact({
+                id: "aaa",
+                created_at: at,
+            });
+            const cleared = contributionFact({
+                id: "bbb",
+                state_action: "cleared",
+                supersedes_intake_id: "aaa",
+                created_at: at,
+            });
+            const result = selectEffectiveDoneFacts([done, cleared], new Map());
+            expect(result.included).toEqual([]);
+            expect(result.excludedByCorrection).toBe(1);
+        });
+
+        test("regimen-bound: identical created_at tie-breaks by id for latest-wins", () => {
+            const at = "2026-08-03T10:00:00Z";
+            const first = contributionFact({
+                id: "aaa",
+                regimen_id: "regimen-1",
+                created_at: at,
+            });
+            const latest = contributionFact({
+                id: "bbb",
+                regimen_id: "regimen-1",
+                created_at: at,
+            });
+            const result = selectEffectiveDoneFacts([first, latest], LA);
+            expect(result.included.map((x) => x.id)).toEqual(["bbb"]);
+            expect(result.excludedByCorrection).toBe(1);
+        });
+
+        test("a supersede link from an EARLIER fact does not retract a later done fact", () => {
+            // Append order is the only authority: a link written before the
+            // fact it names cannot retract it.
+            const cleared = contributionFact({
+                id: "f1",
+                state_action: "cleared",
+                supersedes_intake_id: "f2",
+            });
+            const done = contributionFact({ id: "f2" });
+            const result = selectEffectiveDoneFacts([cleared, done], new Map());
+            expect(result.included.map((x) => x.id)).toEqual(["f2"]);
+            expect(result.excludedByCorrection).toBe(0);
+        });
     });
 });

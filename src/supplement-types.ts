@@ -7,7 +7,7 @@
 // and idempotency identity. No database, no network, no MCP registration.
 
 import { NUTRIENT_FIELDS, sha256Hex } from "./meal-types.js";
-import { dowInTz, shiftLocalDate, zonedHourUtc } from "./tz.js";
+import { dateInTz, dowInTz, shiftLocalDate, zonedHourUtc } from "./tz.js";
 
 // ---------------------------------------------------------------------------
 // PRODUCT CATEGORY
@@ -398,4 +398,112 @@ export function reduceOccurrenceState(
         return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     });
     return projectIntakeVisibleState(ordered[ordered.length - 1]!.state_action);
+}
+
+// ---------------------------------------------------------------------------
+// EFFECTIVE-DONE FACT SELECTION (Slice 7 reporting reads)
+// ---------------------------------------------------------------------------
+// Which intake facts still count as recorded contribution after corrections.
+// Facts are append-only and cleared projects undefined, so summing every raw
+// done fact would over-report corrected intakes. The rule is deterministic
+// and has exactly two branches, both ordered by append order (created_at, id)
+// — the same state authority as reduceOccurrenceState; supersedes links stay
+// audit metadata except in the ad-hoc branch, where they are the only way a
+// later fact can retract an unlinked done fact.
+//
+// - Regimen-bound facts claim the occurrence identified by (regimen_id,
+//   local date of occurred_at in the REGIMEN's timezone) — the exact identity
+//   regimen status uses. The latest fact in each group wins; its snapshots
+//   contribute only when its action is done.
+// - Ad-hoc facts (regimen_id NULL) claim no occurrence. A done fact
+//   contributes unless a LATER fact (by append order) names it via
+//   supersedes_intake_id; a superseding done fact is evaluated by the same
+//   rule, so correction chains collapse to their newest fact. An ad-hoc
+//   cleared/missed fact without a supersedes link retracts nothing — that is
+//   disclosed, not smoothed over.
+//
+// excludedByCorrection counts the done facts that lost to a later fact, so
+// raw done facts = included + excludedByCorrection always reconciles.
+
+export interface IntakeFactForContribution extends IntakeFactForProjection {
+    product_id: string;
+    supersedes_intake_id: string | null;
+}
+
+export interface EffectiveDoneSelection {
+    /** Done facts that still contribute, ordered by (created_at, id). */
+    included: IntakeFactForContribution[];
+    /** Done facts excluded because a later fact corrected them. */
+    excludedByCorrection: number;
+}
+
+function compareAppendOrder(
+    a: IntakeFactForProjection,
+    b: IntakeFactForProjection,
+): number {
+    const byTime = epochMs(a.created_at) - epochMs(b.created_at);
+    if (byTime !== 0) return byTime;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+export function selectEffectiveDoneFacts(
+    facts: IntakeFactForContribution[],
+    regimenTimezones: Map<string, string>,
+): EffectiveDoneSelection {
+    const ordered = [...facts].sort(compareAppendOrder);
+    const included = new Map<string, IntakeFactForContribution>();
+
+    // Regimen-bound branch: group by occurrence identity, latest fact wins.
+    const regimenBound = ordered.filter((f) => f.regimen_id !== null);
+    const groups = new Map<string, IntakeFactForContribution[]>();
+    for (const fact of regimenBound) {
+        const timezone = regimenTimezones.get(fact.regimen_id!);
+        if (timezone === undefined) {
+            // Fail closed: occurrence identity is unknowable without the
+            // regimen's schedule timezone.
+            throw new Error(
+                `missing regimen timezone for regimen ${fact.regimen_id}`,
+            );
+        }
+        const identity = `${fact.regimen_id}${dateInTz(fact.occurred_at, timezone)}`;
+        const group = groups.get(identity) ?? [];
+        group.push(fact);
+        groups.set(identity, group);
+    }
+    for (const group of groups.values()) {
+        const latest = group[group.length - 1]!;
+        if (latest.state_action === "done") {
+            included.set(latest.id, latest);
+        }
+    }
+
+    // Ad-hoc branch: a done fact stands unless a LATER fact names it. Append
+    // order is the only authority, so a link written before the fact it
+    // names retracts nothing.
+    const positionById = new Map<string, number>();
+    ordered.forEach((f, index) => positionById.set(f.id, index));
+    const supersededIds = new Set<string>();
+    const adHoc = ordered.filter((f) => f.regimen_id === null);
+    for (const fact of adHoc) {
+        if (fact.supersedes_intake_id !== null) {
+            const targetPosition = positionById.get(fact.supersedes_intake_id);
+            if (
+                targetPosition !== undefined &&
+                targetPosition < positionById.get(fact.id)!
+            ) {
+                supersededIds.add(fact.supersedes_intake_id);
+            }
+        }
+    }
+    for (const fact of adHoc) {
+        if (fact.state_action === "done" && !supersededIds.has(fact.id)) {
+            included.set(fact.id, fact);
+        }
+    }
+
+    const doneCount = ordered.filter((f) => f.state_action === "done").length;
+    return {
+        included: ordered.filter((f) => included.has(f.id)),
+        excludedByCorrection: doneCount - included.size,
+    };
 }
