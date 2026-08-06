@@ -245,6 +245,10 @@ describeDb("legacy meal MCP tools use the event projection", () => {
         "log and all eight legacy reads work through the real MCP transport",
         async () => {
             await callTools(async (call) => {
+                // Computed, not hardcoded: get_meals_today resolves "today" in
+                // UTC for a profile-less user, so a fixed calendar date makes
+                // this test fail the day after it was written.
+                const day = new Date().toISOString().slice(0, 10);
                 const logged = await call("log_meal", {
                     description: "oatmeal with banana",
                     meal_type: "breakfast",
@@ -254,13 +258,13 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                     fat_g: 10,
                     fiber_g: 8,
                     sugar_g: 12,
-                    logged_at: "2026-08-05T08:00:00.000Z",
+                    logged_at: `${day}T08:00:00.000Z`,
                     idempotency_key: "legacy-mcp-read-regression",
                 });
                 expect(logged.isError).not.toBe(true);
 
                 const byDate = await call("get_meals_by_date", {
-                    date: "2026-08-05",
+                    date: day,
                 });
                 expect(byDate.isError).not.toBe(true);
                 expect(byDate.content[0]!.text).toContain("oatmeal");
@@ -271,15 +275,15 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                 expect(today.content[0]!.text).toContain("oatmeal");
 
                 const range = await call("get_meals_by_date_range", {
-                    start_date: "2026-08-05",
-                    end_date: "2026-08-05",
+                    start_date: day,
+                    end_date: day,
                 });
                 expect(range.isError).not.toBe(true);
-                expect(range.content[0]!.text).toContain("2026-08-05");
+                expect(range.content[0]!.text).toContain(day);
 
                 const summary = await call("get_nutrition_summary", {
-                    start_date: "2026-08-05",
-                    end_date: "2026-08-05",
+                    start_date: day,
+                    end_date: day,
                 });
                 expect(summary.isError).not.toBe(true);
                 expect(summary.structuredContent?.logged_days).toBe(1);
@@ -288,14 +292,14 @@ describeDb("legacy meal MCP tools use the event projection", () => {
                 ).toBe(1);
 
                 const progress = await call("get_goal_progress", {
-                    date: "2026-08-05",
+                    date: day,
                 });
                 expect(progress.isError).not.toBe(true);
                 expect(progress.structuredContent?.meal_count).toBe(1);
 
                 const trends = await call("get_trends", {
                     days: 7,
-                    end_date: "2026-08-05",
+                    end_date: day,
                 });
                 expect(trends.isError).not.toBe(true);
                 expect(
@@ -304,7 +308,7 @@ describeDb("legacy meal MCP tools use the event projection", () => {
 
                 const patterns = await call("get_meal_patterns", {
                     days: 7,
-                    end_date: "2026-08-05",
+                    end_date: day,
                 });
                 expect(patterns.isError).not.toBe(true);
                 expect(patterns.content[0]!.text).toContain("Patterns —");
