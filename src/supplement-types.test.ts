@@ -12,6 +12,7 @@ import {
     deriveRegimenOccurrences,
     reduceOccurrenceState,
     selectEffectiveDoneFacts,
+    combineNutrientContributions,
     type IntakeFactForContribution,
     type RegimenSchedule,
     type SupplementRegimenIdempotencyIdentity,
@@ -942,5 +943,135 @@ describe("effective-done fact selection (Slice 7)", () => {
             expect(result.included.map((x) => x.id)).toEqual(["f2"]);
             expect(result.excludedByCorrection).toBe(0);
         });
+    });
+});
+
+
+// ---------------------------------------------------------------------------
+// Slice 7: combined-total grouping — exact (nutrient_key, unit) merge with
+// null-preserving totals. Pure; no database.
+// ---------------------------------------------------------------------------
+
+describe("combined nutrient contributions (Slice 7)", () => {
+    test("the same key + unit on both sides merges into one row with the summed total", () => {
+        const combined = combineNutrientContributions(
+            [{ nutrient_key: "calories", unit: "kcal", amount: 500 }],
+            [{ nutrient_key: "calories", unit: "kcal", amount: 240 }],
+        );
+        expect(combined).toEqual([
+            {
+                nutrient_key: "calories",
+                unit: "kcal",
+                food_amount: 500,
+                supplement_amount: 240,
+                total: 740,
+            },
+        ]);
+    });
+
+    test("the same key in different units never combines and never converts", () => {
+        const combined = combineNutrientContributions(
+            [{ nutrient_key: "vitamin_c", unit: "mg", amount: 80 }],
+            [{ nutrient_key: "vitamin_c", unit: "g", amount: 0.5 }],
+        );
+        expect(combined).toEqual([
+            {
+                nutrient_key: "vitamin_c",
+                unit: "g",
+                food_amount: null,
+                supplement_amount: 0.5,
+                total: 0.5,
+            },
+            {
+                nutrient_key: "vitamin_c",
+                unit: "mg",
+                food_amount: 80,
+                supplement_amount: null,
+                total: 80,
+            },
+        ]);
+    });
+
+    test("food-only and supplement-only keys keep the absent side null", () => {
+        const combined = combineNutrientContributions(
+            [{ nutrient_key: "protein_g", unit: "g", amount: 30 }],
+            [{ nutrient_key: "vitamin_d", unit: "µg", amount: 10 }],
+        );
+        expect(combined).toEqual([
+            {
+                nutrient_key: "protein_g",
+                unit: "g",
+                food_amount: 30,
+                supplement_amount: null,
+                total: 30,
+            },
+            {
+                nutrient_key: "vitamin_d",
+                unit: "µg",
+                food_amount: null,
+                supplement_amount: 10,
+                total: 10,
+            },
+        ]);
+    });
+
+    test("an explicit zero on either side propagates as 0 and is never dropped", () => {
+        const combined = combineNutrientContributions(
+            [
+                { nutrient_key: "fat_g", unit: "g", amount: 0 },
+                { nutrient_key: "sugar_g", unit: "g", amount: 12 }],
+            [
+                { nutrient_key: "fat_g", unit: "g", amount: 3 },
+                { nutrient_key: "sugar_g", unit: "g", amount: 0 },
+            ],
+        );
+        expect(combined).toEqual([
+            {
+                nutrient_key: "fat_g",
+                unit: "g",
+                food_amount: 0,
+                supplement_amount: 3,
+                total: 3,
+            },
+            {
+                nutrient_key: "sugar_g",
+                unit: "g",
+                food_amount: 12,
+                supplement_amount: 0,
+                total: 12,
+            },
+        ]);
+        // Both-zero stays a real 0 row, not an absence.
+        const bothZero = combineNutrientContributions(
+            [{ nutrient_key: "fiber_g", unit: "g", amount: 0 }],
+            [{ nutrient_key: "fiber_g", unit: "g", amount: 0 }],
+        );
+        expect(bothZero).toEqual([
+            {
+                nutrient_key: "fiber_g",
+                unit: "g",
+                food_amount: 0,
+                supplement_amount: 0,
+                total: 0,
+            },
+        ]);
+    });
+
+    test("output is sorted by (nutrient_key, unit) for determinism", () => {
+        const combined = combineNutrientContributions(
+            [
+                { nutrient_key: "sugar_g", unit: "g", amount: 1 },
+                { nutrient_key: "calories", unit: "kcal", amount: 2 },
+            ],
+            [
+                { nutrient_key: "calories", unit: "kcal", amount: 3 },
+                { nutrient_key: "alcohol_g", unit: "g", amount: 4 },
+            ],
+        );
+        expect(combined.map((row) => `${row.nutrient_key}/${row.unit}`)).toEqual([
+            "alcohol_g/g",
+            "calories/kcal",
+            "sugar_g/g",
+        ]);
     });
 });

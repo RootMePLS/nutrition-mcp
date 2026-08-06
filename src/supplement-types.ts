@@ -507,3 +507,80 @@ export function selectEffectiveDoneFacts(
         excludedByCorrection: doneCount - included.size,
     };
 }
+
+
+// ---------------------------------------------------------------------------
+// COMBINED NUTRIENT TOTALS (Slice 7 reporting reads)
+// ---------------------------------------------------------------------------
+// Unit compatibility is exact (nutrient_key, unit) identity: no conversion,
+// ever — µg vs mg vs IU stay separate rows. A side with no data for an
+// identity is null in the combined row, never 0; an explicitly recorded zero
+// is real data and propagates as 0.
+
+export interface NutrientContributionAmount {
+    nutrient_key: string;
+    unit: string;
+    amount: number;
+}
+
+export interface CombinedNutrientContribution {
+    nutrient_key: string;
+    unit: string;
+    food_amount: number | null;
+    supplement_amount: number | null;
+    total: number;
+}
+
+export function combineNutrientContributions(
+    food: NutrientContributionAmount[],
+    supplement: NutrientContributionAmount[],
+): CombinedNutrientContribution[] {
+    interface Bucket {
+        food: number | null;
+        supplement: number | null;
+    }
+    // Collision-free tuple identity: key maps to the set of units seen, so
+    // distinct pairs like ("ab","c") and ("a","bc") can never alias.
+    const buckets = new Map<string, Map<string, Bucket>>();
+    const bucketFor = (key: string, unit: string): Bucket => {
+        let byUnit = buckets.get(key);
+        if (byUnit === undefined) {
+            byUnit = new Map();
+            buckets.set(key, byUnit);
+        }
+        let bucket = byUnit.get(unit);
+        if (bucket === undefined) {
+            bucket = { food: null, supplement: null };
+            byUnit.set(unit, bucket);
+        }
+        return bucket;
+    };
+    for (const entry of food) {
+        const bucket = bucketFor(entry.nutrient_key, entry.unit);
+        bucket.food = (bucket.food ?? 0) + entry.amount;
+    }
+    for (const entry of supplement) {
+        const bucket = bucketFor(entry.nutrient_key, entry.unit);
+        bucket.supplement = (bucket.supplement ?? 0) + entry.amount;
+    }
+
+    const combined: CombinedNutrientContribution[] = [];
+    for (const [nutrient_key, byUnit] of buckets) {
+        for (const [unit, bucket] of byUnit) {
+            combined.push({
+                nutrient_key,
+                unit,
+                food_amount: bucket.food,
+                supplement_amount: bucket.supplement,
+                total: (bucket.food ?? 0) + (bucket.supplement ?? 0),
+            });
+        }
+    }
+    combined.sort((a, b) => {
+        if (a.nutrient_key !== b.nutrient_key) {
+            return a.nutrient_key < b.nutrient_key ? -1 : 1;
+        }
+        return a.unit < b.unit ? -1 : a.unit > b.unit ? 1 : 0;
+    });
+    return combined;
+}
