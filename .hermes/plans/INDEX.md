@@ -54,6 +54,7 @@ plus the audit family itself and the gap-remediation campaign family.
 | `2026-08-05-plan-vs-code-gap-audit.md` (audit family)                                                                    | 1     | superseded  | `2026-08-05-gap-remediation-campaign-plan.md`                                                                   | Governing audit for the campaign; campaign plan `.hermes/plans/2026-08-05-gap-remediation-campaign-plan.md`; archived by S0 commit `249698a`                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `2026-08-05-gap-remediation-campaign-{brief,plan}` (campaign family)                                                     | 2     | implemented | —                                                                                                               | Campaign plan slices S0-S11 complete; S0-S10 accepted (per-slice table below); campaign evidence range `36dd86f`..S11 closeout commit `b538d1e` (`docs: close out gap-remediation campaign`); this row owns only the campaign brief and plan — the closeout and all S11 review artifacts belong to the S11 subfamily row; final acceptance follows the effective-acceptance rule above: the literal Status cell is the dated-snapshot baseline, and effective status is `accepted` exactly when the latest committed `2026-08-05-gap-remediation-s11-terra-review*.md` has verdict PASS, otherwise `implemented` |
 | `2026-08-06-mcp-fixes-*` (brief, plan)                                                                                   | 2     | implemented | —                                                                                                               | Schema hardening (`append_meal_capture_message`, `confirm_meal_capture`, fingerprint docs) plus the commit-after-`update_meal` duplicate-key fix, implemented test-first per the plan; baseline typecheck fix `6127486`; task commits `a7567dc`, `fdcd3e3`, `ed33676`, `1d89ab7`, `09a6220`, `6126255`; the plan also records the MCP 2.0 migration assessment                                                                                                                                                                                                                                                   |
+| `2026-08-06-nutrition-reuse-supplements-{brief,plan}` + committed Release-1 slice artifacts | 5 + every committed `2026-08-06-slice-8-release1-terra-review*.md` (0 at this snapshot) | implemented | — | Release 1 (reuse + supplements) slices 1-7 implemented and accepted on `main`, evidence range `01cad23`..`d5637d4`; this row owns the governing brief/plan, the committed slice artifacts `2026-08-06-slice-1-terra-fixes.md`, `2026-08-06-slice-2-migration-008-fixes.md`, `2026-08-06-slice-2-terra-fixes.md`, and every committed slice-8 release-1 Terra review under the dynamic pattern (unsuffixed = ordinal 1, `-N` = ordinal N, highest is latest), so no future review requires another INDEX edit; the literal Status cell is the dated-snapshot baseline, and effective status flips to `accepted` exactly when the latest committed `2026-08-06-slice-8-release1-terra-review*.md` has verdict PASS, otherwise `implemented`; untracked working-session slice briefs/plans under `.hermes/plans/` are outside coverage by the `git ls-files` method |
 
 ## Gap-remediation campaign per-slice subfamilies
 
@@ -113,3 +114,21 @@ above):
 - Unmatched: 0
 - Duplicates (file in more than one family): 0
 - Excluded from coverage by design: `INDEX.md` (this file)
+
+Snapshot 2026-08-07, taken at the slice 8 closeout
+(`docs: slice 8 — index the Release 1 plan family and refresh coverage`),
+which adds the Release-1 reuse/supplements family row above covering the five
+previously unclassified tracked files:
+
+- Tracked markdown files: 101
+- Covered: 100 (27 classification entries: 15 family rows + 12 slice subfamily
+  rows)
+- Unmatched: 0
+- Duplicates (file in more than one family): 0
+- Excluded from coverage by design: `INDEX.md` (this file)
+
+Like the S11 dynamic pattern, every later committed file matching
+`.hermes/plans/2026-08-06-slice-8-release1-terra-review*.md` is owned by the
+Release-1 family row's dynamic pattern, so it increments Tracked and Covered
+together and preserves Unmatched 0 and Duplicates 0. Any other new plan file
+still requires a one-row INDEX update, as before.
