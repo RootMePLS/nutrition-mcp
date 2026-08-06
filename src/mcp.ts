@@ -5339,8 +5339,15 @@ export function registerTools(
                 openWorldHint: false,
             },
             inputSchema: {
-                capture_id: z.string().min(1),
-                confirmation: z.string().min(1),
+                capture_id: z
+                    .string()
+                    .uuid()
+                    .describe("UUID returned by start_meal_capture."),
+                confirmation: z
+                    .enum(["добавь", "add", "confirm"])
+                    .describe(
+                        "The explicit user add command, lowercase. Normalize case/whitespace before calling.",
+                    ),
                 event_idempotency_key: z.string().optional(),
             },
             outputSchema: CONFIRM_MEAL_CAPTURE_OUTPUT_SCHEMA,
@@ -5348,10 +5355,7 @@ export function registerTools(
         async (args) => {
             const result = await confirmMealCapture(
                 mealEventsPool,
-                {
-                    ...args,
-                    confirmation: args.confirmation as "добавь",
-                },
+                args,
                 userId,
             );
             const provenance = await getMealEventProvenance(

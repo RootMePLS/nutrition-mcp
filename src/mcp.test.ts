@@ -2216,4 +2216,18 @@ describe("MCP tool input schema advertisement", () => {
         expect(fingerprint.description).toMatch(/omit/i);
         expect(fingerprint.description).toMatch(/server/i);
     });
+
+    test("confirm_meal_capture constrains capture_id and confirmation", async () => {
+        const schemas = await listToolSchemas();
+        const schema = schemas.get("confirm_meal_capture") as any;
+        expect(schema.required).toEqual(
+            expect.arrayContaining(["capture_id", "confirmation"]),
+        );
+        expect(schema.properties.capture_id.format).toBe("uuid");
+        expect(schema.properties.confirmation.enum).toEqual([
+            "добавь",
+            "add",
+            "confirm",
+        ]);
+    });
 });
