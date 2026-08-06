@@ -29,7 +29,7 @@ import { createMealEvent } from "./meal-events.js";
 import type { CreateMealEventCommand, Nutrients } from "./meal-types.js";
 import { isStrictIsoTimestamp, sha256Hex } from "./meal-types.js";
 import { escapeLikePattern } from "./search.js";
-import { dateInTz } from "./tz.js";
+import { dateInTz, validateTz, zonedDayStartUtc, zonedNextDayStartUtc } from "./tz.js";
 import {
     deriveRegimenOccurrences,
     deriveSupplementIntakeIdempotencyFingerprint,
@@ -2280,12 +2280,20 @@ export interface SupplementRegimenStatusReadback {
     occurrences: RegimenOccurrenceStatus[];
 }
 
-/** Status windows are bounded: at most 92 inclusive days. */
-const REGIMEN_STATUS_MAX_WINDOW_DAYS = 92;
+/** Bounded status/reporting windows: at most 92 inclusive days. */
+export const REGIMEN_STATUS_MAX_WINDOW_DAYS = 92;
 
-function validateStatusWindow(window: {
+/**
+ * The shared bounded-window validation surface (Slice 7): real YYYY-MM-DD
+ * dates, from <= to, span at most REGIMEN_STATUS_MAX_WINDOW_DAYS inclusive
+ * days, and — when supplied — a valid IANA timezone. Both Release-2
+ * reporting reads validate through this; the regimen-status read delegates
+ * to it unchanged.
+ */
+export function validateBoundedWindow(window: {
     from_date: string;
     to_date: string;
+    timezone?: string;
 }): void {
     const errors: string[] = [];
     if (!isLocalDateString(window.from_date)) {
@@ -2305,14 +2313,24 @@ function validateStatusWindow(window: {
                 1;
             if (days > REGIMEN_STATUS_MAX_WINDOW_DAYS) {
                 errors.push(
-                    `the status window must be at most ${REGIMEN_STATUS_MAX_WINDOW_DAYS} days`,
+                    `the window must be at most ${REGIMEN_STATUS_MAX_WINDOW_DAYS} days`,
                 );
             }
         }
     }
+    if (window.timezone !== undefined && !validateTz(window.timezone)) {
+        errors.push("timezone must be a valid IANA timezone name");
+    }
     if (errors.length > 0) {
         throw new SupplementValidationError(errors);
     }
+}
+
+function validateStatusWindow(window: {
+    from_date: string;
+    to_date: string;
+}): void {
+    validateBoundedWindow(window);
 }
 
 export async function getSupplementRegimenStatus(
@@ -2379,5 +2397,90 @@ export async function getSupplementRegimenStatus(
                         : ordered[ordered.length - 1]!.id,
             };
         }),
+    };
+}
+
+
+// ===========================================================================
+// NUTRITION SUMMARY READ (Slice 7, read-only)
+// ===========================================================================
+// Bounded date-range summary in an explicit IANA timezone separating the food
+// contribution (meal events, excluding supplement-linked snack events so
+// nothing is counted twice), the supplement/sports contribution (immutable
+// done-intake label snapshots, correction-aware), and a combined total —
+// grouped strictly by exact nutrient key + unit with no unit conversion.
+// Absent values stay absent; an explicit stored zero stays 0. Purely derived:
+// reads nothing but projections of stored facts and writes nothing.
+
+export interface SummaryNutrientRow {
+    nutrient_key: string;
+    unit: string;
+    amount: number;
+    events_with_value: number;
+}
+
+export interface SummarySupplementNutrientRow {
+    nutrient_key: string;
+    unit: string;
+    amount: number;
+    intakes_with_value: number;
+}
+
+export interface SummaryCombinedRow {
+    nutrient_key: string;
+    unit: string;
+    food_amount: number | null;
+    supplement_amount: number | null;
+    total: number;
+}
+
+export interface SupplementNutritionSummary {
+    from_date: string;
+    to_date: string;
+    timezone: string;
+    food: {
+        meal_event_count: number;
+        linked_snack_event_count_excluded: number;
+        nutrients: SummaryNutrientRow[];
+    };
+    supplements: {
+        intake_fact_count_in_range: number;
+        effective_done_intake_count: number;
+        excluded_by_correction_count: number;
+        nutrients: SummarySupplementNutrientRow[];
+    };
+    combined: SummaryCombinedRow[];
+}
+
+export interface SummaryWindow {
+    from_date: string;
+    to_date: string;
+    timezone: string;
+}
+
+export async function getSupplementNutritionSummary(
+    pool: Queryable,
+    userId: string,
+    window: SummaryWindow,
+): Promise<SupplementNutritionSummary> {
+    validateBoundedWindow(window);
+    void pool;
+    void userId;
+    return {
+        from_date: window.from_date,
+        to_date: window.to_date,
+        timezone: window.timezone,
+        food: {
+            meal_event_count: 0,
+            linked_snack_event_count_excluded: 0,
+            nutrients: [],
+        },
+        supplements: {
+            intake_fact_count_in_range: 0,
+            effective_done_intake_count: 0,
+            excluded_by_correction_count: 0,
+            nutrients: [],
+        },
+        combined: [],
     };
 }

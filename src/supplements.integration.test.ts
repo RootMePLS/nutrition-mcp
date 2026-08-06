@@ -19,6 +19,7 @@ import {
     resolveSupplementProduct,
     logSupplementIntake,
     getSupplementIntakes,
+    getSupplementNutritionSummary,
     getSupplementRegimenStatus,
     SupplementAliasAmbiguousError,
     SupplementIdempotencyConflictError,
@@ -3382,3 +3383,84 @@ describeDb(
         });
     },
 );
+
+
+// ---------------------------------------------------------------------------
+// Slice 7: supplement nutrition summary — bounded date-range/timezone read
+// separating food, supplement/sports, and compatible combined totals. Real
+// PostgreSQL only.
+// ---------------------------------------------------------------------------
+
+const SLICE_SEVEN_DOMAIN_TABLES = [
+    "supplement_products",
+    "supplement_product_versions",
+    "supplement_product_aliases",
+    "supplement_product_nutrients",
+    "supplement_product_label_limits",
+    "supplement_regimens",
+    "supplement_intake_events",
+    "supplement_intake_nutrient_snapshots",
+    "supplement_intake_meal_links",
+    "meal_events",
+    "meal_event_versions",
+    "meal_event_items",
+    "meal_event_canonical_results",
+    "meal_event_nutrition_results",
+] as const;
+
+describeDb("supplement nutrition summary (requires DATABASE_URL_TEST)", () => {
+    let pool: Pool;
+
+    beforeAll(() => {
+        pool = new Pool({ connectionString: DATABASE_URL_TEST });
+    });
+
+    afterAll(async () => {
+        await pool.end();
+    });
+
+    beforeEach(async () => {
+        await resetSchema(pool);
+    });
+
+    async function domainCounts(): Promise<Record<string, number>> {
+        const counts: Record<string, number> = {};
+        for (const table of SLICE_SEVEN_DOMAIN_TABLES) {
+            counts[table] = await tableCount(pool, table);
+        }
+        return counts;
+    }
+
+    test("summary window rules: junk dates, inverted range, >92 days, and invalid timezone are rejected with zero reads/writes", async () => {
+        const before = await domainCounts();
+        const badPayloads = [
+            {
+                from_date: "2026-13-40",
+                to_date: "2026-08-05",
+                timezone: "UTC",
+            },
+            {
+                from_date: "2026-08-05",
+                to_date: "2026-08-01",
+                timezone: "UTC",
+            },
+            {
+                // 94 inclusive days: beyond the shared 92-day bound.
+                from_date: "2026-01-01",
+                to_date: "2026-04-04",
+                timezone: "UTC",
+            },
+            {
+                from_date: "2026-08-01",
+                to_date: "2026-08-05",
+                timezone: "Not/AZone",
+            },
+        ];
+        for (const payload of badPayloads) {
+            await expect(
+                getSupplementNutritionSummary(pool, "u1", payload),
+            ).rejects.toBeInstanceOf(SupplementValidationError);
+        }
+        expect(await domainCounts()).toEqual(before);
+    });
+});
