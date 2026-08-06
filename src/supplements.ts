@@ -29,7 +29,13 @@ import { createMealEvent } from "./meal-events.js";
 import type { CreateMealEventCommand, Nutrients } from "./meal-types.js";
 import { isStrictIsoTimestamp, sha256Hex } from "./meal-types.js";
 import { escapeLikePattern } from "./search.js";
-import { dateInTz, validateTz, zonedDayStartUtc, zonedNextDayStartUtc } from "./tz.js";
+import {
+    dateInTz,
+    validateTz,
+    zonedDayStartUtc,
+    zonedNextDayStartUtc,
+    zonedWallClockToUtc,
+} from "./tz.js";
 import {
     deriveRegimenOccurrences,
     deriveSupplementIntakeIdempotencyFingerprint,
@@ -2966,6 +2972,107 @@ export async function getSupplementDataFlags(
         });
     }
 
+    // (3) Derived past-due occurrences of ACTIVE regimens with no recorded
+    // state. Occurrences are derived in each regimen's own timezone via the
+    // same pure helpers regimen status uses; state is reduced from the same
+    // fact bucketing. Nothing is materialized, scheduled, or marked.
+    const { rows: regimenRows } = await pool.query(
+        `SELECT r.id, r.product_id, r.product_version, r.schedule,
+                to_char(r.starts_on, 'YYYY-MM-DD') AS starts_on,
+                to_char(r.ends_on, 'YYYY-MM-DD') AS ends_on,
+                v.display_name
+         FROM supplement_regimens r
+         JOIN supplement_product_versions v
+             ON v.product_id = r.product_id AND v.version = r.product_version
+         WHERE r.user_id = $1 AND r.active
+         ORDER BY r.created_at, r.id`,
+        [userId],
+    );
+    interface ActiveRegimenRow {
+        id: string;
+        product_id: string;
+        product_version: number;
+        schedule: RegimenSchedule;
+        starts_on: string;
+        ends_on: string | null;
+        display_name: string;
+    }
+    const activeRegimens = regimenRows as ActiveRegimenRow[];
+    const unmarkedOccurrences: UnmarkedRegimenOccurrence[] = [];
+    if (activeRegimens.length > 0) {
+        const { rows: factRows } = await pool.query(
+            `SELECT id, regimen_id, occurred_at, state_action, created_at
+             FROM supplement_intake_events
+             WHERE user_id = $1 AND regimen_id = ANY($2)
+             ORDER BY created_at, id`,
+            [userId, activeRegimens.map((r) => r.id)],
+        );
+        const facts = factRows as IntakeFactForProjection[];
+        const asOfMs = Date.parse(asOf);
+        for (const regimen of activeRegimens) {
+            const occurrences = deriveRegimenOccurrences(
+                regimen.schedule,
+                regimen.starts_on,
+                regimen.ends_on,
+                window.from_date,
+                window.to_date,
+            );
+            if (occurrences.length === 0) continue;
+            const factsByLocalDate = new Map<
+                string,
+                IntakeFactForProjection[]
+            >();
+            for (const fact of facts) {
+                if (fact.regimen_id !== regimen.id) continue;
+                const localDate = dateInTz(
+                    fact.occurred_at,
+                    regimen.schedule.timezone,
+                );
+                const list = factsByLocalDate.get(localDate) ?? [];
+                list.push(fact);
+                factsByLocalDate.set(localDate, list);
+            }
+            for (const occurrence of occurrences) {
+                const state = reduceOccurrenceState(
+                    factsByLocalDate.get(occurrence.local_date) ?? [],
+                );
+                if (state !== "undefined") continue;
+                const [y, mo, d] = occurrence.local_date
+                    .split("-")
+                    .map(Number);
+                const [hh, mi] = occurrence.local_time.split(":").map(Number);
+                const due = zonedWallClockToUtc(
+                    y!,
+                    mo!,
+                    d!,
+                    hh!,
+                    mi!,
+                    0,
+                    regimen.schedule.timezone,
+                ).instant;
+                // Past-due boundary: exactly as_of counts, later does not.
+                if (due.getTime() > asOfMs) continue;
+                unmarkedOccurrences.push({
+                    regimen_id: regimen.id,
+                    product_id: regimen.product_id,
+                    product_display_name: regimen.display_name,
+                    local_date: occurrence.local_date,
+                    local_time: occurrence.local_time,
+                    timezone: regimen.schedule.timezone,
+                });
+            }
+        }
+        unmarkedOccurrences.sort((a, b) => {
+            if (a.local_date !== b.local_date) {
+                return a.local_date < b.local_date ? -1 : 1;
+            }
+            if (a.local_time !== b.local_time) {
+                return a.local_time < b.local_time ? -1 : 1;
+            }
+            return a.regimen_id.localeCompare(b.regimen_id);
+        });
+    }
+
     return {
         from_date: window.from_date,
         to_date: window.to_date,
@@ -2973,6 +3080,6 @@ export async function getSupplementDataFlags(
         as_of: asOf,
         duplicate_nutrient_exposures: duplicateExposures,
         label_limit_comparisons: limitComparisons,
-        unmarked_active_regimen_occurrences: [],
+        unmarked_active_regimen_occurrences: unmarkedOccurrences,
     };
 }

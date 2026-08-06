@@ -4038,6 +4038,7 @@ describeDb("supplement nutrition summary (requires DATABASE_URL_TEST)", () => {
         ).rejects.toBeInstanceOf(SupplementValidationError);
         expect(await domainCounts()).toEqual(before);
     });
+
 });
 
 
@@ -4442,5 +4443,218 @@ describeDb("supplement data flags (requires DATABASE_URL_TEST)", () => {
             }),
         ).rejects.toBeInstanceOf(SupplementValidationError);
         expect(await domainCounts()).toEqual(before);
+    });
+    test("derives unmarked past-due occurrences for active regimens only", async () => {
+        const productId = await seedProduct({
+            category: "supplement",
+            display_name: "Vitamin D Tabs",
+            aliases: ["vitd-a"],
+        });
+        const regimen = await createSupplementRegimen(
+            pool,
+            validRegimenCommand(productId, {
+                schedule: {
+                    timezone: "Europe/London",
+                    frequency: "daily",
+                    local_time: "08:00",
+                },
+                starts_on: "2026-07-28",
+                ends_on: null,
+            }),
+        );
+        const regimenId = regimen.regimen.regimen_id;
+        // 07-29: done. 07-30: done then cleared (back to undefined).
+        const done0730 = await log(productId, {
+            product_id: null,
+            regimen_id: regimenId,
+            servings: 1,
+            occurred_at: "2026-07-30T08:00:00+01:00",
+        });
+        await log(productId, {
+            product_id: null,
+            regimen_id: regimenId,
+            servings: 1,
+            occurred_at: "2026-07-29T08:00:00+01:00",
+        });
+        await log(productId, {
+            product_id: null,
+            regimen_id: regimenId,
+            servings: 1,
+            occurred_at: "2026-07-30T09:00:00+01:00",
+            state_action: "cleared",
+            supersedes_intake_id: done0730.intake_id,
+        });
+
+        const flags = await getSupplementDataFlags(pool, "u1", {
+            from_date: "2026-07-28",
+            to_date: "2026-08-03",
+            timezone: "UTC",
+            as_of: "2026-08-01T12:00:00.000Z",
+        });
+        // Unmarked = undefined state AND past-due: 07-28 (never marked),
+        // 07-30 (cleared), 07-31, and 08-01 (08:00 London <= as_of). The
+        // done 07-29 and the future 08-02/08-03 are absent.
+        expect(
+            flags.unmarked_active_regimen_occurrences.map((o) => o.local_date),
+        ).toEqual([
+            "2026-07-28",
+            "2026-07-30",
+            "2026-07-31",
+            "2026-08-01",
+        ]);
+        const first = flags.unmarked_active_regimen_occurrences[0]!;
+        expect(first.regimen_id).toBe(regimenId);
+        expect(first.product_id).toBe(productId);
+        expect(first.product_display_name).toBe("Vitamin D Tabs");
+        expect(first.local_time).toBe("08:00");
+        expect(first.timezone).toBe("Europe/London");
+    });
+
+    test("an occurrence at exactly as_of is past-due; one minute later is not", async () => {
+        const productId = await seedProduct({ category: "supplement" });
+        const regimen = await createSupplementRegimen(
+            pool,
+            validRegimenCommand(productId, {
+                schedule: {
+                    timezone: "UTC",
+                    frequency: "daily",
+                    local_time: "12:00",
+                },
+                starts_on: "2026-08-01",
+                ends_on: null,
+            }),
+        );
+        const regimenId = regimen.regimen.regimen_id;
+        const window = {
+            from_date: "2026-08-01",
+            to_date: "2026-08-01",
+            timezone: "UTC",
+        };
+
+        const atExact = await getSupplementDataFlags(pool, "u1", {
+            ...window,
+            as_of: "2026-08-01T12:00:00.000Z",
+        });
+        expect(
+            atExact.unmarked_active_regimen_occurrences.map(
+                (o) => o.regimen_id,
+            ),
+        ).toEqual([regimenId]);
+
+        const oneMinuteEarly = await getSupplementDataFlags(pool, "u1", {
+            ...window,
+            as_of: "2026-08-01T11:59:00.000Z",
+        });
+        expect(
+            oneMinuteEarly.unmarked_active_regimen_occurrences,
+        ).toEqual([]);
+    });
+
+    test("weekly schedules and regimen timezone are respected", async () => {
+        const productId = await seedProduct({ category: "supplement" });
+        const regimen = await createSupplementRegimen(
+            pool,
+            validRegimenCommand(productId, {
+                schedule: {
+                    timezone: "Pacific/Auckland",
+                    frequency: "weekly",
+                    local_time: "09:00",
+                    weekdays: [1, 4],
+                },
+                starts_on: "2026-07-27",
+                ends_on: null,
+            }),
+        );
+        const regimenId = regimen.regimen.regimen_id;
+
+        const flags = await getSupplementDataFlags(pool, "u1", {
+            from_date: "2026-07-27",
+            to_date: "2026-08-03",
+            timezone: "UTC",
+            as_of: "2026-08-06T00:00:00.000Z",
+        });
+        // Mon/Thu in Pacific/Auckland: 07-27 (Mon), 07-30 (Thu), 08-03 (Mon).
+        expect(flags.unmarked_active_regimen_occurrences).toEqual([
+            "2026-07-27",
+            "2026-07-30",
+            "2026-08-03",
+        ].map((local_date) => ({
+            regimen_id: regimenId,
+            product_id: productId,
+            product_display_name: "Impact Whey Protein",
+            local_date,
+            local_time: "09:00",
+            timezone: "Pacific/Auckland",
+        })));
+    });
+
+    test("inactive regimens and ended windows derive nothing", async () => {
+        const productId = await seedProduct({ category: "supplement" });
+        const inactive = await createSupplementRegimen(
+            pool,
+            validRegimenCommand(productId, {
+                schedule: {
+                    timezone: "UTC",
+                    frequency: "daily",
+                    local_time: "08:00",
+                },
+                starts_on: "2026-08-01",
+                ends_on: null,
+            }),
+        );
+        await setSupplementRegimenActive(
+            pool,
+            "u1",
+            inactive.regimen.regimen_id,
+            false,
+        );
+        // An active regimen whose ends_on precedes the window derives nothing.
+        await createSupplementRegimen(
+            pool,
+            validRegimenCommand(productId, {
+                schedule: {
+                    timezone: "UTC",
+                    frequency: "daily",
+                    local_time: "08:00",
+                },
+                starts_on: "2026-07-01",
+                ends_on: "2026-07-20",
+            }),
+        );
+
+        const flags = await getSupplementDataFlags(pool, "u1", {
+            from_date: "2026-08-01",
+            to_date: "2026-08-03",
+            timezone: "UTC",
+            as_of: "2026-08-06T00:00:00.000Z",
+        });
+        expect(flags.unmarked_active_regimen_occurrences).toEqual([]);
+    });
+
+    test("deriving occurrence flags writes nothing", async () => {
+        const productId = await seedProduct({ category: "supplement" });
+        await createSupplementRegimen(
+            pool,
+            validRegimenCommand(productId, {
+                schedule: {
+                    timezone: "UTC",
+                    frequency: "daily",
+                    local_time: "08:00",
+                },
+                starts_on: "2026-08-01",
+                ends_on: null,
+            }),
+        );
+        const before = await domainCounts();
+        await getSupplementDataFlags(pool, "u1", {
+            from_date: "2026-08-01",
+            to_date: "2026-08-03",
+            timezone: "UTC",
+            as_of: "2026-08-06T00:00:00.000Z",
+        });
+        expect(await domainCounts()).toEqual(before);
+        expect(await tableCount(pool, "supplement_intake_events")).toBe(0);
+        expect(await tableCount(pool, "meal_events")).toBe(0);
+        expect(await tableCount(pool, "supplement_intake_meal_links")).toBe(0);
     });
 });
