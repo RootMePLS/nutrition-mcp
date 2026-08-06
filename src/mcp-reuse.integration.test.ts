@@ -116,10 +116,41 @@ describeDb(
             });
         });
 
-        test("listTools does not advertise reuse_meal_calculation (Slice 4 guard)", async () => {
+        test("listTools advertises reuse_meal_calculation with mutation annotations and typed outputSchema", async () => {
             await withReuseTools(pool, "u1", async ({ listTools }) => {
-                const names = (await listTools()).map((t) => t.name);
-                expect(names).not.toContain("reuse_meal_calculation");
+                const tools = await listTools();
+                const tool = tools.find(
+                    (t) => t.name === "reuse_meal_calculation",
+                );
+                expect(tool).toBeDefined();
+                const annotations = (
+                    tool as unknown as {
+                        annotations?: Record<string, unknown>;
+                    }
+                ).annotations;
+                expect(annotations?.readOnlyHint).toBe(false);
+                expect(annotations?.idempotentHint).toBe(true);
+                expect(annotations?.destructiveHint).toBe(false);
+                const outputSchema = tool!.outputSchema as {
+                    properties?: Record<string, unknown>;
+                };
+                expect(outputSchema).toBeDefined();
+                for (const key of [
+                    "event_id",
+                    "version",
+                    "deduplicated",
+                    "provenance_status",
+                    "compatibility",
+                    "canonical",
+                    "components",
+                    "source",
+                ]) {
+                    expect(outputSchema.properties).toHaveProperty(key);
+                }
+                const description = tool!.description ?? "";
+                expect(description.toLowerCase()).toContain("confirmation");
+                // Truthful mutation contract: never claims provider calls.
+                expect(description).toContain("never calls providers");
             });
         });
 
@@ -276,6 +307,108 @@ describeDb(
                     limit: 5,
                 });
                 expect(await domainTableCounts(pool)).toEqual(before);
+            });
+        });
+    },
+);
+
+
+// ---------------------------------------------------------------------------
+// Slice 4 public transport: the reuse_meal_calculation mutation through a
+// real McpServer + Client + InMemoryTransport against real PostgreSQL.
+// ---------------------------------------------------------------------------
+
+import { REUSE_MEAL_OUTPUT_SCHEMA } from "./mcp.js";
+
+describeDb(
+    "reuse_meal_calculation transport (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await pool.end();
+        });
+
+        beforeEach(async () => {
+            await resetSchema(pool);
+        });
+
+        afterEach(async () => {
+            await flushAnalytics();
+        });
+
+        test("happy-path structured round-trip + get_calculation_provenance re-read", async () => {
+            const sourceId = await seedMealEvent(pool, "u1", {
+                idempotencyKey: "tx-src",
+                consumedAt: daysAgo(2),
+                items: [{ ordinal: 0, raw_item_text: "transport oats" }],
+            });
+            const bundle = readyBundle(sourceId, 1);
+            await commitBundle(pool, "u1", bundle);
+
+            await withReuseTools(pool, "u1", async ({ call }) => {
+                const result = await call("reuse_meal_calculation", {
+                    source_event_id: sourceId,
+                    source_version: 1,
+                    reported_at: "2026-08-06T13:00:00.000Z",
+                    consumed_at: "2026-08-06T12:30:00.000Z",
+                    idempotency_key: "tx-key-1",
+                    confirmation: "добавь",
+                });
+                expect(result.isError).not.toBe(true);
+                const payload = REUSE_MEAL_OUTPUT_SCHEMA.parse(
+                    result.structuredContent,
+                );
+                expect(payload.event_id).not.toBe(sourceId);
+                expect(payload.version).toBe(1);
+                expect(payload.deduplicated).toBe(false);
+                expect(payload.reported_at).toBe("2026-08-06T13:00:00.000Z");
+                expect(payload.consumed_at).toBe("2026-08-06T12:30:00.000Z");
+                expect(payload.meal_type).toBe("breakfast");
+                expect(payload.provenance_status).toBe("ready");
+                expect(payload.compatibility).toBe(false);
+                expect(payload.bundle_fingerprint).toBe(bundle.fingerprint!);
+                expect(payload.canonical).not.toBeNull();
+                expect(payload.canonical!.calories).toBe(500);
+                expect(payload.canonical!.protein_g).toBe(20);
+                expect(payload.canonical!.carbs_g).toBe(60);
+                expect(payload.canonical!.fat_g).toBe(15);
+                expect(payload.components).toHaveLength(1);
+                expect(payload.components[0]!.raw_item_text).toBe(
+                    "transport oats",
+                );
+                expect(payload.source.source_event_id).toBe(sourceId);
+                expect(payload.source.source_version).toBe(1);
+                expect(payload.source.source_was_current).toBe(true);
+                expect(payload.source.source_bundle_fingerprint).toBe(
+                    bundle.fingerprint!,
+                );
+                expect(payload.source.confirmation_received).toBe(true);
+
+                // The target is independently re-readable through the public
+                // provenance path with the copied canonical values.
+                const provenance = await call("get_calculation_provenance", {
+                    event_id: payload.event_id,
+                    version: 1,
+                });
+                expect(provenance.isError).not.toBe(true);
+                const reRead = provenance.structuredContent as {
+                    provenance_status: string;
+                    compatibility: boolean;
+                    bundle_fingerprint: string | null;
+                    canonical: {
+                        nutrients: Record<string, number | null>;
+                    } | null;
+                };
+                expect(reRead.provenance_status).toBe("ready");
+                expect(reRead.compatibility).toBe(false);
+                expect(reRead.bundle_fingerprint).toBe(bundle.fingerprint!);
+                expect(reRead.canonical!.nutrients.calories).toBe(500);
+                expect(reRead.canonical!.nutrients.protein_g).toBe(20);
             });
         });
     },

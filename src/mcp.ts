@@ -31,7 +31,14 @@ import type {
     PreparedMealDraft,
 } from "./meal-capture-types.js";
 import { computeConsensus } from "./meal-consensus.js";
-import { searchReuseCandidates } from "./meal-reuse.js";
+import {
+    MealReuseIdempotencyConflictError,
+    MealReuseSourceIneligibleError,
+    MealReuseSourceNotFoundError,
+    MealReuseSourceVersionError,
+    reuseMealCalculation,
+    searchReuseCandidates,
+} from "./meal-reuse.js";
 import { NUTRIENT_FIELDS, type NutrientField } from "./meal-types.js";
 import {
     validateCalculationBundle,
@@ -209,6 +216,71 @@ export const SEARCH_MEALS_OUTPUT_SCHEMA = z
                 })
                 .strict(),
         ),
+    })
+    .strict();
+
+// Slice 4: typed structuredContent for reuse_meal_calculation — the confirmed
+// server-copy mutation readback: fresh root/version identity, copied canonical
+// facts and components, and the immutable source lineage link. Every nullable
+// field is explicit so absence is never fabricated; nothing nutrition-shaped
+// is accepted as input.
+export const REUSE_MEAL_OUTPUT_SCHEMA = z
+    .object({
+        event_id: z.string().uuid(),
+        version: z.literal(1),
+        deduplicated: z.boolean(),
+        reported_at: z.string(),
+        consumed_at: z.string(),
+        meal_type: z.string().nullable(),
+        provenance_status: z.enum([
+            "ready",
+            "pending",
+            "unavailable",
+            "missing",
+        ]),
+        compatibility: z.boolean(),
+        bundle_fingerprint: z.string().nullable(),
+        canonical: z
+            .object({
+                status: z.enum(["pending", "ready", "low_confidence"]),
+                consensus_status: z.enum([
+                    "two_agree_one_outlier",
+                    "all_agree",
+                    "no_consensus",
+                    "insufficient_data",
+                ]),
+                calories: z.number().nullable(),
+                protein_g: z.number().nullable(),
+                carbs_g: z.number().nullable(),
+                fat_g: z.number().nullable(),
+                fiber_g: z.number().nullable(),
+                sugar_g: z.number().nullable(),
+                alcohol_g: z.number().nullable(),
+            })
+            .strict()
+            .nullable(),
+        components: z.array(
+            z
+                .object({
+                    ordinal: z.number().int().min(0),
+                    raw_item_text: z.string(),
+                    normalized_name: z.string().nullable(),
+                    quantity: z.number().nullable(),
+                    portion_value: z.number().nullable(),
+                    portion_unit: z.string().nullable(),
+                    notes: z.string().nullable(),
+                })
+                .strict(),
+        ),
+        source: z
+            .object({
+                source_event_id: z.string().uuid(),
+                source_version: z.number().int().min(1),
+                source_was_current: z.boolean(),
+                source_bundle_fingerprint: z.string(),
+                confirmation_received: z.literal(true),
+            })
+            .strict(),
     })
     .strict();
 
@@ -2638,6 +2710,155 @@ export function registerTools(
                 },
                 { userId },
                 { days: days ?? 365 },
+            );
+        },
+    );
+
+    // --------------------------------------------------------------------
+    // Confirmed meal-reuse mutation (Slice 4)
+    // --------------------------------------------------------------------
+    // The handler only adapts args and maps typed domain errors to stable
+    // public codes (mirroring supplementToolError); validation, locking,
+    // eligibility, copying, lineage, and idempotency live in meal-reuse.ts.
+    // Only declared fields are destructured — smuggled extras never reach
+    // the service. `confirmation` is validated by zod and intentionally
+    // unused beyond validation: the service records confirmation_received
+    // only on the path that required it.
+    const reuseToolError = (error: unknown): never => {
+        if (error instanceof MealReuseSourceNotFoundError) {
+            throw new Error("meal_reuse_source_not_found");
+        }
+        if (error instanceof MealReuseSourceVersionError) {
+            throw new Error(
+                "meal_reuse_source_version_not_current_or_historical",
+            );
+        }
+        if (error instanceof MealReuseSourceIneligibleError) {
+            // Message is already prefixed with the stable code + category.
+            throw new Error(error.message);
+        }
+        if (error instanceof MealReuseIdempotencyConflictError) {
+            // Message is already prefixed with the shared stable code.
+            throw new Error(error.message);
+        }
+        throw error;
+    };
+
+    server.registerTool(
+        "reuse_meal_calculation",
+        {
+            title: "Reuse Meal Calculation",
+            description:
+                "Create a NEW meal event from one precise prior event/version the user explicitly confirmed reusing. The server copies the source's persisted provider evidence and canonical calculation as immutable copied facts with a recorded source link — it never calls providers and never accepts caller-supplied nutrition values. Requires the source_event_id + source_version from search_meals reuse candidates, fresh reported_at/consumed_at for the new occurrence, a stable idempotency_key for safe retries, and the explicit user confirmation ('добавь'/'add'/'confirm'). Ineligible, deleted, or foreign sources fail with a stable error and create nothing.",
+            annotations: {
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                source_event_id: z.string().uuid(),
+                source_version: z.number().int().min(1),
+                reported_at: z
+                    .string()
+                    .refine((s) => !Number.isNaN(Date.parse(s)), {
+                        message:
+                            "reported_at must be a valid ISO 8601 timestamp",
+                    }),
+                consumed_at: z
+                    .string()
+                    .refine((s) => !Number.isNaN(Date.parse(s)), {
+                        message:
+                            "consumed_at must be a valid ISO 8601 timestamp",
+                    }),
+                idempotency_key: z.string().min(1).max(255),
+                confirmation: z.enum(["добавь", "add", "confirm"]),
+            },
+            outputSchema: REUSE_MEAL_OUTPUT_SCHEMA.shape,
+        },
+        async ({
+            source_event_id,
+            source_version,
+            reported_at,
+            consumed_at,
+            idempotency_key,
+        }) => {
+            return withAnalytics(
+                "reuse_meal_calculation",
+                async () => {
+                    const result = await reuseMealCalculation(mealEventsPool, {
+                        user_id: userId,
+                        source_event_id,
+                        source_version,
+                        reported_at,
+                        consumed_at,
+                        idempotency_key,
+                        created_by: "reuse_meal_calculation",
+                    }).catch(reuseToolError);
+                    const readback = await getMealEventProvenance(
+                        mealEventsPool,
+                        userId,
+                        result.event_id,
+                        1,
+                    );
+                    if (!readback) {
+                        throw new Error("reused meal event readback missing");
+                    }
+                    const { aggregate } = readback;
+                    const payload = REUSE_MEAL_OUTPUT_SCHEMA.parse({
+                        event_id: aggregate.event.id,
+                        version: 1,
+                        deduplicated: result.deduplicated,
+                        reported_at: aggregate.event.reported_at,
+                        consumed_at: aggregate.event.consumed_at,
+                        meal_type: aggregate.event.meal_type,
+                        provenance_status: readback.provenance_status,
+                        compatibility: readback.compatibility,
+                        bundle_fingerprint:
+                            aggregate.version.calculation_bundle_fingerprint,
+                        canonical: aggregate.canonical
+                            ? {
+                                  status: aggregate.canonical.status,
+                                  consensus_status:
+                                      aggregate.canonical.consensus_status,
+                                  calories: aggregate.canonical.calories,
+                                  protein_g: aggregate.canonical.protein_g,
+                                  carbs_g: aggregate.canonical.carbs_g,
+                                  fat_g: aggregate.canonical.fat_g,
+                                  fiber_g: aggregate.canonical.fiber_g,
+                                  sugar_g: aggregate.canonical.sugar_g,
+                                  alcohol_g: aggregate.canonical.alcohol_g,
+                              }
+                            : null,
+                        components: aggregate.items.map((item) => ({
+                            ordinal: item.ordinal,
+                            raw_item_text: item.raw_item_text,
+                            normalized_name: item.normalized_name,
+                            quantity: item.quantity,
+                            portion_value: item.portion_value,
+                            portion_unit: item.portion_unit,
+                            notes: item.notes,
+                        })),
+                        source: {
+                            source_event_id: result.source_event_id,
+                            source_version: result.source_version,
+                            source_was_current: result.source_was_current,
+                            source_bundle_fingerprint:
+                                result.source_bundle_fingerprint,
+                            confirmation_received: true as const,
+                        },
+                    });
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(payload, null, 2),
+                            },
+                        ],
+                        structuredContent: payload,
+                    };
+                },
+                { userId },
             );
         },
     );
