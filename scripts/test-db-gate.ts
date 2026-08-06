@@ -48,6 +48,7 @@ const migrations = [
     "db/migrations/006_meal_reuse_and_supplements.sql",
     "db/migrations/007_ownership_lineage_integrity.sql",
     "db/migrations/008_supplement_create_idempotency.sql",
+    "db/migrations/009_supplement_create_idem_reconciliation.sql",
 ];
 
 // Reset and materialize the complete schema before every child process. This

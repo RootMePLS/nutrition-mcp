@@ -2,6 +2,10 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Pool, type PoolClient } from "pg";
 import { createMealEvent } from "./meal-events.js";
 import { checkDatabaseReadiness } from "./readiness.js";
+import {
+    createSupplementProduct,
+    type CreateSupplementProductCommand,
+} from "./supplements.js";
 
 // Opt-in integration suite against a real disposable PostgreSQL database.
 // Skipped loudly unless DATABASE_URL_TEST points at a scratch database the
@@ -16,6 +20,8 @@ const MIGRATION_005 = "db/migrations/005_calculation_corrections.sql";
 const MIGRATION_006 = "db/migrations/006_meal_reuse_and_supplements.sql";
 const MIGRATION_007 = "db/migrations/007_ownership_lineage_integrity.sql";
 const MIGRATION_008 = "db/migrations/008_supplement_create_idempotency.sql";
+const MIGRATION_009 =
+    "db/migrations/009_supplement_create_idem_reconciliation.sql";
 
 const MIGRATION_006_TABLES = [
     "meal_event_reuse_sources",
@@ -101,6 +107,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_006);
         await applyMigration(client, MIGRATION_007);
         await applyMigration(client, MIGRATION_008);
+        await applyMigration(client, MIGRATION_009);
 
         const tables = await tableNames(client);
         for (const table of NEW_TABLES) {
@@ -146,6 +153,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_006);
         await applyMigration(client, MIGRATION_007);
         await applyMigration(client, MIGRATION_008);
+        await applyMigration(client, MIGRATION_009);
 
         const tables = await tableNames(client);
         expect(tables).not.toContain(LEGACY_TABLE);
@@ -175,6 +183,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_006);
         await applyMigration(client, MIGRATION_007);
         await applyMigration(client, MIGRATION_008);
+        await applyMigration(client, MIGRATION_009);
 
         const tables = await tableNames(client);
         for (const table of NEW_TABLES) {
@@ -193,6 +202,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_006);
         await applyMigration(client, MIGRATION_007);
         await applyMigration(client, MIGRATION_008);
+        await applyMigration(client, MIGRATION_009);
         const event = await createMealEvent(
             pool,
             {
@@ -271,10 +281,12 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_006);
         await applyMigration(client, MIGRATION_007);
         await applyMigration(client, MIGRATION_008);
-        // Rerunning 006-008 must be safe (additive/idempotent like 003-005).
+        await applyMigration(client, MIGRATION_009);
+        // Rerunning 006-009 must be safe (additive/idempotent like 003-005).
         await applyMigration(client, MIGRATION_006);
         await applyMigration(client, MIGRATION_007);
         await applyMigration(client, MIGRATION_008);
+        await applyMigration(client, MIGRATION_009);
 
         // Existing alcohol profile state survives the upgrade untouched.
         const { rows: profiles } = await client.query(
@@ -407,6 +419,7 @@ const INTEGRITY_CHAIN = [
     MIGRATION_006,
     MIGRATION_007,
     MIGRATION_008,
+    MIGRATION_009,
 ];
 
 // Reviewer-terra finding 2: direct persistence must not be able to create
@@ -843,6 +856,7 @@ describeDb(
             // Rerunning the head migrations must be safe (additive/idempotent).
             await applyMigration(client, MIGRATION_007);
             await applyMigration(client, MIGRATION_008);
+            await applyMigration(client, MIGRATION_009);
         });
     },
 );
@@ -946,6 +960,330 @@ describeDb(
             await insertVersion(rootE, "u1", 2, "shared-key");
 
             // Rerunning 008 must be safe (IF NOT EXISTS).
+            await applyMigration(client, MIGRATION_008);
+        });
+    },
+);
+
+// Reviewer-terra slice 2 remediation: 008 is immutable (pushed to main, which
+// auto-deploys) and genuinely blocks any 001-007 database carrying pre-008
+// race duplicates — CREATE UNIQUE INDEX cannot build over duplicate keys.
+// Migration 009 is the forward-safe fix: it reconciles duplicates
+// deterministically and non-destructively, appends one audit row per
+// decision, and creates the same partial unique index IF NOT EXISTS, so a
+// stuck database reaches head by applying 009 and then re-applying 008.
+describeDb(
+    "migration 009 create-idempotency reconciliation (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+        let client: PoolClient;
+
+        beforeAll(async () => {
+            // No max=1: the repository convergence check below acquires its
+            // own connection while this suite's client stays checked out.
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+            client = await pool.connect();
+        });
+
+        afterAll(async () => {
+            client.release();
+            await pool.end();
+        });
+
+        // The pre-008 chain: the state a duplicate-bearing database is in
+        // when the upgrade to 008 first fails.
+        const PRE_008_CHAIN = INTEGRITY_CHAIN.slice(0, 7);
+
+        async function applyPre008(): Promise<void> {
+            await resetSchema(client);
+            for (const migration of PRE_008_CHAIN) {
+                await applyMigration(client, migration);
+            }
+        }
+
+        async function insertRoot(userId: string): Promise<string> {
+            const { rows } = await client.query(
+                `INSERT INTO supplement_products (user_id, category)
+                 VALUES ($1, 'supplement') RETURNING id`,
+                [userId],
+            );
+            return rows[0].id as string;
+        }
+
+        async function insertVersion(
+            productId: string,
+            userId: string,
+            key: string | null,
+            createdAt: string,
+        ): Promise<void> {
+            await client.query(
+                `INSERT INTO supplement_product_versions
+                    (product_id, version, user_id, revision_idempotency_key,
+                     display_name, label_evidence, created_by, created_at)
+                 VALUES ($1, 1, $2, $3, 'Label', '{}', 'test', $4)`,
+                [productId, userId, key, createdAt],
+            );
+        }
+
+        // Full label identity matching the repository convergence command in
+        // the race test, plus one alias and one nutrient child row so the
+        // non-destructive assertions have real label data to check.
+        async function insertVersionWithChildren(
+            productId: string,
+            userId: string,
+            key: string | null,
+            createdAt: string,
+        ): Promise<void> {
+            await client.query(
+                `INSERT INTO supplement_product_versions
+                    (product_id, version, user_id, revision_idempotency_key,
+                     display_name, short_name, brand, form,
+                     serving_amount, serving_unit, serving_description,
+                     label_evidence, label_source_kind, created_by, created_at)
+                 VALUES ($1, 1, $2, $3,
+                         'Race Whey', 'RW', 'RaceBrand', 'powder',
+                         30, 'g', '1 scoop',
+                         '{"kind":"label_photo"}', 'user_verified_label',
+                         'test', $4)`,
+                [productId, userId, key, createdAt],
+            );
+            await client.query(
+                `INSERT INTO supplement_product_aliases
+                    (product_id, version, user_id, alias, normalized_alias)
+                 VALUES ($1, 1, $2, 'Race Whey', 'race whey')`,
+                [productId, userId],
+            );
+            await client.query(
+                `INSERT INTO supplement_product_nutrients
+                    (product_id, version, nutrient_key, display_name,
+                     amount, unit, source_evidence)
+                 VALUES ($1, 1, 'protein_g', NULL, 21, 'g', '{}')`,
+                [productId],
+            );
+        }
+
+        async function versionKeys(
+            productIds: string[],
+        ): Promise<Map<string, string | null>> {
+            const { rows } = await client.query(
+                `SELECT product_id, revision_idempotency_key
+                 FROM supplement_product_versions
+                 WHERE version = 1 AND product_id = ANY($1)`,
+                [productIds],
+            );
+            return new Map(
+                rows.map((r) => [
+                    r.product_id as string,
+                    r.revision_idempotency_key as string | null,
+                ]),
+            );
+        }
+
+        async function auditRows(): Promise<Record<string, unknown>[]> {
+            const { rows } = await client.query(
+                `SELECT * FROM supplement_create_idem_reconciliation_audit`,
+            );
+            return rows;
+        }
+
+        test("001-007 database with race duplicates: 008 blocks, 009 reconciles deterministically, head is reachable, retries converge on the winner", async () => {
+            await applyPre008();
+
+            // Pre-008 race: two roots, same user, same create key, each with
+            // alias + nutrient children. The older one must win.
+            const winner = await insertRoot("u1");
+            await insertVersionWithChildren(
+                winner,
+                "u1",
+                "race-key",
+                "2026-08-01T00:00:00Z",
+            );
+            const loser = await insertRoot("u1");
+            await insertVersionWithChildren(
+                loser,
+                "u1",
+                "race-key",
+                "2026-08-01T00:00:01Z",
+            );
+
+            // Independent controls that reconciliation must never touch.
+            const controlSolo = await insertRoot("u1");
+            await insertVersion(
+                controlSolo,
+                "u1",
+                "solo-key",
+                "2026-08-01T00:00:02Z",
+            );
+            const controlOtherUser = await insertRoot("u2");
+            await insertVersion(
+                controlOtherUser,
+                "u2",
+                "race-key",
+                "2026-08-01T00:00:03Z",
+            );
+            const controlNull = await insertRoot("u1");
+            await insertVersion(
+                controlNull,
+                "u1",
+                null,
+                "2026-08-01T00:00:04Z",
+            );
+
+            // Deployment reality: immutable 008 genuinely blocks this
+            // database — the unique index cannot build over duplicates.
+            await expect(
+                applyMigration(client, MIGRATION_008),
+            ).rejects.toMatchObject({ code: "23505" });
+
+            // 009 is the forward-safe remediation path.
+            await applyMigration(client, MIGRATION_009);
+
+            // Deterministic winner (oldest created_at) keeps the retry key;
+            // the loser releases exactly its version-1 key and nothing else.
+            const keys = await versionKeys([
+                winner,
+                loser,
+                controlSolo,
+                controlOtherUser,
+                controlNull,
+            ]);
+            expect(keys.get(winner)).toBe("race-key");
+            expect(keys.get(loser)).toBeNull();
+            expect(keys.get(controlSolo)).toBe("solo-key");
+            expect(keys.get(controlOtherUser)).toBe("race-key");
+            expect(keys.get(controlNull)).toBeNull();
+
+            // Non-destructive: the losing root, its version row, and every
+            // child label fact remain fully readable.
+            const { rows: loserData } = await client.query(
+                `SELECT
+                    (SELECT status FROM supplement_products
+                      WHERE id = $1) AS root_status,
+                    (SELECT count(*)::int FROM supplement_product_versions
+                      WHERE product_id = $1) AS versions,
+                    (SELECT count(*)::int FROM supplement_product_aliases
+                      WHERE product_id = $1) AS aliases,
+                    (SELECT count(*)::int FROM supplement_product_nutrients
+                      WHERE product_id = $1) AS nutrients`,
+                [loser],
+            );
+            expect(loserData[0]).toEqual({
+                root_status: "active",
+                versions: 1,
+                aliases: 1,
+                nutrients: 1,
+            });
+
+            // Exactly one complete append-only audit row for the group.
+            const audit = await auditRows();
+            expect(audit.length).toBe(1);
+            expect(audit[0]).toMatchObject({
+                migration: "009_supplement_create_idem_reconciliation",
+                user_id: "u1",
+                revision_idempotency_key: "race-key",
+                winner_product_id: winner,
+                winner_version: 1,
+                loser_product_id: loser,
+                loser_version: 1,
+                decision: "null_loser_revision_idempotency_key",
+            });
+            expect(audit[0]!.reason).toContain("created_at");
+            expect(audit[0]!.created_at).toBeTruthy();
+
+            // The index now exists — created by 009 itself after
+            // reconciliation, with the same definition 008 ships.
+            const { rows: indexes } = await client.query(
+                `SELECT indexdef FROM pg_indexes
+                 WHERE schemaname = 'public'
+                   AND indexname = 'uniq_spv_user_create_idem'`,
+            );
+            expect(indexes.length).toBe(1);
+            expect(indexes[0].indexdef as string).toContain("UNIQUE");
+
+            // 008 re-applies cleanly as a no-op: the chain reaches head.
+            await applyMigration(client, MIGRATION_008);
+
+            // A fresh same-key create converges on the reconciled winner
+            // through the real repository path — deduplicated readback of
+            // the winner, never a second root.
+            const result = await createSupplementProduct(pool, {
+                user_id: "u1",
+                category: "supplement",
+                display_name: "Race Whey",
+                short_name: "RW",
+                brand: "RaceBrand",
+                form: "powder",
+                serving_amount: 30,
+                serving_unit: "g",
+                serving_description: "1 scoop",
+                aliases: ["Race Whey"],
+                nutrients: [
+                    { nutrient_key: "protein_g", amount: 21, unit: "g" },
+                ],
+                label_evidence: { kind: "label_photo" },
+                label_source_kind: "user_verified_label",
+                idempotency_key: "race-key",
+                created_by: "test",
+            } as CreateSupplementProductCommand);
+            expect(result.deduplicated).toBe(true);
+            expect(result.product.product_id).toBe(winner);
+        });
+
+        test("identical created_at breaks the tie by lowest product_id; rerun writes no duplicate audit and loses no data", async () => {
+            await applyPre008();
+
+            const LOW = "00000000-0000-0000-0000-000000000001";
+            const HIGH = "00000000-0000-0000-0000-000000000002";
+            await client.query(
+                `INSERT INTO supplement_products (id, user_id, category)
+                 VALUES ($1, 'u1', 'supplement'), ($2, 'u1', 'supplement')`,
+                [LOW, HIGH],
+            );
+            // Insert the higher UUID first with an identical timestamp so
+            // neither insertion order nor created_at can decide — only the
+            // stable product_id tie-break can.
+            const stamp = "2026-08-01T00:00:00Z";
+            await insertVersionWithChildren(HIGH, "u1", "tie-key", stamp);
+            await insertVersionWithChildren(LOW, "u1", "tie-key", stamp);
+
+            await applyMigration(client, MIGRATION_009);
+
+            const keys = await versionKeys([LOW, HIGH]);
+            expect(keys.get(LOW)).toBe("tie-key");
+            expect(keys.get(HIGH)).toBeNull();
+
+            const audit = await auditRows();
+            expect(audit.length).toBe(1);
+            expect(audit[0]).toMatchObject({
+                user_id: "u1",
+                revision_idempotency_key: "tie-key",
+                winner_product_id: LOW,
+                loser_product_id: HIGH,
+            });
+
+            // Rerun: append-only audit stays at one row, keys stay decided,
+            // and no product/label data is touched again.
+            await applyMigration(client, MIGRATION_009);
+
+            expect((await auditRows()).length).toBe(1);
+            const keysAfter = await versionKeys([LOW, HIGH]);
+            expect(keysAfter.get(LOW)).toBe("tie-key");
+            expect(keysAfter.get(HIGH)).toBeNull();
+            const { rows: survivorData } = await client.query(
+                `SELECT
+                    (SELECT count(*)::int FROM supplement_products) AS roots,
+                    (SELECT count(*)::int FROM supplement_product_versions) AS versions,
+                    (SELECT count(*)::int FROM supplement_product_aliases) AS aliases,
+                    (SELECT count(*)::int FROM supplement_product_nutrients) AS nutrients`,
+            );
+            expect(survivorData[0]).toEqual({
+                roots: 2,
+                versions: 2,
+                aliases: 2,
+                nutrients: 2,
+            });
+
+            // After 009 the immutable 008 applies cleanly: head reached.
             await applyMigration(client, MIGRATION_008);
         });
     },

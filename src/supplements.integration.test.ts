@@ -24,7 +24,7 @@ import {
 // Slice 2 repository gate: versioned, user-scoped supplement product
 // catalogue against real PostgreSQL. Skipped loudly without
 // DATABASE_URL_TEST; every test resets the public schema and replays the
-// full migration chain 001-008 (the current head).
+// full migration chain 001-009 (the current head).
 // ---------------------------------------------------------------------------
 
 const DATABASE_URL_TEST = process.env.DATABASE_URL_TEST;
@@ -46,6 +46,7 @@ const MIGRATIONS = [
     "db/migrations/006_meal_reuse_and_supplements.sql",
     "db/migrations/007_ownership_lineage_integrity.sql",
     "db/migrations/008_supplement_create_idempotency.sql",
+    "db/migrations/009_supplement_create_idem_reconciliation.sql",
 ];
 
 async function resetSchema(pool: Pool): Promise<void> {

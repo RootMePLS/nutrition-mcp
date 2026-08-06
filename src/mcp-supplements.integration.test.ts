@@ -43,6 +43,7 @@ const MIGRATIONS = [
     "db/migrations/006_meal_reuse_and_supplements.sql",
     "db/migrations/007_ownership_lineage_integrity.sql",
     "db/migrations/008_supplement_create_idempotency.sql",
+    "db/migrations/009_supplement_create_idem_reconciliation.sql",
 ];
 
 const SUPPLEMENT_TOOL_NAMES = [

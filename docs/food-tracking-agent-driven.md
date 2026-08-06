@@ -233,6 +233,21 @@ WHERE version = 1 AND revision_idempotency_key IS NOT NULL`, which makes
    database: exactly one root/version-1 commits per (user, key); the loser
    converges as a deduplicated read or a stable `idempotency_conflict`.
    Null keys stay non-unique and different users never collide.
+9. `db/migrations/009_supplement_create_idem_reconciliation.sql` — additive,
+   forward-safe remediation for 008 (which is pushed and immutable): a
+   001–007 database carrying pre-008 race duplicates cannot build 008's
+   index. 009 first reconciles every duplicate non-null `(user_id,
+version = 1, revision_idempotency_key)` group deterministically — the
+   oldest `created_at` version-1 row wins (ties broken by lowest
+   `product_id`) and keeps the key; each losing version-1 row's key is set
+   to NULL while its product root, version row, and all child label facts
+   stay fully readable — and appends one row per decision to
+   `supplement_create_idem_reconciliation_audit` (migration, user, original
+   key, winner/loser product+version, decision, reason, timestamp;
+   idempotent via a unique constraint, never duplicated on rerun). Only
+   then does it create the same index `IF NOT EXISTS`. A database stuck at
+   008's `could not create unique index` failure reaches head by applying
+   009 and then re-applying 008, which succeeds as a no-op.
 
 For a new database:
 
@@ -245,9 +260,10 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/005_calculation_correct
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/006_meal_reuse_and_supplements.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/007_ownership_lineage_integrity.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/008_supplement_create_idempotency.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/009_supplement_create_idem_reconciliation.sql
 ```
 
-`004`, `005`, `006`, `007`, and `008` are additive and rerunnable. `002` is forward-only and
+`004`, `005`, `006`, `007`, `008`, and `009` are additive and rerunnable. `002` is forward-only and
 irreversible because of the legacy reset. The disposable integration database
 is selected explicitly; do not treat skipped PostgreSQL tests as a pass:
 

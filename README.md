@@ -136,6 +136,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/005_calculation_correct
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/006_meal_reuse_and_supplements.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/007_ownership_lineage_integrity.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/008_supplement_create_idempotency.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/009_supplement_create_idem_reconciliation.sql
 ```
 
 Migration `002_food_tracking.sql` is **destructive**: it deletes the legacy
@@ -143,13 +144,20 @@ Migration `002_food_tracking.sql` is **destructive**: it deletes the legacy
 food-tracking schema. Export any data you need before applying it. Migration
 `002` is safe to rerun after a complete or interrupted run, but it is not a
 backfill and there is no rollback for the legacy meal reset. Migrations `003`
-through `008` are additive and safe to rerun: `006` adds the meal-reuse lineage
+through `009` are additive and safe to rerun: `006` adds the meal-reuse lineage
 and supplement/sports-nutrition catalogue substrate (schema only — no MCP tools
 for those tables yet), `007` adds the database-enforced ownership/lineage
-integrity constraints on top of it, and `008` adds the partial unique index
+integrity constraints on top of it, `008` adds the partial unique index
 that serializes concurrent first-time product creates per (user, idempotency
-key). A clean setup must apply all migrations
-through `008`; stopping at `005` leaves the reuse/supplement tables absent.
+key), and `009` deterministically reconciles any pre-`008` race duplicates
+(oldest version-1 row keeps the key, losers release it to NULL with all
+product and label data preserved, one append-only audit row per decision)
+before creating that same index `IF NOT EXISTS`. If `008` fails on an older
+database with `could not create unique index "uniq_spv_user_create_idem"`,
+that database carries pre-`008` duplicates: apply `009` (it reconciles and
+creates the index), then re-apply `008`, which succeeds as a no-op. A clean
+setup must apply all migrations
+through `009`; stopping at `005` leaves the reuse/supplement tables absent.
 
 ### 2. Environment variables
 
