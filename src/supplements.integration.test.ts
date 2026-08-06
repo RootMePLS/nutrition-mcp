@@ -14,10 +14,13 @@ import {
     listSupplementProducts,
     searchSupplementProducts,
     createSupplementRegimen,
+    listSupplementRegimens,
+    setSupplementRegimenActive,
     SupplementIdempotencyConflictError,
     SupplementProductInactiveError,
     SupplementProductNotFoundError,
     SupplementProductVersionNotFoundError,
+    SupplementRegimenNotFoundError,
     SupplementValidationError,
     type CreateSupplementProductCommand,
     type CreateSupplementRegimenCommand,
@@ -1309,6 +1312,249 @@ describeDb(
             expect(await sliceFiveWriteTableCounts(pool)).toEqual(
                 ZERO_SLICE_FIVE_WRITES,
             );
+        });
+    },
+);
+
+describeDb(
+    "supplement regimen repository: list + active-state (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await pool.end();
+        });
+
+        beforeEach(async () => {
+            await resetSchema(pool);
+        });
+
+        async function seedProduct(
+            overrides: Record<string, unknown> = {},
+        ): Promise<string> {
+            const result = await createSupplementProduct(
+                pool,
+                validCreateCommand({
+                    idempotency_key: `product:${crypto.randomUUID()}`,
+                    ...overrides,
+                }),
+            );
+            return result.product.product_id;
+        }
+
+        async function seedRegimen(
+            productId: string,
+            overrides: Record<string, unknown> = {},
+        ) {
+            const result = await createSupplementRegimen(
+                pool,
+                validRegimenCommand(productId, overrides),
+            );
+            return result.regimen;
+        }
+
+        test("list is user-scoped, excludes inactive by default, filters by product, newest-first", async () => {
+            const productA = await seedProduct();
+            const productB = await seedProduct();
+            const first = await seedRegimen(productA);
+            const second = await seedRegimen(productB);
+            const third = await seedRegimen(productA);
+            await setSupplementRegimenActive(
+                pool,
+                "u1",
+                second.regimen_id,
+                false,
+            );
+
+            const visible = await listSupplementRegimens(pool, "u1");
+            expect(visible.map((r) => r.regimen_id)).toEqual([
+                third.regimen_id,
+                first.regimen_id,
+            ]);
+
+            const all = await listSupplementRegimens(pool, "u1", {
+                includeInactive: true,
+            });
+            expect(all.map((r) => r.regimen_id)).toEqual([
+                third.regimen_id,
+                second.regimen_id,
+                first.regimen_id,
+            ]);
+            expect(all[1]!.active).toBe(false);
+
+            const forA = await listSupplementRegimens(pool, "u1", {
+                includeInactive: true,
+                productId: productA,
+            });
+            expect(forA.map((r) => r.regimen_id)).toEqual([
+                third.regimen_id,
+                first.regimen_id,
+            ]);
+
+            // u2 sees nothing of u1's regimens.
+            expect(
+                await listSupplementRegimens(pool, "u2", {
+                    includeInactive: true,
+                }),
+            ).toEqual([]);
+
+            // The limit is honored.
+            expect(
+                (
+                    await listSupplementRegimens(pool, "u1", {
+                        includeInactive: true,
+                        limit: 2,
+                    })
+                ).length,
+            ).toBe(2);
+        });
+
+        test("deactivate stamps deactivated_at/updated_at; a matching state is a no-op readback", async () => {
+            const productId = await seedProduct();
+            const regimen = await seedRegimen(productId);
+
+            const deactivated = await setSupplementRegimenActive(
+                pool,
+                "u1",
+                regimen.regimen_id,
+                false,
+            );
+            expect(deactivated.changed).toBe(true);
+            expect(deactivated.regimen.active).toBe(false);
+            expect(deactivated.regimen.deactivated_at).not.toBeNull();
+            expect(deactivated.regimen.updated_at >= regimen.updated_at).toBe(
+                true,
+            );
+
+            // Repeating the same state is idempotent: nothing is rewritten.
+            const repeat = await setSupplementRegimenActive(
+                pool,
+                "u1",
+                regimen.regimen_id,
+                false,
+            );
+            expect(repeat.changed).toBe(false);
+            expect(repeat.regimen.deactivated_at).toBe(
+                deactivated.regimen.deactivated_at,
+            );
+            expect(repeat.regimen.updated_at).toBe(
+                deactivated.regimen.updated_at,
+            );
+
+            // Reactivate clears deactivated_at.
+            const reactivated = await setSupplementRegimenActive(
+                pool,
+                "u1",
+                regimen.regimen_id,
+                true,
+            );
+            expect(reactivated.changed).toBe(true);
+            expect(reactivated.regimen.active).toBe(true);
+            expect(reactivated.regimen.deactivated_at).toBeNull();
+
+            const repeatActive = await setSupplementRegimenActive(
+                pool,
+                "u1",
+                regimen.regimen_id,
+                true,
+            );
+            expect(repeatActive.changed).toBe(false);
+        });
+
+        test("reactivation fails closed when the bound product is deleted; deactivation stays allowed", async () => {
+            const productId = await seedProduct();
+            const regimen = await seedRegimen(productId);
+            await setSupplementRegimenActive(
+                pool,
+                "u1",
+                regimen.regimen_id,
+                false,
+            );
+
+            await pool.query(
+                `UPDATE supplement_products SET status = 'deleted' WHERE id = $1`,
+                [productId],
+            );
+
+            await expect(
+                setSupplementRegimenActive(
+                    pool,
+                    "u1",
+                    regimen.regimen_id,
+                    true,
+                ),
+            ).rejects.toBeInstanceOf(SupplementProductNotFoundError);
+
+            // Deactivation of an already-inactive regimen is still a clean
+            // no-op even with a deleted product.
+            const stillInactive = await setSupplementRegimenActive(
+                pool,
+                "u1",
+                regimen.regimen_id,
+                false,
+            );
+            expect(stillInactive.changed).toBe(false);
+        });
+
+        test("unknown and cross-user regimens fail closed as not found", async () => {
+            const productId = await seedProduct();
+            const regimen = await seedRegimen(productId);
+
+            await expect(
+                setSupplementRegimenActive(
+                    pool,
+                    "u1",
+                    crypto.randomUUID(),
+                    false,
+                ),
+            ).rejects.toBeInstanceOf(SupplementRegimenNotFoundError);
+            await expect(
+                setSupplementRegimenActive(
+                    pool,
+                    "u2",
+                    regimen.regimen_id,
+                    false,
+                ),
+            ).rejects.toBeInstanceOf(SupplementRegimenNotFoundError);
+
+            // The failed attempts changed nothing.
+            const after = await listSupplementRegimens(pool, "u1");
+            expect(after[0]!.active).toBe(true);
+        });
+
+        test("a later label revision never moves the regimen's bound version or display name", async () => {
+            const productId = await seedProduct();
+            const regimen = await seedRegimen(productId);
+            expect(regimen.product_display_name).toBe("Impact Whey Protein");
+
+            await reviseSupplementProductLabel(pool, {
+                user_id: "u1",
+                product_id: productId,
+                display_name: "Impact Whey Protein (new formula)",
+                short_name: "Whey",
+                brand: "MyProtein",
+                form: "powder",
+                serving_amount: 32,
+                serving_unit: "g",
+                serving_description: "1 heaped scoop",
+                aliases: ["impact whey"],
+                nutrients: [
+                    { nutrient_key: "calories", amount: 128, unit: "kcal" },
+                    { nutrient_key: "protein_g", amount: 23, unit: "g" },
+                ],
+                label_evidence: { kind: "label_photo", verified_by: "user" },
+                label_source_kind: "user_verified_label",
+                revision_idempotency_key: `revise:${crypto.randomUUID()}`,
+                created_by: "test",
+            });
+
+            const listed = await listSupplementRegimens(pool, "u1");
+            expect(listed[0]!.product_version).toBe(1);
+            expect(listed[0]!.product_display_name).toBe("Impact Whey Protein");
         });
     },
 );

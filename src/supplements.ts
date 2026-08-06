@@ -1324,3 +1324,94 @@ export async function createSupplementRegimen(
         }
     }
 }
+
+export async function listSupplementRegimens(
+    pool: Queryable,
+    userId: string,
+    options: {
+        includeInactive?: boolean;
+        productId?: string;
+        limit?: number;
+    } = {},
+): Promise<SupplementRegimenReadback[]> {
+    const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
+    const params: unknown[] = [userId];
+    let where = "WHERE user_id = $1";
+    if (!options.includeInactive) {
+        where += " AND active";
+    }
+    if (options.productId !== undefined) {
+        params.push(options.productId);
+        where += ` AND product_id = $${params.length}`;
+    }
+    params.push(limit);
+    const { rows } = await pool.query(
+        `${REGIMEN_SELECT} ${where}
+         ORDER BY created_at DESC, id DESC
+         LIMIT $${params.length}`,
+        params,
+    );
+    const readbacks: SupplementRegimenReadback[] = [];
+    for (const row of rows as RegimenRow[]) {
+        readbacks.push(await assembleRegimenReadback(pool, row));
+    }
+    return readbacks;
+}
+
+export async function setSupplementRegimenActive(
+    pool: Pool,
+    userId: string,
+    regimenId: string,
+    active: boolean,
+): Promise<{ regimen: SupplementRegimenReadback; changed: boolean }> {
+    return withTransaction(pool, async (client) => {
+        // Lock the regimen row (user-scoped) so concurrent state flips
+        // serialize here.
+        const { rows } = await client.query(
+            `${REGIMEN_SELECT} WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+            [regimenId, userId],
+        );
+        const row = rows[0] as RegimenRow | undefined;
+        if (!row) {
+            // Unknown id or another user's regimen: identical closed failure.
+            throw new SupplementRegimenNotFoundError();
+        }
+        if (row.active === active) {
+            // Idempotent no-op: no timestamp is rewritten.
+            return {
+                regimen: await assembleRegimenReadback(client, row),
+                changed: false,
+            };
+        }
+        if (active) {
+            // Reactivation requires the bound product to still be active.
+            const { rows: productRows } = await client.query(
+                `SELECT status FROM supplement_products
+                 WHERE id = $1 AND user_id = $2`,
+                [row.product_id, userId],
+            );
+            const product = productRows[0] as { status: string } | undefined;
+            if (!product || product.status !== "active") {
+                throw new SupplementProductNotFoundError();
+            }
+        }
+        const { rows: updated } = await client.query(
+            `UPDATE supplement_regimens
+             SET active = $2,
+                 deactivated_at = CASE WHEN $2 THEN NULL ELSE now() END,
+                 updated_at = now()
+             WHERE id = $1
+             RETURNING id`,
+            [regimenId, active],
+        );
+        const updatedRow = await readRegimenRow(
+            client,
+            (updated[0] as { id: string }).id,
+        );
+        if (!updatedRow) throw new Error("failed to read updated regimen");
+        return {
+            regimen: await assembleRegimenReadback(client, updatedRow),
+            changed: true,
+        };
+    });
+}
