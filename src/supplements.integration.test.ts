@@ -2259,18 +2259,16 @@ describeDb(
             ).toBe(0);
         });
 
-        test("sports_nutrition and supplement done intakes create zero meal roots and zero links", async () => {
-            const sportsId = await seedProduct();
+        test("supplement-category done intake creates zero meal events and zero links", async () => {
             const supplementId = await seedProduct({
                 category: "supplement",
                 display_name: "Creatine",
                 aliases: ["creatine"],
             });
 
-            await logSupplementIntake(pool, validIntakeCommand(sportsId));
             await logSupplementIntake(pool, validIntakeCommand(supplementId));
 
-            expect(await tableCount(pool, "supplement_intake_events")).toBe(2);
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(1);
             expect(await tableCount(pool, "meal_events")).toBe(0);
             expect(await tableCount(pool, "meal_event_versions")).toBe(0);
             expect(await tableCount(pool, "meal_event_items")).toBe(0);
@@ -2851,6 +2849,445 @@ describeDb(
                     to_date: "2026-08-03",
                 }),
             ).rejects.toBeInstanceOf(SupplementRegimenNotFoundError);
+        });
+    },
+);
+
+describeDb(
+    "supplement snack meal-event linkage (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await pool.end();
+        });
+
+        beforeEach(async () => {
+            await resetSchema(pool);
+        });
+
+        async function seedProduct(
+            overrides: Record<string, unknown> = {},
+        ): Promise<string> {
+            const result = await createSupplementProduct(
+                pool,
+                validCreateCommand({
+                    idempotency_key: `product:${crypto.randomUUID()}`,
+                    ...overrides,
+                }),
+            );
+            return result.product.product_id;
+        }
+
+        async function seedRegimen(
+            productId: string,
+            overrides: Record<string, unknown> = {},
+        ) {
+            const result = await createSupplementRegimen(
+                pool,
+                validRegimenCommand(productId, overrides),
+            );
+            return result.regimen;
+        }
+
+        async function mealEventCounts() {
+            return {
+                events: await tableCount(pool, "meal_events"),
+                versions: await tableCount(pool, "meal_event_versions"),
+                items: await tableCount(pool, "meal_event_items"),
+                nutritionResults: await tableCount(
+                    pool,
+                    "meal_event_nutrition_results",
+                ),
+                canonicalResults: await tableCount(
+                    pool,
+                    "meal_event_canonical_results",
+                ),
+                links: await tableCount(pool, "supplement_intake_meal_links"),
+            };
+        }
+
+        test("done sports_nutrition intake creates a snack event with version-pinned label nutrients including zero", async () => {
+            // Create a sports_nutrition product with explicit-zero fat_g,
+            // non-zero calories/protein_g, and a non-food-compatible key.
+            const productId = await seedProduct({
+                // Override nutrients for 2-serving scaled math.
+                nutrients: [
+                    {
+                        nutrient_key: "calories",
+                        display_name: "Energy",
+                        amount: 120,
+                        unit: "kcal",
+                        source_evidence: { label_line: "per serving" },
+                    },
+                    {
+                        nutrient_key: "protein_g",
+                        amount: 21,
+                        unit: "g",
+                    },
+                    // Explicit numeric zero.
+                    {
+                        nutrient_key: "fat_g",
+                        amount: 0,
+                        unit: "g",
+                    },
+                    // Non-food-compatible; must not propagate to meal rows.
+                    {
+                        nutrient_key: "vitamin_d",
+                        display_name: "Vitamin D",
+                        amount: 5,
+                        unit: "µg",
+                    },
+                ],
+            });
+
+            const result = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, { servings: 2 }),
+            );
+            expect(result.snack_event_id).toBeString();
+            expect(result.snack_version).toBe(1);
+
+            // The snack event and link exist.
+            const counts = await mealEventCounts();
+            expect(counts.events).toBe(1);
+            expect(counts.versions).toBe(1);
+            expect(counts.items).toBe(1);
+            expect(counts.nutritionResults).toBe(1);
+            expect(counts.canonicalResults).toBe(1);
+            expect(counts.links).toBe(1);
+
+            // Verify the link row.
+            const { rows: linkRows } = await pool.query(
+                `SELECT intake_id, event_id, version, product_id, product_version
+                     FROM supplement_intake_meal_links`,
+            );
+            expect(linkRows).toHaveLength(1);
+            const link = linkRows[0] as {
+                intake_id: string;
+                event_id: string;
+                version: number;
+                product_id: string;
+                product_version: number;
+            };
+            expect(link.intake_id).toBe(result.intake.intake_id);
+            expect(link.event_id).toBe(result.snack_event_id!);
+            expect(link.version).toBe(1);
+            expect(link.product_id).toBe(productId);
+            expect(link.product_version).toBe(1);
+
+            // Verify the nutrition result has the correct scaled values.
+            const { rows: nutRows } = await pool.query(
+                `SELECT nutrient_key, amount::numeric
+                     FROM meal_event_nutrition_results
+                     WHERE event_id = $1 AND version = $2 AND provider = 'own'
+                     ORDER BY nutrient_key`,
+                [link.event_id, link.version],
+            );
+            const nutrients = Object.fromEntries(
+                (
+                    nutRows as Array<{
+                        nutrient_key: string;
+                        amount: number;
+                    }>
+                ).map((r) => [r.nutrient_key, Number(r.amount)]),
+            );
+            expect(nutrients.calories).toBe(240);
+            expect(nutrients.protein_g).toBe(42);
+            expect(nutrients.fat_g).toBe(0);
+            expect(nutrients.vitamin_d).toBeUndefined();
+
+            // Verify the canonical results match.
+            const { rows: canRows } = await pool.query(
+                `SELECT nutrient_key, amount::numeric
+                     FROM meal_event_canonical_results
+                     WHERE event_id = $1 AND version = $2
+                     ORDER BY nutrient_key`,
+                [link.event_id, link.version],
+            );
+            expect(canRows).toHaveLength(3);
+            const canonicals = Object.fromEntries(
+                (
+                    canRows as Array<{
+                        nutrient_key: string;
+                        amount: number;
+                    }>
+                ).map((r) => [r.nutrient_key, Number(r.amount)]),
+            );
+            expect(canonicals.calories).toBe(240);
+            expect(canonicals.protein_g).toBe(42);
+            expect(canonicals.fat_g).toBe(0);
+            expect(canonicals.vitamin_d).toBeUndefined();
+
+            // The snack item references the product display name.
+            const { rows: itemRows } = await pool.query(
+                `SELECT raw_item_text FROM meal_event_items
+                     WHERE event_id = $1 AND version = $2`,
+                [link.event_id, link.version],
+            );
+            expect(itemRows).toHaveLength(1);
+            const itemText = (itemRows[0] as { raw_item_text: string })
+                .raw_item_text;
+            expect(itemText).toContain("Impact Whey Protein");
+        });
+
+        test("snack event uses 'own' single provider with label-specific provenance — no provider rerun", async () => {
+            const productId = await seedProduct();
+            const result = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId),
+            );
+
+            // Re-read the snack event's provider result.
+            const { rows: prvRows } = await pool.query(
+                `SELECT provider, status, source_id, algorithm_version,
+                            request_fingerprint
+                     FROM meal_event_nutrition_results
+                     WHERE event_id = $1 AND version = $2`,
+                [result.snack_event_id, result.snack_version],
+            );
+            expect(prvRows).toHaveLength(1);
+            const prv = prvRows[0] as {
+                provider: string;
+                status: string;
+                source_id: string;
+                algorithm_version: string;
+                request_fingerprint: string;
+            };
+            expect(prv.provider).toBe("own");
+            expect(prv.status).toBe("succeeded");
+            expect(prv.source_id).toStartWith("suppl-snack:");
+            expect(prv.algorithm_version).toBe("label-compat-v1");
+            expect(prv.request_fingerprint).toStartWith("suppl-snack:");
+
+            // Verify the snack event provenance status.
+            const { rows: evRows } = await pool.query(
+                `SELECT provenance_data FROM meal_event_versions
+                     WHERE event_id = $1 AND version = $2`,
+                [result.snack_event_id, result.snack_version],
+            );
+            const ev = evRows[0] as { provenance_data: unknown };
+            const prov = ev.provenance_data as Record<string, unknown>;
+            expect(prov).toMatchObject({
+                provenance_status: "compatibility",
+            });
+
+            // No external provider result sets exist for this event.
+            const otherProviders = ["myfitnesspal", "nutrition-local"];
+            for (const p of otherProviders) {
+                const { rows: other } = await pool.query(
+                    `SELECT count(*)::int AS n
+                         FROM meal_event_nutrition_results
+                         WHERE event_id = $1 AND version = $2
+                           AND provider = $3`,
+                    [result.snack_event_id, result.snack_version, p],
+                );
+                expect(other[0]!.n).toBe(0);
+            }
+        });
+
+        test("non-caloric (supplement) done intake creates no snack event and no link", async () => {
+            const supplementId = await seedProduct({
+                category: "supplement",
+                display_name: "Creatine",
+                aliases: ["creatine"],
+            });
+
+            const result = await logSupplementIntake(
+                pool,
+                validIntakeCommand(supplementId),
+            );
+            expect(result.snack_event_id).toBeUndefined();
+            expect(result.snack_version).toBeUndefined();
+
+            const counts = await mealEventCounts();
+            expect(counts.events).toBe(0);
+            expect(counts.versions).toBe(0);
+            expect(counts.items).toBe(0);
+            expect(counts.nutritionResults).toBe(0);
+            expect(counts.canonicalResults).toBe(0);
+            expect(counts.links).toBe(0);
+
+            // The intake and its snapshots still persisted.
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(1);
+            expect(
+                await tableCount(pool, "supplement_intake_nutrient_snapshots"),
+            ).toBe(4);
+        });
+
+        test("missed and cleared sports_nutrition intakes create no snack event", async () => {
+            const productId = await seedProduct();
+
+            await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, {
+                    state_action: "missed",
+                    idempotency_key: "intake:missed",
+                }),
+            );
+            let counts = await mealEventCounts();
+            expect(counts.events).toBe(0);
+            expect(counts.links).toBe(0);
+
+            await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, {
+                    state_action: "cleared",
+                    idempotency_key: "intake:cleared",
+                }),
+            );
+            counts = await mealEventCounts();
+            expect(counts.events).toBe(0);
+            expect(counts.links).toBe(0);
+        });
+
+        test("retrying the same idempotency_key returns existing result AND the same snack event", async () => {
+            const productId = await seedProduct();
+            const idempotencyKey = "intake:retry";
+
+            const first = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, {
+                    idempotency_key: idempotencyKey,
+                }),
+            );
+            expect(first.snack_event_id).toBeString();
+            expect(first.snack_version).toBe(1);
+
+            const replay = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, {
+                    idempotency_key: idempotencyKey,
+                }),
+            );
+            expect(replay.deduplicated).toBe(true);
+            expect(replay.snack_event_id).toBe(first.snack_event_id);
+            expect(replay.snack_version).toBe(first.snack_version);
+
+            const counts = await mealEventCounts();
+            expect(counts.events).toBe(1);
+            expect(counts.links).toBe(1);
+        });
+
+        test("two concurrent same-key same-identity logs converge on one fact and one snack event", async () => {
+            const productId = await seedProduct();
+            const command = validIntakeCommand(productId, {
+                idempotency_key: "intake:race",
+            });
+
+            const results = await Promise.all([
+                logSupplementIntake(pool, command),
+                logSupplementIntake(pool, command),
+            ]);
+            expect(results[0]!.intake.intake_id).toBe(
+                results[1]!.intake.intake_id,
+            );
+            expect(results[0]!.snack_event_id).toBe(results[1]!.snack_event_id);
+            expect(results.filter((r) => r.deduplicated).length).toBe(1);
+
+            const counts = await mealEventCounts();
+            expect(counts.events).toBe(1);
+            expect(counts.links).toBe(1);
+        });
+
+        test("injected rollback after event+link insertion rolls back everything", async () => {
+            const productId = await seedProduct();
+
+            await expect(
+                logSupplementIntake(pool, validIntakeCommand(productId), {
+                    beforeCommit: () =>
+                        Promise.reject(new Error("injected rollback")),
+                }),
+            ).rejects.toThrow("injected rollback");
+
+            // All supplement and meal tables are clean.
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(0);
+            expect(
+                await tableCount(pool, "supplement_intake_nutrient_snapshots"),
+            ).toBe(0);
+            const counts = await mealEventCounts();
+            expect(counts.events).toBe(0);
+            expect(counts.versions).toBe(0);
+            expect(counts.items).toBe(0);
+            expect(counts.nutritionResults).toBe(0);
+            expect(counts.canonicalResults).toBe(0);
+            expect(counts.links).toBe(0);
+
+            // The product catalogue rows are untouched.
+            expect(await tableCount(pool, "supplement_products")).toBe(1);
+            expect(await tableCount(pool, "supplement_product_versions")).toBe(
+                1,
+            );
+        });
+
+        test("deleted product and inactive regimen block snack event creation", async () => {
+            // Deleted product.
+            const productId = await seedProduct();
+            await pool.query(
+                `UPDATE supplement_products SET status = 'deleted' WHERE id = $1`,
+                [productId],
+            );
+
+            await expect(
+                logSupplementIntake(pool, validIntakeCommand(productId)),
+            ).rejects.toBeInstanceOf(SupplementProductNotFoundError);
+
+            let counts = await mealEventCounts();
+            expect(counts.events).toBe(0);
+            expect(counts.links).toBe(0);
+
+            // Inactive regimen (active product still works).
+            const activeProductId = await seedProduct();
+            const regimen = await seedRegimen(activeProductId);
+            await setSupplementRegimenActive(
+                pool,
+                "u1",
+                regimen.regimen_id,
+                false,
+            );
+
+            await expect(
+                logSupplementIntake(
+                    pool,
+                    validIntakeCommand(activeProductId, {
+                        product_id: null,
+                        regimen_id: regimen.regimen_id,
+                    }),
+                ),
+            ).rejects.toBeInstanceOf(SupplementRegimenInactiveError);
+
+            counts = await mealEventCounts();
+            expect(counts.events).toBe(0);
+            expect(counts.links).toBe(0);
+        });
+
+        test("cross-user intake finds no product and writes zero rows including any meal tables", async () => {
+            const productId = await seedProduct();
+
+            await expect(
+                logSupplementIntake(
+                    pool,
+                    validIntakeCommand(productId, {
+                        user_id: "u2",
+                        product_id: productId,
+                        alias: null,
+                        regimen_id: null,
+                    }),
+                ),
+            ).rejects.toBeInstanceOf(SupplementProductNotFoundError);
+
+            // Zero rows across all supplement and meal tables.
+            expect(await tableCount(pool, "supplement_intake_events")).toBe(0);
+            expect(
+                await tableCount(pool, "supplement_intake_nutrient_snapshots"),
+            ).toBe(0);
+            const counts = await mealEventCounts();
+            expect(counts.events).toBe(0);
+            expect(counts.links).toBe(0);
         });
     },
 );
