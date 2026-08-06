@@ -60,7 +60,16 @@ function bundleProvider(
     provider: "nutrition-local" | "own" | "myfitnesspal",
     sourceId: string,
     calories: number,
+    // Slice 7: optional full nutrient override so canonical rows can carry
+    // explicit zeros and absent (NULL) fields instead of the default set.
+    nutrientsOverride?: Record<string, number | null>,
 ): ProviderCalculationResult {
+    const nutrients = nutrientsOverride ?? {
+        calories,
+        protein_g: 20,
+        carbs_g: 60,
+        fat_g: 15,
+    };
     return {
         provider,
         status: "succeeded",
@@ -70,7 +79,7 @@ function bundleProvider(
         algorithm_version: "v1",
         basis: "per_meal",
         units: "g_and_kcal",
-        nutrients: { calories, protein_g: 20, carbs_g: 60, fat_g: 15 },
+        nutrients,
         raw_payload: { provider, source_id: sourceId, calories },
         provenance: { provider, retrieved_at: "2026-08-05T12:00:00Z" },
     };
@@ -83,6 +92,7 @@ function bundleProvider(
 export function readyBundle(
     eventId: string,
     version: number,
+    nutrientsOverride?: Record<string, number | null>,
 ): CalculationBundleInput {
     const input = {
         event_id: eventId,
@@ -96,9 +106,20 @@ export function readyBundle(
                 "nutrition-local",
                 `local-${eventId.slice(0, 8)}`,
                 500,
+                nutrientsOverride,
             ),
-            bundleProvider("own", `own-${eventId.slice(0, 8)}`, 500),
-            bundleProvider("myfitnesspal", `mfp-${eventId.slice(0, 8)}`, 500),
+            bundleProvider(
+                "own",
+                `own-${eventId.slice(0, 8)}`,
+                500,
+                nutrientsOverride,
+            ),
+            bundleProvider(
+                "myfitnesspal",
+                `mfp-${eventId.slice(0, 8)}`,
+                500,
+                nutrientsOverride,
+            ),
         ],
     };
     return { ...input, fingerprint: stableBundleFingerprint(input) };

@@ -18,6 +18,7 @@ import {
     setSupplementRegimenActive,
     resolveSupplementProduct,
     logSupplementIntake,
+    getSupplementDataFlags,
     getSupplementIntakes,
     getSupplementNutritionSummary,
     getSupplementRegimenStatus,
@@ -33,6 +34,12 @@ import {
     type CreateSupplementRegimenCommand,
     type LogSupplementIntakeCommand,
 } from "./supplements.js";
+import {
+    commitBundle,
+    deleteMealEvent,
+    readyBundle,
+    seedMealEvent,
+} from "./meal-reuse.fixtures.js";
 
 // ---------------------------------------------------------------------------
 // Slice 2 repository gate: versioned, user-scoped supplement product
@@ -3431,6 +3438,61 @@ describeDb("supplement nutrition summary (requires DATABASE_URL_TEST)", () => {
         return counts;
     }
 
+    async function seedProduct(
+        overrides: Record<string, unknown> = {},
+    ): Promise<string> {
+        const result = await createSupplementProduct(
+            pool,
+            validCreateCommand({
+                idempotency_key: `product:${crypto.randomUUID()}`,
+                ...overrides,
+            }),
+        );
+        return result.product.product_id;
+    }
+
+    async function log(
+        productId: string,
+        overrides: Record<string, unknown> = {},
+    ) {
+        const result = await logSupplementIntake(
+            pool,
+            validIntakeCommand(productId, overrides),
+        );
+        return result.intake;
+    }
+
+    async function seedFood(
+        userId: string,
+        keySuffix: string,
+        consumedAt: string,
+        nutrients: Record<string, number | null>,
+    ): Promise<string> {
+        const eventId = await seedMealEvent(pool, userId, {
+            idempotencyKey: `sum-food-${keySuffix}`,
+            consumedAt,
+            items: [
+                {
+                    ordinal: 0,
+                    raw_item_text: `seeded food ${keySuffix}`,
+                    normalized_name: `seeded food ${keySuffix}`,
+                },
+            ],
+        });
+        await commitBundle(
+            pool,
+            userId,
+            readyBundle(eventId, 1, nutrients),
+        );
+        return eventId;
+    }
+
+    const UTC_WINDOW = {
+        from_date: "2026-08-03",
+        to_date: "2026-08-03",
+        timezone: "UTC",
+    };
+
     test("summary window rules: junk dates, inverted range, >92 days, and invalid timezone are rejected with zero reads/writes", async () => {
         const before = await domainCounts();
         const badPayloads = [
@@ -3461,6 +3523,519 @@ describeDb("supplement nutrition summary (requires DATABASE_URL_TEST)", () => {
                 getSupplementNutritionSummary(pool, "u1", payload),
             ).rejects.toBeInstanceOf(SupplementValidationError);
         }
+        expect(await domainCounts()).toEqual(before);
+    });
+
+    test("separates food, supplement, and combined totals by exact nutrient key + unit", async () => {
+        await seedFood("u1", "case1", "2026-08-03T12:00:00.000Z", {
+            calories: 500,
+            protein_g: 30,
+        });
+        const productId = await seedProduct({
+            category: "supplement",
+            nutrients: [
+                { nutrient_key: "calories", amount: 120, unit: "kcal" },
+                { nutrient_key: "protein_g", amount: 21, unit: "g" },
+                { nutrient_key: "vitamin_d", amount: 5, unit: "µg" },
+            ],
+        });
+        await log(productId, { occurred_at: "2026-08-03T13:00:00.000Z" });
+
+        const summary = await getSupplementNutritionSummary(
+            pool,
+            "u1",
+            UTC_WINDOW,
+        );
+        expect(summary.from_date).toBe("2026-08-03");
+        expect(summary.to_date).toBe("2026-08-03");
+        expect(summary.timezone).toBe("UTC");
+        expect(summary.food.meal_event_count).toBe(1);
+        expect(summary.food.linked_snack_event_count_excluded).toBe(0);
+        expect(summary.food.nutrients).toEqual([
+            {
+                nutrient_key: "calories",
+                unit: "kcal",
+                amount: 500,
+                events_with_value: 1,
+            },
+            {
+                nutrient_key: "protein_g",
+                unit: "g",
+                amount: 30,
+                events_with_value: 1,
+            },
+        ]);
+        expect(summary.supplements).toEqual({
+            intake_fact_count_in_range: 1,
+            effective_done_intake_count: 1,
+            excluded_by_correction_count: 0,
+            nutrients: [
+                {
+                    nutrient_key: "calories",
+                    unit: "kcal",
+                    amount: 240,
+                    intakes_with_value: 1,
+                },
+                {
+                    nutrient_key: "protein_g",
+                    unit: "g",
+                    amount: 42,
+                    intakes_with_value: 1,
+                },
+                {
+                    nutrient_key: "vitamin_d",
+                    unit: "µg",
+                    amount: 10,
+                    intakes_with_value: 1,
+                },
+            ],
+        });
+        expect(summary.combined).toEqual([
+            {
+                nutrient_key: "calories",
+                unit: "kcal",
+                food_amount: 500,
+                supplement_amount: 240,
+                total: 740,
+            },
+            {
+                nutrient_key: "protein_g",
+                unit: "g",
+                food_amount: 30,
+                supplement_amount: 42,
+                total: 72,
+            },
+            {
+                nutrient_key: "vitamin_d",
+                unit: "µg",
+                food_amount: null,
+                supplement_amount: 10,
+                total: 10,
+            },
+        ]);
+    });
+
+    test("never combines the same key across different units", async () => {
+        const productMg = await seedProduct({
+            category: "supplement",
+            display_name: "VitC Tablets",
+            aliases: ["vitc-mg"],
+            nutrients: [{ nutrient_key: "vitamin_c", amount: 80, unit: "mg" }],
+        });
+        const productG = await seedProduct({
+            category: "supplement",
+            display_name: "VitC Powder",
+            aliases: ["vitc-g"],
+            nutrients: [{ nutrient_key: "vitamin_c", amount: 0.5, unit: "g" }],
+        });
+        await log(productMg, {
+            servings: 1,
+            occurred_at: "2026-08-03T10:00:00.000Z",
+        });
+        await log(productG, {
+            servings: 1,
+            occurred_at: "2026-08-03T11:00:00.000Z",
+        });
+
+        const summary = await getSupplementNutritionSummary(
+            pool,
+            "u1",
+            UTC_WINDOW,
+        );
+        expect(summary.food.nutrients).toEqual([]);
+        expect(summary.supplements.nutrients).toEqual([
+            {
+                nutrient_key: "vitamin_c",
+                unit: "g",
+                amount: 0.5,
+                intakes_with_value: 1,
+            },
+            {
+                nutrient_key: "vitamin_c",
+                unit: "mg",
+                amount: 80,
+                intakes_with_value: 1,
+            },
+        ]);
+        // Two distinct combined rows: no conversion, no merging across units.
+        expect(summary.combined).toEqual([
+            {
+                nutrient_key: "vitamin_c",
+                unit: "g",
+                food_amount: null,
+                supplement_amount: 0.5,
+                total: 0.5,
+            },
+            {
+                nutrient_key: "vitamin_c",
+                unit: "mg",
+                food_amount: null,
+                supplement_amount: 80,
+                total: 80,
+            },
+        ]);
+    });
+
+    test("explicit zero persists as 0 and absent stays absent", async () => {
+        // Default product nutrients carry fat_g: 0 (real label data).
+        const productId = await seedProduct({ category: "supplement" });
+        await log(productId, {
+            servings: 1,
+            occurred_at: "2026-08-03T10:00:00.000Z",
+        });
+        // Food bundle with fiber ABSENT (NULL canonical), calories present.
+        await seedFood("u1", "case3", "2026-08-03T12:00:00.000Z", {
+            calories: 300,
+        });
+
+        const summary = await getSupplementNutritionSummary(
+            pool,
+            "u1",
+            UTC_WINDOW,
+        );
+        const fat = summary.supplements.nutrients.find(
+            (n) => n.nutrient_key === "fat_g",
+        );
+        expect(fat).toEqual({
+            nutrient_key: "fat_g",
+            unit: "g",
+            amount: 0,
+            intakes_with_value: 1,
+        });
+        // NULL canonical fields contribute no row at all.
+        expect(summary.food.nutrients).toEqual([
+            {
+                nutrient_key: "calories",
+                unit: "kcal",
+                amount: 300,
+                events_with_value: 1,
+            },
+        ]);
+        expect(
+            summary.combined.find((r) => r.nutrient_key === "fiber_g"),
+        ).toBeUndefined();
+        const combinedFat = summary.combined.find(
+            (r) => r.nutrient_key === "fat_g",
+        )!;
+        expect(combinedFat).toEqual({
+            nutrient_key: "fat_g",
+            unit: "g",
+            food_amount: null,
+            supplement_amount: 0,
+            total: 0,
+        });
+    });
+
+    test("excludes supplement-linked snack events from the food side and discloses the count", async () => {
+        // sports_nutrition done intake creates a snack event carrying the
+        // same scaled label nutrients: counting both sides would double.
+        const productId = await seedProduct(); // sports_nutrition, calories 120 kcal
+        await log(productId, { occurred_at: "2026-08-03T13:00:00.000Z" }); // ×2 servings
+        await seedFood("u1", "case4", "2026-08-03T12:00:00.000Z", {
+            calories: 500,
+        });
+        expect(await tableCount(pool, "supplement_intake_meal_links")).toBe(1);
+        expect(await tableCount(pool, "meal_events")).toBe(2);
+
+        const summary = await getSupplementNutritionSummary(
+            pool,
+            "u1",
+            UTC_WINDOW,
+        );
+        expect(summary.food.meal_event_count).toBe(1);
+        expect(summary.food.linked_snack_event_count_excluded).toBe(1);
+        expect(summary.food.nutrients).toEqual([
+            {
+                nutrient_key: "calories",
+                unit: "kcal",
+                amount: 500,
+                events_with_value: 1,
+            },
+        ]);
+        const calories = summary.combined.find(
+            (r) => r.nutrient_key === "calories",
+        )!;
+        // Each side counted exactly once: 500 food + 240 supplement.
+        expect(calories).toEqual({
+            nutrient_key: "calories",
+            unit: "kcal",
+            food_amount: 500,
+            supplement_amount: 240,
+            total: 740,
+        });
+    });
+
+    test("buckets both sides by the explicit request timezone", async () => {
+        const productId = await seedProduct({
+            category: "supplement",
+            nutrients: [{ nutrient_key: "calories", amount: 100, unit: "kcal" }],
+        });
+        // A: 23:30 Los Angeles on 08-01 (06:30 UTC on 08-02).
+        await log(productId, {
+            servings: 1,
+            occurred_at: "2026-08-01T23:30:00-07:00",
+        });
+        // B: exactly at the LA day start instant of 08-01 (00:00 PDT).
+        await log(productId, {
+            servings: 1,
+            occurred_at: "2026-08-01T07:00:00.000Z",
+        });
+        // C: exactly at the LA NEXT day start instant (00:00 PDT on 08-02):
+        // the exclusive upper bound.
+        await log(productId, {
+            servings: 1,
+            occurred_at: "2026-08-02T07:00:00.000Z",
+        });
+        await seedFood("u1", "case5", "2026-08-01T23:30:00-07:00", {
+            calories: 50,
+        });
+
+        const laWindow = {
+            from_date: "2026-08-01",
+            to_date: "2026-08-01",
+            timezone: "America/Los_Angeles",
+        };
+        const la = await getSupplementNutritionSummary(pool, "u1", laWindow);
+        expect(la.food.meal_event_count).toBe(1);
+        expect(la.food.nutrients).toEqual([
+            {
+                nutrient_key: "calories",
+                unit: "kcal",
+                amount: 50,
+                events_with_value: 1,
+            },
+        ]);
+        // A and B in, C out (exclusive day-end boundary).
+        expect(la.supplements.intake_fact_count_in_range).toBe(2);
+        expect(la.supplements.effective_done_intake_count).toBe(2);
+        expect(la.supplements.nutrients).toEqual([
+            {
+                nutrient_key: "calories",
+                unit: "kcal",
+                amount: 200,
+                intakes_with_value: 2,
+            },
+        ]);
+
+        // The same local dates in UTC bucket differently: only B qualifies.
+        const utcWindow = {
+            from_date: "2026-08-01",
+            to_date: "2026-08-01",
+            timezone: "UTC",
+        };
+        const utc = await getSupplementNutritionSummary(pool, "u1", utcWindow);
+        expect(utc.food.meal_event_count).toBe(0);
+        expect(utc.supplements.intake_fact_count_in_range).toBe(1);
+        expect(utc.supplements.nutrients).toEqual([
+            {
+                nutrient_key: "calories",
+                unit: "kcal",
+                amount: 100,
+                intakes_with_value: 1,
+            },
+        ]);
+    });
+
+    test("applies the effective-done rule with disclosed counts", async () => {
+        const productId = await seedProduct({
+            category: "supplement",
+            nutrients: [{ nutrient_key: "calories", amount: 120, unit: "kcal" }],
+        });
+        const regimen = await createSupplementRegimen(
+            pool,
+            validRegimenCommand(productId, {
+                schedule: {
+                    timezone: "UTC",
+                    frequency: "daily",
+                    local_time: "08:00",
+                },
+                starts_on: "2026-08-01",
+                ends_on: null,
+            }),
+        );
+        const regimenId = regimen.regimen.regimen_id;
+        // Regimen-bound done then cleared: corrected away.
+        const regDone = await log(productId, {
+            product_id: null,
+            regimen_id: regimenId,
+            servings: 1,
+            occurred_at: "2026-08-03T08:00:00.000Z",
+        });
+        await log(productId, {
+            product_id: null,
+            regimen_id: regimenId,
+            servings: 1,
+            occurred_at: "2026-08-03T09:00:00.000Z",
+            state_action: "cleared",
+            supersedes_intake_id: regDone.intake_id,
+        });
+        // Ad-hoc done superseded by a cleared correction: corrected away.
+        const adhocDone = await log(productId, {
+            servings: 1,
+            occurred_at: "2026-08-04T08:00:00.000Z",
+        });
+        await log(productId, {
+            servings: 1,
+            occurred_at: "2026-08-04T09:00:00.000Z",
+            state_action: "cleared",
+            supersedes_intake_id: adhocDone.intake_id,
+        });
+        // One standing ad-hoc done fact.
+        await log(productId, {
+            servings: 1,
+            occurred_at: "2026-08-05T08:00:00.000Z",
+        });
+
+        const summary = await getSupplementNutritionSummary(pool, "u1", {
+            from_date: "2026-08-01",
+            to_date: "2026-08-07",
+            timezone: "UTC",
+        });
+        expect(summary.supplements.intake_fact_count_in_range).toBe(5);
+        expect(summary.supplements.effective_done_intake_count).toBe(1);
+        expect(summary.supplements.excluded_by_correction_count).toBe(2);
+        expect(summary.supplements.nutrients).toEqual([
+            {
+                nutrient_key: "calories",
+                unit: "kcal",
+                amount: 120,
+                intakes_with_value: 1,
+            },
+        ]);
+    });
+
+    test("is user-scoped: u2 data never leaks into u1 output", async () => {
+        const u1Product = await seedProduct({ category: "supplement" });
+        await log(u1Product, {
+            servings: 1,
+            occurred_at: "2026-08-03T10:00:00.000Z",
+        });
+        await seedFood("u1", "case7-u1", "2026-08-03T12:00:00.000Z", {
+            calories: 500,
+        });
+        const before = await getSupplementNutritionSummary(
+            pool,
+            "u1",
+            UTC_WINDOW,
+        );
+
+        // A parallel u2 corpus through the same real write paths.
+        const u2Product = await createSupplementProduct(
+            pool,
+            validCreateCommand({
+                user_id: "u2",
+                category: "supplement",
+                display_name: "U2 Creatine",
+                aliases: ["u2-creatine"],
+                nutrients: [
+                    { nutrient_key: "creatine", amount: 5, unit: "g" },
+                ],
+                idempotency_key: `product:${crypto.randomUUID()}`,
+            }),
+        );
+        await logSupplementIntake(
+            pool,
+            validIntakeCommand(u2Product.product.product_id, {
+                user_id: "u2",
+                servings: 1,
+                occurred_at: "2026-08-03T09:00:00.000Z",
+            }),
+        );
+        await seedFood("u2", "case7-u2", "2026-08-03T11:00:00.000Z", {
+            calories: 900,
+        });
+
+        // u1 output is byte-identical with the u2 corpus present.
+        expect(
+            await getSupplementNutritionSummary(pool, "u1", UTC_WINDOW),
+        ).toEqual(before);
+        // u2 sees only u2.
+        const u2 = await getSupplementNutritionSummary(
+            pool,
+            "u2",
+            UTC_WINDOW,
+        );
+        expect(u2.food.nutrients).toEqual([
+            {
+                nutrient_key: "calories",
+                unit: "kcal",
+                amount: 900,
+                events_with_value: 1,
+            },
+        ]);
+        expect(u2.supplements.nutrients).toEqual([
+            {
+                nutrient_key: "creatine",
+                unit: "g",
+                amount: 5,
+                intakes_with_value: 1,
+            },
+        ]);
+    });
+
+    test("deleted meal events and deleted products' future reads stay honest", async () => {
+        const deletedEvent = await seedFood(
+            "u1",
+            "case8-del",
+            "2026-08-03T10:00:00.000Z",
+            { calories: 700 },
+        );
+        await seedFood("u1", "case8-live", "2026-08-03T12:00:00.000Z", {
+            calories: 500,
+        });
+        await deleteMealEvent(pool, "u1", deletedEvent);
+
+        const productId = await seedProduct({ category: "supplement" });
+        await log(productId, {
+            servings: 1,
+            occurred_at: "2026-08-03T13:00:00.000Z",
+        });
+        // Product deleted AFTER the done intake: the recorded snapshots are
+        // history and still contribute.
+        await pool.query(
+            `UPDATE supplement_products SET status = 'deleted'
+             WHERE id = $1 AND user_id = 'u1'`,
+            [productId],
+        );
+
+        const summary = await getSupplementNutritionSummary(
+            pool,
+            "u1",
+            UTC_WINDOW,
+        );
+        expect(summary.food.meal_event_count).toBe(1);
+        expect(summary.food.nutrients).toEqual([
+            {
+                nutrient_key: "calories",
+                unit: "kcal",
+                amount: 500,
+                events_with_value: 1,
+            },
+        ]);
+        expect(summary.supplements.effective_done_intake_count).toBe(1);
+        const calories = summary.combined.find(
+            (r) => r.nutrient_key === "calories",
+        )!;
+        expect(calories.food_amount).toBe(500);
+        expect(calories.supplement_amount).toBe(120);
+        expect(calories.total).toBe(620);
+    });
+
+    test("summary reads write nothing", async () => {
+        const productId = await seedProduct();
+        await log(productId, { occurred_at: "2026-08-03T13:00:00.000Z" });
+        await seedFood("u1", "case9", "2026-08-03T12:00:00.000Z", {
+            calories: 500,
+        });
+        const before = await domainCounts();
+        await getSupplementNutritionSummary(pool, "u1", UTC_WINDOW);
+        await getSupplementNutritionSummary(pool, "u1", UTC_WINDOW);
+        await expect(
+            getSupplementNutritionSummary(pool, "u1", {
+                ...UTC_WINDOW,
+                timezone: "Not/AZone",
+            }),
+        ).rejects.toBeInstanceOf(SupplementValidationError);
         expect(await domainCounts()).toEqual(before);
     });
 });

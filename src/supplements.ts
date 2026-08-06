@@ -34,16 +34,20 @@ import {
     deriveRegimenOccurrences,
     deriveSupplementIntakeIdempotencyFingerprint,
     deriveSupplementRegimenIdempotencyFingerprint,
+    combineNutrientContributions,
     FOOD_COMPATIBLE_NUTRIENT_KEYS,
     isFoodCompatibleNutrientKey,
     isSupplementProductCategory,
     normalizeSupplementAlias,
     projectIntakeVisibleState,
     reduceOccurrenceState,
+    selectEffectiveDoneFacts,
     stableStringify,
     validateLabelNutrients,
     validateRegimenSchedule,
+    type IntakeFactForContribution,
     type IntakeFactForProjection,
+    type NutrientContributionAmount,
     type RegimenSchedule,
     type SupplementIntakeStateAction,
     type SupplementIntakeVisibleState,
@@ -2458,29 +2462,269 @@ export interface SummaryWindow {
     timezone: string;
 }
 
+/** Exact UTC range of the validated inclusive local-date window (DST-safe). */
+function boundedWindowUtcRange(window: SummaryWindow): {
+    startUtc: Date;
+    endUtc: Date;
+} {
+    return {
+        startUtc: zonedDayStartUtc(window.from_date, window.timezone),
+        endUtc: zonedNextDayStartUtc(window.to_date, window.timezone),
+    };
+}
+
+/** Fail-closed numeric read: pg numerics arrive as strings; never coerce junk. */
+function finiteNumeric(value: unknown): number {
+    const n = Number(value);
+    if (!Number.isFinite(n)) {
+        throw new Error(`non-finite numeric value read from the database`);
+    }
+    return n;
+}
+
+function compareNutrientIdentity(
+    a: { nutrient_key: string; unit: string },
+    b: { nutrient_key: string; unit: string },
+): number {
+    if (a.nutrient_key !== b.nutrient_key) {
+        return a.nutrient_key < b.nutrient_key ? -1 : 1;
+    }
+    return a.unit < b.unit ? -1 : a.unit > b.unit ? 1 : 0;
+}
+
+/**
+ * Food-side nutrient identities are fixed by the canonical model: calories
+ * are kcal, the six gram fields are grams. A supplement snapshot combines
+ * with food only when its stored (key, unit) matches exactly.
+ */
+const FOOD_CANONICAL_NUTRIENT_FIELDS = FOOD_COMPATIBLE_NUTRIENT_KEYS;
+
+const FOOD_FIELD_IDENTITY: Record<
+    string,
+    { nutrient_key: string; unit: string }
+> = Object.fromEntries(
+    FOOD_CANONICAL_NUTRIENT_FIELDS.map((field) => [
+        field,
+        { nutrient_key: field, unit: field === "calories" ? "kcal" : "g" },
+    ]),
+);
+
+/**
+ * Candidate facts are fetched over a ±48 h widened UTC window: occurrence
+ * identity uses the regimen timezone while the request window uses the
+ * request timezone, so a fact just outside the exact window can still decide
+ * which in-window fact is effective. Only effective done facts whose
+ * occurred_at lies in the exact requested window contribute.
+ */
+const WINDOW_WIDEN_MS = 48 * 3600 * 1000;
+
+interface EffectiveDoneFactsInWindow {
+    /** All facts whose occurred_at lies in the exact requested UTC window. */
+    factsInRange: IntakeFactForContribution[];
+    /** Effective done facts in the exact window, in append order. */
+    effectiveDone: IntakeFactForContribution[];
+    /** Done facts in the exact window excluded by a later correction. */
+    excludedByCorrection: number;
+}
+
+async function effectiveDoneFactsInWindow(
+    pool: Queryable,
+    userId: string,
+    startUtc: Date,
+    endUtc: Date,
+): Promise<EffectiveDoneFactsInWindow> {
+    const widenedStart = new Date(startUtc.getTime() - WINDOW_WIDEN_MS);
+    const widenedEnd = new Date(endUtc.getTime() + WINDOW_WIDEN_MS);
+    const { rows: factRows } = await pool.query(
+        `SELECT id, product_id, regimen_id, occurred_at, state_action,
+                supersedes_intake_id, created_at
+         FROM supplement_intake_events
+         WHERE user_id = $1 AND occurred_at >= $2 AND occurred_at < $3
+         ORDER BY created_at, id`,
+        [userId, widenedStart.toISOString(), widenedEnd.toISOString()],
+    );
+    const facts = factRows as IntakeFactForContribution[];
+
+    const regimenIds = [
+        ...new Set(
+            facts
+                .map((f) => f.regimen_id)
+                .filter((id): id is string => id !== null),
+        ),
+    ];
+    const regimenTimezones = new Map<string, string>();
+    if (regimenIds.length > 0) {
+        const { rows: tzRows } = await pool.query(
+            `SELECT id, timezone FROM supplement_regimens
+             WHERE user_id = $1 AND id = ANY($2)`,
+            [userId, regimenIds],
+        );
+        for (const row of tzRows as { id: string; timezone: string }[]) {
+            regimenTimezones.set(row.id, row.timezone);
+        }
+    }
+
+    const selection = selectEffectiveDoneFacts(facts, regimenTimezones);
+    const startMs = startUtc.getTime();
+    const endMs = endUtc.getTime();
+    const inExactWindow = (fact: IntakeFactForContribution): boolean => {
+        const t =
+            fact.occurred_at instanceof Date
+                ? fact.occurred_at.getTime()
+                : Date.parse(fact.occurred_at);
+        return t >= startMs && t < endMs;
+    };
+    const factsInRange = facts.filter(inExactWindow);
+    const effectiveDone = selection.included.filter(inExactWindow);
+    const effectiveIds = new Set(effectiveDone.map((f) => f.id));
+    const excludedByCorrection = factsInRange.filter(
+        (f) => f.state_action === "done" && !effectiveIds.has(f.id),
+    ).length;
+    return { factsInRange, effectiveDone, excludedByCorrection };
+}
+
 export async function getSupplementNutritionSummary(
     pool: Queryable,
     userId: string,
     window: SummaryWindow,
 ): Promise<SupplementNutritionSummary> {
     validateBoundedWindow(window);
-    void pool;
-    void userId;
+    const { startUtc, endUtc } = boundedWindowUtcRange(window);
+
+    // Food side: current-version canonical event-scope rows of active events
+    // in range, excluding supplement-linked snack events so a sports intake
+    // is never counted on both sides. SQL SUM/COUNT ignore NULLs, which is
+    // exactly the presence semantics needed: canonical NULL contributes
+    // nothing and is not counted present; an explicit 0 sums as 0 and counts.
+    const { rows: foodRows } = await pool.query(
+        `SELECT count(*)::int AS meal_event_count,
+                SUM(c.calories) AS calories_sum, COUNT(c.calories)::int AS calories_count,
+                SUM(c.protein_g) AS protein_g_sum, COUNT(c.protein_g)::int AS protein_g_count,
+                SUM(c.carbs_g) AS carbs_g_sum, COUNT(c.carbs_g)::int AS carbs_g_count,
+                SUM(c.fat_g) AS fat_g_sum, COUNT(c.fat_g)::int AS fat_g_count,
+                SUM(c.fiber_g) AS fiber_g_sum, COUNT(c.fiber_g)::int AS fiber_g_count,
+                SUM(c.sugar_g) AS sugar_g_sum, COUNT(c.sugar_g)::int AS sugar_g_count,
+                SUM(c.alcohol_g) AS alcohol_g_sum, COUNT(c.alcohol_g)::int AS alcohol_g_count
+         FROM meal_events e
+         JOIN meal_event_versions v
+             ON v.event_id = e.id AND v.version = e.current_version
+         LEFT JOIN meal_event_canonical_results c
+             ON c.event_id = v.event_id AND c.version = v.version
+                AND c.ordinal IS NULL
+         WHERE e.user_id = $1 AND e.status = 'active'
+           AND e.consumed_at >= $2 AND e.consumed_at < $3
+           AND NOT EXISTS (
+               SELECT 1 FROM supplement_intake_meal_links l
+               WHERE l.event_id = e.id AND l.user_id = $1
+           )`,
+        [userId, startUtc.toISOString(), endUtc.toISOString()],
+    );
+    const { rows: excludedRows } = await pool.query(
+        `SELECT count(*)::int AS n
+         FROM meal_events e
+         WHERE e.user_id = $1 AND e.status = 'active'
+           AND e.consumed_at >= $2 AND e.consumed_at < $3
+           AND EXISTS (
+               SELECT 1 FROM supplement_intake_meal_links l
+               WHERE l.event_id = e.id AND l.user_id = $1
+           )`,
+        [userId, startUtc.toISOString(), endUtc.toISOString()],
+    );
+
+    const foodRow = foodRows[0] as Record<string, unknown>;
+    const foodNutrients: SummaryNutrientRow[] = [];
+    const foodAmounts: NutrientContributionAmount[] = [];
+    for (const field of FOOD_CANONICAL_NUTRIENT_FIELDS) {
+        const eventsWithValue = Number(foodRow[`${field}_count`]);
+        if (eventsWithValue === 0) continue;
+        const amount = finiteNumeric(foodRow[`${field}_sum`]);
+        const { nutrient_key, unit } = FOOD_FIELD_IDENTITY[field]!;
+        foodNutrients.push({
+            nutrient_key,
+            unit,
+            amount,
+            events_with_value: eventsWithValue,
+        });
+        foodAmounts.push({ nutrient_key, unit, amount });
+    }
+
+    // Supplement side: correction-aware effective done facts in the exact
+    // window, then their immutable scaled snapshots aggregated per exact
+    // (nutrient_key, unit) identity.
+    const effective = await effectiveDoneFactsInWindow(
+        pool,
+        userId,
+        startUtc,
+        endUtc,
+    );
+    const supplementNutrients: SummarySupplementNutrientRow[] = [];
+    const supplementAmounts: NutrientContributionAmount[] = [];
+    if (effective.effectiveDone.length > 0) {
+        const { rows: snapshotRows } = await pool.query(
+            `SELECT intake_id, nutrient_key, unit, scaled_amount
+             FROM supplement_intake_nutrient_snapshots
+             WHERE user_id = $1 AND intake_id = ANY($2)`,
+            [userId, effective.effectiveDone.map((f) => f.id)],
+        );
+        interface Aggregate {
+            amount: number;
+            intakeIds: Set<string>;
+        }
+        const byIdentity = new Map<string, Map<string, Aggregate>>();
+        for (const row of snapshotRows as {
+            intake_id: string;
+            nutrient_key: string;
+            unit: string;
+            scaled_amount: unknown;
+        }[]) {
+            let byUnit = byIdentity.get(row.nutrient_key);
+            if (byUnit === undefined) {
+                byUnit = new Map();
+                byIdentity.set(row.nutrient_key, byUnit);
+            }
+            let aggregate = byUnit.get(row.unit);
+            if (aggregate === undefined) {
+                aggregate = { amount: 0, intakeIds: new Set() };
+                byUnit.set(row.unit, aggregate);
+            }
+            aggregate.amount += finiteNumeric(row.scaled_amount);
+            aggregate.intakeIds.add(row.intake_id);
+        }
+        for (const [nutrient_key, byUnit] of byIdentity) {
+            for (const [unit, aggregate] of byUnit) {
+                supplementNutrients.push({
+                    nutrient_key,
+                    unit,
+                    amount: aggregate.amount,
+                    intakes_with_value: aggregate.intakeIds.size,
+                });
+                supplementAmounts.push({
+                    nutrient_key,
+                    unit,
+                    amount: aggregate.amount,
+                });
+            }
+        }
+        supplementNutrients.sort(compareNutrientIdentity);
+    }
+
     return {
         from_date: window.from_date,
         to_date: window.to_date,
         timezone: window.timezone,
         food: {
-            meal_event_count: 0,
-            linked_snack_event_count_excluded: 0,
-            nutrients: [],
+            meal_event_count: Number(foodRow.meal_event_count),
+            linked_snack_event_count_excluded: Number(
+                (excludedRows[0] as { n: number }).n,
+            ),
+            nutrients: foodNutrients,
         },
         supplements: {
-            intake_fact_count_in_range: 0,
-            effective_done_intake_count: 0,
-            excluded_by_correction_count: 0,
-            nutrients: [],
+            intake_fact_count_in_range: effective.factsInRange.length,
+            effective_done_intake_count: effective.effectiveDone.length,
+            excluded_by_correction_count: effective.excludedByCorrection,
+            nutrients: supplementNutrients,
         },
-        combined: [],
+        combined: combineNutrientContributions(foodAmounts, supplementAmounts),
     };
 }
