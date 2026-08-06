@@ -107,8 +107,8 @@ describeDb("calculation concurrency and correction acceptance matrix", () => {
                 a === b ? 0 : a ? 1 : -1,
             ),
         ).toEqual([false, true]);
-        expect(first.fingerprint).toBe(bundle.fingerprint);
-        expect(second.fingerprint).toBe(bundle.fingerprint);
+        expect(first.fingerprint).toBe(bundle.fingerprint!);
+        expect(second.fingerprint).toBe(bundle.fingerprint!);
 
         const version = await pool.query(
             `SELECT calculation_bundle_fingerprint FROM meal_event_versions

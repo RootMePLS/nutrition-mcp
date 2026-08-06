@@ -50,7 +50,7 @@ test("bundle fingerprints are independent of provider completion order", () =>
             ...base,
             results: [...base.results].reverse(),
         }),
-    ).toBe(base.fingerprint));
+    ).toBe(base.fingerprint!));
 test("bundle fingerprint includes resolved input and rejects tampering", () => {
     expect(
         validateCalculationBundle({ ...base, fingerprint: "wrong" }),
