@@ -494,6 +494,80 @@ describe("calculation bundle commit seam", () => {
             /fingerprint/,
         );
     });
+
+    test("commits bundle without fingerprint by computing it server-side", async () => {
+        let persistedFingerprint: string | null = null;
+        const client = {
+            query: async (sql: string, params: unknown[] = []) => {
+                if (sql.includes("UPDATE meal_event_versions")) {
+                    persistedFingerprint = String(params[2]);
+                    return { rows: [] };
+                }
+                if (sql.includes("SELECT calculation_bundle_fingerprint"))
+                    return {
+                        rows: [
+                            {
+                                calculation_bundle_fingerprint:
+                                    persistedFingerprint,
+                            },
+                        ],
+                    };
+                if (sql.includes("SELECT id FROM meal_event_nutrition_results"))
+                    return { rows: [] };
+                if (sql.includes("status, consensus_status"))
+                    return {
+                        rows: [
+                            {
+                                status: "ready",
+                                consensus_status: "all_agree",
+                                calories: "505",
+                                protein_g: null,
+                                carbs_g: null,
+                                fat_g: null,
+                                fiber_g: null,
+                                sugar_g: null,
+                                alcohol_g: null,
+                                eligible_providers: ["nutrition-local", "own"],
+                                outlier_providers: [],
+                                threshold_percent: "10",
+                                policy_version: "consensus-10pct-v1",
+                            },
+                        ],
+                    };
+                return { rows: [] };
+            },
+            release: () => undefined,
+        };
+        const pool = { connect: async () => client } as never;
+        const input = {
+            event_id: "00000000-0000-4000-8000-000000000001",
+            version: 1,
+            resolved_input: { items: [], inputs: [] },
+            results: [
+                provider("nutrition-local", "local-source", 500),
+                provider("own", "own-source", 510),
+            ],
+            canonical_proposal: { calories: 9999 },
+        } satisfies Omit<CalculationBundleInput, "fingerprint">;
+        const result = await commitCalculationBundle(pool, input);
+        expect(result.fingerprint).toBe(stableBundleFingerprint(input));
+        expect(result.canonical.nutrients.calories).toBe(505);
+    });
+
+    test("rejects bundle with wrong fingerprint even when provided", async () => {
+        const bundle = makeBundle();
+        bundle.fingerprint = "bundle:0000000000000000000000000000000000000000000000000000000000000000";
+        const client = {
+            query: async (_sql: string) => {
+                throw new Error("should not reach DB — fingerprint validation fails first");
+            },
+            release: () => undefined,
+        };
+        const pool = { connect: async () => client } as never;
+        await expect(commitCalculationBundle(pool, bundle)).rejects.toThrow(
+            /fingerprint/,
+        );
+    });
 });
 
 function makeBundle(): CalculationBundleInput {
