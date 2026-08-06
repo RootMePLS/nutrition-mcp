@@ -2728,3 +2728,251 @@ export async function getSupplementNutritionSummary(
         combined: combineNutrientContributions(foodAmounts, supplementAmounts),
     };
 }
+
+
+// ===========================================================================
+// SUPPLEMENT DATA FLAGS READ (Slice 7, read-only)
+// ===========================================================================
+// Transparent, data-only flags over a bounded window in an explicit timezone:
+// (1) the same nutrient key + unit recorded from two or more distinct
+// products, (2) recorded daily totals compared against a product label's own
+// explicitly stored maximum where one exists, (3) derived past-due
+// occurrences of active regimens with no recorded state. These are
+// recorded-data facts with no interpretation: no advice, no thresholds beyond
+// what the label itself stores, and nothing is written — ever.
+
+export interface DuplicateNutrientExposure {
+    nutrient_key: string;
+    unit: string;
+    product_count: number;
+    products: {
+        product_id: string;
+        display_name: string;
+        recorded_amount: number;
+    }[];
+}
+
+export interface LabelLimitComparison {
+    product_id: string;
+    product_version: number;
+    display_name: string;
+    nutrient_key: string;
+    unit: string;
+    local_date: string;
+    recorded_total: number;
+    label_limit_maximum: number;
+    exceeds_label_limit: boolean;
+}
+
+export interface UnmarkedRegimenOccurrence {
+    regimen_id: string;
+    product_id: string;
+    product_display_name: string;
+    local_date: string;
+    local_time: string;
+    timezone: string;
+}
+
+export interface SupplementDataFlags {
+    from_date: string;
+    to_date: string;
+    timezone: string;
+    as_of: string;
+    duplicate_nutrient_exposures: DuplicateNutrientExposure[];
+    label_limit_comparisons: LabelLimitComparison[];
+    unmarked_active_regimen_occurrences: UnmarkedRegimenOccurrence[];
+}
+
+export interface DataFlagsWindow {
+    from_date: string;
+    to_date: string;
+    timezone: string;
+    /** Strict ISO-8601; defaults to server now when absent. */
+    as_of?: string;
+}
+
+export async function getSupplementDataFlags(
+    pool: Queryable,
+    userId: string,
+    window: DataFlagsWindow,
+): Promise<SupplementDataFlags> {
+    validateBoundedWindow(window);
+    if (window.as_of !== undefined && !isStrictIsoTimestamp(window.as_of)) {
+        throw new SupplementValidationError([
+            "as_of must be a strict ISO-8601 timestamp with an explicit offset",
+        ]);
+    }
+    const asOf = window.as_of ?? new Date().toISOString();
+    const { startUtc, endUtc } = boundedWindowUtcRange(window);
+
+    const effective = await effectiveDoneFactsInWindow(
+        pool,
+        userId,
+        startUtc,
+        endUtc,
+    );
+
+    const duplicateExposures: DuplicateNutrientExposure[] = [];
+    const limitComparisons: LabelLimitComparison[] = [];
+    if (effective.effectiveDone.length > 0) {
+        // Snapshots of the effective done facts, joined to the bound
+        // version's display name and — only where one exists — the label's
+        // own explicitly stored maximum. No limit row means no comparison,
+        // never a fabricated threshold.
+        const { rows } = await pool.query(
+            `SELECT s.intake_id, s.product_id, s.product_version,
+                    s.nutrient_key, s.unit, s.scaled_amount,
+                    e.occurred_at, v.display_name, l.maximum_amount
+             FROM supplement_intake_nutrient_snapshots s
+             JOIN supplement_intake_events e
+                 ON e.id = s.intake_id AND e.user_id = s.user_id
+             JOIN supplement_product_versions v
+                 ON v.product_id = s.product_id AND v.version = s.product_version
+             LEFT JOIN supplement_product_label_limits l
+                 ON l.product_id = s.product_id AND l.version = s.product_version
+                AND l.nutrient_key = s.nutrient_key AND l.unit = s.unit
+             WHERE s.user_id = $1 AND s.intake_id = ANY($2)`,
+            [userId, effective.effectiveDone.map((f) => f.id)],
+        );
+
+        interface SnapshotRow {
+            intake_id: string;
+            product_id: string;
+            product_version: number;
+            nutrient_key: string;
+            unit: string;
+            scaled_amount: unknown;
+            occurred_at: Date | string;
+            display_name: string;
+            maximum_amount: unknown;
+        }
+
+        // (1) Duplicate recorded exposure: same (key, unit) delivered by
+        // effective done intakes of two or more DISTINCT products.
+        interface ProductContribution {
+            display_name: string;
+            amount: number;
+        }
+        const exposureByIdentity = new Map<
+            string,
+            Map<string, Map<string, ProductContribution>>
+        >();
+        for (const row of rows as SnapshotRow[]) {
+            let byUnit = exposureByIdentity.get(row.nutrient_key);
+            if (byUnit === undefined) {
+                byUnit = new Map();
+                exposureByIdentity.set(row.nutrient_key, byUnit);
+            }
+            let byProduct = byUnit.get(row.unit);
+            if (byProduct === undefined) {
+                byProduct = new Map();
+                byUnit.set(row.unit, byProduct);
+            }
+            const contribution = byProduct.get(row.product_id) ?? {
+                display_name: row.display_name,
+                amount: 0,
+            };
+            contribution.amount += finiteNumeric(row.scaled_amount);
+            byProduct.set(row.product_id, contribution);
+        }
+        for (const [nutrient_key, byUnit] of exposureByIdentity) {
+            for (const [unit, byProduct] of byUnit) {
+                if (byProduct.size < 2) continue;
+                const products = [...byProduct.entries()]
+                    .map(([product_id, contribution]) => ({
+                        product_id,
+                        display_name: contribution.display_name,
+                        recorded_amount: contribution.amount,
+                    }))
+                    .sort((a, b) =>
+                        a.product_id.localeCompare(b.product_id),
+                    );
+                duplicateExposures.push({
+                    nutrient_key,
+                    unit,
+                    product_count: products.length,
+                    products,
+                });
+            }
+        }
+        duplicateExposures.sort(compareNutrientIdentity);
+
+        // (2) Recorded daily totals vs the bound version's explicit label
+        // limit, grouped by (product, version, key, unit, local date in the
+        // REQUEST timezone). Facts, not alarms: every limit-bearing recorded
+        // day is reported, whether or not it exceeds.
+        interface LimitGroup {
+            product_id: string;
+            product_version: number;
+            display_name: string;
+            nutrient_key: string;
+            unit: string;
+            local_date: string;
+            recorded_total: number;
+            label_limit_maximum: number;
+        }
+        const limitGroups = new Map<string, LimitGroup>();
+        for (const row of rows as SnapshotRow[]) {
+            if (row.maximum_amount === null) continue;
+            const localDate = dateInTz(row.occurred_at, window.timezone);
+            const groupId = [
+                row.product_id,
+                row.product_version,
+                row.nutrient_key,
+                row.unit,
+                localDate,
+            ].join("");
+            let group = limitGroups.get(groupId);
+            if (group === undefined) {
+                group = {
+                    product_id: row.product_id,
+                    product_version: row.product_version,
+                    display_name: row.display_name,
+                    nutrient_key: row.nutrient_key,
+                    unit: row.unit,
+                    local_date: localDate,
+                    recorded_total: 0,
+                    label_limit_maximum: finiteNumeric(row.maximum_amount),
+                };
+                limitGroups.set(groupId, group);
+            }
+            group.recorded_total += finiteNumeric(row.scaled_amount);
+        }
+        for (const group of limitGroups.values()) {
+            limitComparisons.push({
+                product_id: group.product_id,
+                product_version: group.product_version,
+                display_name: group.display_name,
+                nutrient_key: group.nutrient_key,
+                unit: group.unit,
+                local_date: group.local_date,
+                recorded_total: group.recorded_total,
+                label_limit_maximum: group.label_limit_maximum,
+                exceeds_label_limit:
+                    group.recorded_total > group.label_limit_maximum,
+            });
+        }
+        limitComparisons.sort((a, b) => {
+            if (a.local_date !== b.local_date) {
+                return a.local_date < b.local_date ? -1 : 1;
+            }
+            if (a.product_id !== b.product_id) {
+                return a.product_id.localeCompare(b.product_id);
+            }
+            if (a.product_version !== b.product_version) {
+                return a.product_version - b.product_version;
+            }
+            return compareNutrientIdentity(a, b);
+        });
+    }
+
+    return {
+        from_date: window.from_date,
+        to_date: window.to_date,
+        timezone: window.timezone,
+        as_of: asOf,
+        duplicate_nutrient_exposures: duplicateExposures,
+        label_limit_comparisons: limitComparisons,
+        unmarked_active_regimen_occurrences: [],
+    };
+}

@@ -4039,3 +4039,408 @@ describeDb("supplement nutrition summary (requires DATABASE_URL_TEST)", () => {
         expect(await domainCounts()).toEqual(before);
     });
 });
+
+
+// ---------------------------------------------------------------------------
+// Slice 7: supplement data flags — transparent, data-only flags over a
+// bounded window. Real PostgreSQL only.
+// ---------------------------------------------------------------------------
+
+describeDb("supplement data flags (requires DATABASE_URL_TEST)", () => {
+    let pool: Pool;
+
+    beforeAll(() => {
+        pool = new Pool({ connectionString: DATABASE_URL_TEST });
+    });
+
+    afterAll(async () => {
+        await pool.end();
+    });
+
+    beforeEach(async () => {
+        await resetSchema(pool);
+    });
+
+    async function domainCounts(): Promise<Record<string, number>> {
+        const counts: Record<string, number> = {};
+        for (const table of SLICE_SEVEN_DOMAIN_TABLES) {
+            counts[table] = await tableCount(pool, table);
+        }
+        return counts;
+    }
+
+    async function seedProduct(
+        overrides: Record<string, unknown> = {},
+    ): Promise<string> {
+        const result = await createSupplementProduct(
+            pool,
+            validCreateCommand({
+                idempotency_key: `product:${crypto.randomUUID()}`,
+                ...overrides,
+            }),
+        );
+        return result.product.product_id;
+    }
+
+    async function log(
+        productId: string,
+        overrides: Record<string, unknown> = {},
+    ) {
+        const result = await logSupplementIntake(
+            pool,
+            validIntakeCommand(productId, overrides),
+        );
+        return result.intake;
+    }
+
+    const FLAGS_WINDOW = {
+        from_date: "2026-08-01",
+        to_date: "2026-08-07",
+        timezone: "UTC",
+        as_of: "2026-08-06T00:00:00.000Z",
+    };
+
+    test("flags the same nutrient key + unit recorded from two or more distinct products", async () => {
+        const productA = await seedProduct({
+            category: "supplement",
+            display_name: "Vitamin D Tabs",
+            aliases: ["vitd-a"],
+            nutrients: [
+                { nutrient_key: "vitamin_d", amount: 10, unit: "µg" },
+                { nutrient_key: "vitamin_e", amount: 3, unit: "mg" },
+            ],
+        });
+        const productB = await seedProduct({
+            category: "supplement",
+            display_name: "Vitamin D Drops",
+            aliases: ["vitd-b"],
+            nutrients: [{ nutrient_key: "vitamin_d", amount: 20, unit: "µg" }],
+        });
+        const productC = await seedProduct({
+            category: "supplement",
+            display_name: "Vitamin D Fortified",
+            aliases: ["vitd-c"],
+            nutrients: [{ nutrient_key: "vitamin_d", amount: 5, unit: "mg" }],
+        });
+        await log(productA, {
+            servings: 1,
+            occurred_at: "2026-08-03T08:00:00.000Z",
+        });
+        await log(productB, {
+            servings: 2,
+            occurred_at: "2026-08-03T09:00:00.000Z",
+        });
+        await log(productC, {
+            servings: 1,
+            occurred_at: "2026-08-03T10:00:00.000Z",
+        });
+
+        const flags = await getSupplementDataFlags(pool, "u1", FLAGS_WINDOW);
+        expect(flags.from_date).toBe("2026-08-01");
+        expect(flags.as_of).toBe("2026-08-06T00:00:00.000Z");
+        // One flag: vitamin_d/µg from products A and B only. The mg unit does
+        // NOT join; the single-product vitamin_e produces no flag.
+        expect(flags.duplicate_nutrient_exposures).toEqual([
+            {
+                nutrient_key: "vitamin_d",
+                unit: "µg",
+                product_count: 2,
+                products: [
+                    {
+                        product_id: productA,
+                        display_name: "Vitamin D Tabs",
+                        recorded_amount: 10,
+                    },
+                    {
+                        product_id: productB,
+                        display_name: "Vitamin D Drops",
+                        recorded_amount: 40,
+                    },
+                ].sort((a, b) => a.product_id.localeCompare(b.product_id)),
+            },
+        ]);
+    });
+
+    test("duplicate flags respect the effective-done rule", async () => {
+        const productA = await seedProduct({
+            category: "supplement",
+            display_name: "Vitamin D Tabs",
+            aliases: ["vitd-a"],
+            nutrients: [{ nutrient_key: "vitamin_d", amount: 10, unit: "µg" }],
+        });
+        const productB = await seedProduct({
+            category: "supplement",
+            display_name: "Vitamin D Drops",
+            aliases: ["vitd-b"],
+            nutrients: [{ nutrient_key: "vitamin_d", amount: 20, unit: "µg" }],
+        });
+        await log(productA, {
+            servings: 1,
+            occurred_at: "2026-08-03T08:00:00.000Z",
+        });
+        // B's only done fact is corrected away: no duplicate remains.
+        const doneB = await log(productB, {
+            servings: 1,
+            occurred_at: "2026-08-03T09:00:00.000Z",
+        });
+        await log(productB, {
+            servings: 1,
+            occurred_at: "2026-08-03T10:00:00.000Z",
+            state_action: "cleared",
+            supersedes_intake_id: doneB.intake_id,
+        });
+
+        const flags = await getSupplementDataFlags(pool, "u1", FLAGS_WINDOW);
+        expect(flags.duplicate_nutrient_exposures).toEqual([]);
+    });
+
+    test("compares recorded daily totals against the bound version's explicit label limit only", async () => {
+        const productId = await seedProduct({
+            category: "supplement",
+            display_name: "Pre-Workout",
+            aliases: ["preworkout"],
+            nutrients: [
+                { nutrient_key: "caffeine", amount: 100, unit: "mg" },
+                { nutrient_key: "vitamin_d", amount: 5, unit: "µg" },
+            ],
+            label_limits: [
+                {
+                    nutrient_key: "caffeine",
+                    unit: "mg",
+                    maximum_amount: 200,
+                },
+            ],
+        });
+        // 2026-08-01: two intakes totalling 250 mg caffeine.
+        await log(productId, {
+            servings: 1,
+            occurred_at: "2026-08-01T08:00:00.000Z",
+        });
+        await log(productId, {
+            servings: 1.5,
+            occurred_at: "2026-08-01T18:00:00.000Z",
+        });
+        // 2026-08-02: one intake totalling 150 mg.
+        await log(productId, {
+            servings: 1.5,
+            occurred_at: "2026-08-02T08:00:00.000Z",
+        });
+
+        const flags = await getSupplementDataFlags(pool, "u1", FLAGS_WINDOW);
+        expect(flags.label_limit_comparisons).toEqual([
+            {
+                product_id: productId,
+                product_version: 1,
+                display_name: "Pre-Workout",
+                nutrient_key: "caffeine",
+                unit: "mg",
+                local_date: "2026-08-01",
+                recorded_total: 250,
+                label_limit_maximum: 200,
+                exceeds_label_limit: true,
+            },
+            {
+                product_id: productId,
+                product_version: 1,
+                display_name: "Pre-Workout",
+                nutrient_key: "caffeine",
+                unit: "mg",
+                local_date: "2026-08-02",
+                recorded_total: 150,
+                label_limit_maximum: 200,
+                exceeds_label_limit: false,
+            },
+        ]);
+        // vitamin_d has no stored limit: no comparison row is ever fabricated.
+        expect(
+            flags.label_limit_comparisons.find(
+                (r) => r.nutrient_key === "vitamin_d",
+            ),
+        ).toBeUndefined();
+    });
+
+    test("limit comparisons are version-pinned", async () => {
+        const productId = await seedProduct({
+            category: "supplement",
+            display_name: "Pre-Workout",
+            aliases: ["preworkout"],
+            nutrients: [{ nutrient_key: "caffeine", amount: 100, unit: "mg" }],
+            label_limits: [
+                {
+                    nutrient_key: "caffeine",
+                    unit: "mg",
+                    maximum_amount: 200,
+                },
+            ],
+        });
+        // v1-pinned intake: 150 mg.
+        await log(productId, {
+            servings: 1.5,
+            occurred_at: "2026-08-03T08:00:00.000Z",
+        });
+        // Revise the label: v2 carries a different limit for the same key.
+        await reviseSupplementProductLabel(pool, {
+            user_id: "u1",
+            product_id: productId,
+            display_name: "Pre-Workout V2",
+            short_name: "PW",
+            brand: null,
+            form: "powder",
+            serving_amount: 10,
+            serving_unit: "g",
+            serving_description: "1 scoop",
+            aliases: ["preworkout"],
+            nutrients: [{ nutrient_key: "caffeine", amount: 100, unit: "mg" }],
+            label_limits: [
+                {
+                    nutrient_key: "caffeine",
+                    unit: "mg",
+                    maximum_amount: 100,
+                },
+            ],
+            label_evidence: { kind: "label_photo", verified_by: "user" },
+            label_source_kind: "user_verified_label",
+            revision_idempotency_key: `revise:${crypto.randomUUID()}`,
+            created_by: "test",
+        });
+        // v2-pinned intake (current version at write time): 150 mg same day.
+        await log(productId, {
+            servings: 1.5,
+            occurred_at: "2026-08-03T09:00:00.000Z",
+        });
+
+        const flags = await getSupplementDataFlags(pool, "u1", FLAGS_WINDOW);
+        expect(flags.label_limit_comparisons).toEqual([
+            {
+                product_id: productId,
+                product_version: 1,
+                display_name: "Pre-Workout",
+                nutrient_key: "caffeine",
+                unit: "mg",
+                local_date: "2026-08-03",
+                recorded_total: 150,
+                label_limit_maximum: 200,
+                exceeds_label_limit: false,
+            },
+            {
+                product_id: productId,
+                product_version: 2,
+                display_name: "Pre-Workout V2",
+                nutrient_key: "caffeine",
+                unit: "mg",
+                local_date: "2026-08-03",
+                recorded_total: 150,
+                label_limit_maximum: 100,
+                exceeds_label_limit: true,
+            },
+        ]);
+    });
+
+    test("limit day bucketing uses the request timezone", async () => {
+        const productId = await seedProduct({
+            category: "supplement",
+            display_name: "Pre-Workout",
+            aliases: ["preworkout"],
+            nutrients: [{ nutrient_key: "caffeine", amount: 100, unit: "mg" }],
+            label_limits: [
+                {
+                    nutrient_key: "caffeine",
+                    unit: "mg",
+                    maximum_amount: 150,
+                },
+            ],
+        });
+        // 23:00 and 01:00 across a Tokyo midnight; both are 2026-08-01 in UTC.
+        await log(productId, {
+            servings: 1,
+            occurred_at: "2026-08-01T23:00:00+09:00",
+        });
+        await log(productId, {
+            servings: 1,
+            occurred_at: "2026-08-02T01:00:00+09:00",
+        });
+
+        const tokyo = await getSupplementDataFlags(pool, "u1", {
+            from_date: "2026-08-01",
+            to_date: "2026-08-02",
+            timezone: "Asia/Tokyo",
+            as_of: FLAGS_WINDOW.as_of,
+        });
+        expect(
+            tokyo.label_limit_comparisons.map((r) => [
+                r.local_date,
+                r.recorded_total,
+                r.exceeds_label_limit,
+            ]),
+        ).toEqual([
+            ["2026-08-01", 100, false],
+            ["2026-08-02", 100, false],
+        ]);
+
+        const utc = await getSupplementDataFlags(pool, "u1", {
+            from_date: "2026-08-01",
+            to_date: "2026-08-02",
+            timezone: "UTC",
+            as_of: FLAGS_WINDOW.as_of,
+        });
+        expect(
+            utc.label_limit_comparisons.map((r) => [
+                r.local_date,
+                r.recorded_total,
+                r.exceeds_label_limit,
+            ]),
+        ).toEqual([["2026-08-01", 200, true]]);
+    });
+
+    test("flags are user-scoped and read-only", async () => {
+        const productA = await seedProduct({
+            category: "supplement",
+            display_name: "Vitamin D Tabs",
+            aliases: ["vitd-a"],
+            nutrients: [{ nutrient_key: "vitamin_d", amount: 10, unit: "µg" }],
+            label_limits: [
+                {
+                    nutrient_key: "vitamin_d",
+                    unit: "µg",
+                    maximum_amount: 50,
+                },
+            ],
+        });
+        const productB = await seedProduct({
+            category: "supplement",
+            display_name: "Vitamin D Drops",
+            aliases: ["vitd-b"],
+            nutrients: [{ nutrient_key: "vitamin_d", amount: 20, unit: "µg" }],
+        });
+        await log(productA, {
+            servings: 1,
+            occurred_at: "2026-08-03T08:00:00.000Z",
+        });
+        await log(productB, {
+            servings: 1,
+            occurred_at: "2026-08-03T09:00:00.000Z",
+        });
+
+        // u2 sees nothing of u1.
+        const u2 = await getSupplementDataFlags(pool, "u2", FLAGS_WINDOW);
+        expect(u2.duplicate_nutrient_exposures).toEqual([]);
+        expect(u2.label_limit_comparisons).toEqual([]);
+        expect(u2.unmarked_active_regimen_occurrences).toEqual([]);
+
+        const before = await domainCounts();
+        await getSupplementDataFlags(pool, "u1", FLAGS_WINDOW);
+        await expect(
+            getSupplementDataFlags(pool, "u1", {
+                ...FLAGS_WINDOW,
+                timezone: "Not/AZone",
+            }),
+        ).rejects.toBeInstanceOf(SupplementValidationError);
+        await expect(
+            getSupplementDataFlags(pool, "u1", {
+                ...FLAGS_WINDOW,
+                as_of: "not-a-timestamp",
+            }),
+        ).rejects.toBeInstanceOf(SupplementValidationError);
+        expect(await domainCounts()).toEqual(before);
+    });
+});
