@@ -1003,6 +1003,26 @@ describeDb("attach_meal_capture_media MCP tool", () => {
             { mediaStore },
         );
     });
+
+    test("append_meal_capture_message rejects schema-invalid message before the handler", async () => {
+        await withTools(pool, async (call) => {
+            const started = await call("start_meal_capture", {
+                conversation_key: "schema-reject",
+                idempotency_key: "schema-reject-1",
+            });
+            const { capture_id } = JSON.parse(started.content[0]!.text!);
+            const bad = await call("append_meal_capture_message", {
+                capture_id,
+                message: { kind: "text", text: "no id" }, // missing external_message_id + received_at
+            });
+            expect(bad.isError).toBe(true);
+            // No message row was persisted.
+            const rows = await pool.query(
+                "SELECT count(*) FROM meal_capture_messages",
+            );
+            expect(rows.rows[0]!.count).toBe("0");
+        });
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -1193,6 +1213,7 @@ describeDb(
                             external_message_id: "msg-1",
                             kind: "text",
                             text: "oatmeal 80g",
+                            received_at: "2026-08-05T12:00:00.000Z",
                         },
                     },
                 );
