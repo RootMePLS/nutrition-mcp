@@ -2894,6 +2894,29 @@ describeDb(
             return result.regimen;
         }
 
+        async function reviseToV2(productId: string, displayName: string) {
+            return reviseSupplementProductLabel(pool, {
+                user_id: "u1",
+                product_id: productId,
+                display_name: displayName,
+                short_name: "Whey",
+                brand: "MyProtein",
+                form: "powder",
+                serving_amount: 32,
+                serving_unit: "g",
+                serving_description: "1 heaped scoop",
+                aliases: ["impact whey"],
+                nutrients: [
+                    { nutrient_key: "calories", amount: 128, unit: "kcal" },
+                    { nutrient_key: "protein_g", amount: 23, unit: "g" },
+                ],
+                label_evidence: { kind: "label_photo", verified_by: "user" },
+                label_source_kind: "user_verified_label",
+                revision_idempotency_key: `revise:${crypto.randomUUID()}`,
+                created_by: "test",
+            });
+        }
+
         async function mealEventCounts() {
             return {
                 events: await tableCount(pool, "meal_events"),
@@ -3039,6 +3062,50 @@ describeDb(
             const itemText = (itemRows[0] as { raw_item_text: string })
                 .raw_item_text;
             expect(itemText).toContain("Impact Whey Protein");
+        });
+
+        test("a v1-pinned done intake after a label revision snacks with exact v1 values", async () => {
+            const productId = await seedProduct(); // v1: 120 kcal, 21 g protein, fat 0
+            const regimen = await seedRegimen(productId); // pins product_version 1
+            await reviseToV2(productId, "Impact Whey Protein (new formula)"); // v2: 128 kcal
+
+            const result = await logSupplementIntake(
+                pool,
+                validIntakeCommand(productId, {
+                    product_id: null,
+                    regimen_id: regimen.regimen_id, // binds v1, not current v2
+                    servings: 2,
+                }),
+            );
+            expect(result.intake.product_version).toBe(1);
+            expect(result.snack_event_id).toBeString();
+
+            const { rows } = await pool.query(
+                `SELECT n.calories::float8 AS calories, n.protein_g::float8 AS protein_g,
+                        n.fat_g::float8 AS fat_g, l.product_version
+                   FROM supplement_intake_meal_links l
+                   JOIN meal_event_nutrition_results n
+                     ON n.event_id = l.event_id AND n.version = l.version
+                  WHERE l.intake_id = $1`,
+                [result.intake.intake_id],
+            );
+            expect(rows).toHaveLength(1);
+            const row = rows[0] as Record<string, unknown>;
+            // v1 label scaled by 2 servings — NOT v2's 256/46.
+            expect(row.product_version).toBe(1);
+            expect(row.calories).toBe(240);
+            expect(row.protein_g).toBe(42);
+            expect(row.fat_g).toBe(0);
+            // The item text uses the v1 display name, not the revised one.
+            const { rows: items } = await pool.query(
+                `SELECT raw_item_text FROM meal_event_items
+                  WHERE event_id = (SELECT event_id FROM supplement_intake_meal_links
+                                     WHERE intake_id = $1)`,
+                [result.intake.intake_id],
+            );
+            expect((items[0] as { raw_item_text: string }).raw_item_text).toBe(
+                "Impact Whey Protein",
+            );
         });
 
         test("snack event uses 'own' single provider with label-specific provenance — no provider rerun", async () => {
