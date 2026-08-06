@@ -330,3 +330,83 @@ export async function withReuseTools(
         await server.close();
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Slice 4 test-only fixtures: full-row source snapshots (byte-identical
+// before/after proofs) and reuse command builders.
+// ---------------------------------------------------------------------------
+
+import type { ReuseMealCalculationCommand } from "./meal-reuse.js";
+
+/** Full-row snapshot of one persisted aggregate for mutation-freedom proofs. */
+export async function snapshotAggregate(
+    pool: Pool,
+    eventId: string,
+    version: number,
+): Promise<{
+    root: Record<string, unknown> | null;
+    version: Record<string, unknown> | null;
+    items: Record<string, unknown>[];
+    provider_results: Record<string, unknown>[];
+    canonical_results: Record<string, unknown>[];
+    inputs: Record<string, unknown>[];
+    media: Record<string, unknown>[];
+}> {
+    const root = await pool.query(`SELECT * FROM meal_events WHERE id = $1`, [
+        eventId,
+    ]);
+    const versionRow = await pool.query(
+        `SELECT * FROM meal_event_versions WHERE event_id = $1 AND version = $2`,
+        [eventId, version],
+    );
+    const items = await pool.query(
+        `SELECT * FROM meal_event_items
+         WHERE event_id = $1 AND version = $2 ORDER BY ordinal`,
+        [eventId, version],
+    );
+    const providers = await pool.query(
+        `SELECT * FROM meal_event_nutrition_results
+         WHERE event_id = $1 AND version = $2 ORDER BY provider, ordinal`,
+        [eventId, version],
+    );
+    const canonicals = await pool.query(
+        `SELECT * FROM meal_event_canonical_results
+         WHERE event_id = $1 AND version = $2 ORDER BY ordinal`,
+        [eventId, version],
+    );
+    const inputs = await pool.query(
+        `SELECT * FROM meal_event_inputs
+         WHERE event_id = $1 AND version = $2 ORDER BY precedence`,
+        [eventId, version],
+    );
+    const media = await pool.query(
+        `SELECT * FROM meal_event_media WHERE event_id = $1 AND version = $2`,
+        [eventId, version],
+    );
+    return {
+        root: root.rows[0] ?? null,
+        version: versionRow.rows[0] ?? null,
+        items: items.rows,
+        provider_results: providers.rows,
+        canonical_results: canonicals.rows,
+        inputs: inputs.rows,
+        media: media.rows,
+    };
+}
+
+/** Reuse command builder with deterministic fresh occurrence timestamps. */
+export function reuseCommand(
+    overrides: Partial<ReuseMealCalculationCommand> &
+        Pick<ReuseMealCalculationCommand, "source_event_id">,
+): ReuseMealCalculationCommand {
+    return {
+        user_id: "u1",
+        source_version: 1,
+        reported_at: "2026-08-06T13:00:00.000Z",
+        consumed_at: "2026-08-06T12:30:00.000Z",
+        idempotency_key: "reuse-key-1",
+        created_by: "reuse_meal_calculation",
+        ...overrides,
+    };
+}

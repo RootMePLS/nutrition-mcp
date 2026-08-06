@@ -564,3 +564,384 @@ describeDb(
         });
     },
 );
+
+
+// ---------------------------------------------------------------------------
+// Slice 4 repository gate: the confirmed reuse mutation against real
+// PostgreSQL. Same reset/replay harness as the Slice 3 suite above.
+// ---------------------------------------------------------------------------
+
+import { deriveReuseIdempotencyFingerprint } from "./meal-types.js";
+import { getMealEventProvenance } from "./meal-events.js";
+import {
+    getReuseLineage,
+    reuseMealCalculation,
+} from "./meal-reuse.js";
+import {
+    reuseCommand,
+    snapshotAggregate,
+} from "./meal-reuse.fixtures.js";
+
+/** Columns that identity-remap in a copy: every other column is byte-equal. */
+function stripIdentity(
+    row: Record<string, unknown>,
+    extra: string[] = [],
+): Record<string, unknown> {
+    const { id, event_id, version, scope_key, ...rest } = row;
+    for (const key of extra) delete rest[key];
+    return rest;
+}
+
+describeDb(
+    "reuse_meal_calculation repository (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await pool.end();
+        });
+
+        beforeEach(async () => {
+            await resetSchema(pool);
+        });
+
+        afterEach(async () => {
+            await flushAnalytics();
+        });
+
+        test("creates a fresh root/version 1 with the supplied fresh timestamps and derived occurrence idempotency key", async () => {
+            const sourceId = await seedMealEvent(pool, "u1", {
+                idempotencyKey: "fresh-src",
+                consumedAt: daysAgo(2),
+                items: [{ ordinal: 0, raw_item_text: "reuse oats" }],
+            });
+            await commitBundle(pool, "u1", readyBundle(sourceId, 1));
+            const command = reuseCommand({ source_event_id: sourceId });
+
+            const result = await reuseMealCalculation(pool, command);
+
+            expect(result.event_id).not.toBe(sourceId);
+            expect(result.version).toBe(1);
+            expect(result.deduplicated).toBe(false);
+            expect(result.source_event_id).toBe(sourceId);
+            expect(result.source_version).toBe(1);
+            const { rows } = await pool.query(
+                `SELECT * FROM meal_events WHERE id = $1`,
+                [result.event_id],
+            );
+            const root = rows[0]!;
+            expect(root.user_id).toBe("u1");
+            expect((root.reported_at as Date).toISOString()).toBe(
+                command.reported_at,
+            );
+            expect((root.consumed_at as Date).toISOString()).toBe(
+                command.consumed_at,
+            );
+            expect(root.meal_type).toBe("breakfast");
+            expect(root.status).toBe("active");
+            expect(root.current_version).toBe(1);
+            expect(root.external_write_authorized).toBe(false);
+            const expectedKey = deriveReuseIdempotencyFingerprint({
+                user_id: "u1",
+                reuse_idempotency_key: command.idempotency_key,
+                source_event_id: sourceId,
+                source_version: 1,
+                reported_at: command.reported_at,
+                consumed_at: command.consumed_at,
+            });
+            expect(root.idempotency_key).toBe(expectedKey);
+            expect(root.idempotency_key.startsWith("reuse:")).toBe(true);
+            expect(root.idempotency_key).not.toBe("fresh-src");
+            // No raw occurrence evidence is copied: the lineage row is the
+            // target's evidence of origin.
+            const inputs = await pool.query(
+                `SELECT count(*)::int AS c FROM meal_event_inputs WHERE event_id = $1`,
+                [result.event_id],
+            );
+            expect(inputs.rows[0]!.c).toBe(0);
+            const journal = await pool.query(
+                `SELECT count(*)::int AS c FROM meal_event_sync_journal WHERE event_id = $1`,
+                [result.event_id],
+            );
+            expect(journal.rows[0]!.c).toBe(0);
+        });
+
+        test("copies items, all provider rows, and all canonical rows column-for-column with remapped source_result_ids", async () => {
+            const sourceId = await seedMealEvent(pool, "u1", {
+                idempotencyKey: "copy-src",
+                consumedAt: daysAgo(3),
+                mealType: "lunch",
+                items: [
+                    {
+                        ordinal: 0,
+                        raw_item_text: "copy chicken bowl",
+                        normalized_name: "chicken bowl",
+                        quantity: 250,
+                        portion_value: 1,
+                        portion_unit: "bowl",
+                        notes: "extra sauce",
+                    },
+                    { ordinal: 1, raw_item_text: "copy water", quantity: null },
+                ],
+            });
+            await commitBundle(pool, "u1", readyBundle(sourceId, 1));
+            const source = await snapshotAggregate(pool, sourceId, 1);
+
+            const result = await reuseMealCalculation(
+                pool,
+                reuseCommand({ source_event_id: sourceId }),
+            );
+            const target = await snapshotAggregate(pool, result.event_id, 1);
+
+            // Items: identical content, same ordinals.
+            expect(
+                target.items.map((r) => stripIdentity(r)),
+            ).toEqual(source.items.map((r) => stripIdentity(r)));
+            // Provider evidence: every column byte-equal except identity.
+            expect(target.provider_results).toHaveLength(
+                source.provider_results.length,
+            );
+            expect(
+                target.provider_results.map((r) => stripIdentity(r)),
+            ).toEqual(source.provider_results.map((r) => stripIdentity(r)));
+            // Canonical facts: byte-equal except identity and the remapped
+            // source_result_ids.
+            expect(target.canonical_results).toHaveLength(
+                source.canonical_results.length,
+            );
+            expect(
+                target.canonical_results.map((r) =>
+                    stripIdentity(r, ["source_result_ids"]),
+                ),
+            ).toEqual(
+                source.canonical_results.map((r) =>
+                    stripIdentity(r, ["source_result_ids"]),
+                ),
+            );
+            // Remap: source canonical ids -> target canonical ids through the
+            // persisted provider mapping, order preserved.
+            const targetProviderIds = new Set(
+                target.provider_results.map((r) => r.id as string),
+            );
+            const sourceCanonical = source.canonical_results.find(
+                (r) => r.ordinal === null,
+            )!;
+            const targetCanonical = target.canonical_results.find(
+                (r) => r.ordinal === null,
+            )!;
+            expect(targetCanonical.source_result_ids).toHaveLength(3);
+            for (const id of targetCanonical.source_result_ids as string[]) {
+                expect(targetProviderIds.has(id)).toBe(true);
+            }
+            // Each remapped id corresponds to the true source id in order.
+            const mappings = await pool.query(
+                `SELECT target_provider_result_id, source_provider_result_id
+                 FROM meal_event_reuse_provider_sources
+                 WHERE event_id = $1 AND version = 1`,
+                [result.event_id],
+            );
+            const toSource = new Map(
+                mappings.rows.map((m) => [
+                    m.target_provider_result_id as string,
+                    m.source_provider_result_id as string,
+                ]),
+            );
+            expect(
+                (targetCanonical.source_result_ids as string[]).map((id) =>
+                    toSource.get(id),
+                ),
+            ).toEqual(sourceCanonical.source_result_ids as string[]);
+        });
+
+        test("persists lineage + three provider mappings with exact source identity and bundle fingerprint", async () => {
+            const sourceId = await seedMealEvent(pool, "u1", {
+                idempotencyKey: "lineage-src",
+                consumedAt: daysAgo(1),
+                items: [{ ordinal: 0, raw_item_text: "lineage oats" }],
+            });
+            const bundle = readyBundle(sourceId, 1);
+            await commitBundle(pool, "u1", bundle);
+            const command = reuseCommand({ source_event_id: sourceId });
+
+            const result = await reuseMealCalculation(pool, command);
+            const lineage = await getReuseLineage(pool, "u1", result.event_id);
+
+            expect(lineage).not.toBeNull();
+            expect(lineage!.source_event_id).toBe(sourceId);
+            expect(lineage!.source_version).toBe(1);
+            expect(lineage!.source_bundle_fingerprint).toBe(bundle.fingerprint!);
+            expect(lineage!.reuse_idempotency_key).toBe(
+                command.idempotency_key,
+            );
+            expect(lineage!.confirmation_received).toBe(true);
+            const sourceCanonical = await pool.query(
+                `SELECT id FROM meal_event_canonical_results
+                 WHERE event_id = $1 AND version = 1 AND ordinal IS NULL`,
+                [sourceId],
+            );
+            expect(lineage!.source_canonical_result_id).toBe(
+                sourceCanonical.rows[0]!.id,
+            );
+            expect(typeof lineage!.copied_at).toBe("string");
+            expect(lineage!.provider_mappings).toHaveLength(3);
+            const sourceProviders = await pool.query(
+                `SELECT id, request_fingerprint FROM meal_event_nutrition_results
+                 WHERE event_id = $1 AND version = 1`,
+                [sourceId],
+            );
+            const sourceById = new Map(
+                sourceProviders.rows.map((r) => [
+                    r.id as string,
+                    r.request_fingerprint as string,
+                ]),
+            );
+            const targetProviders = await pool.query(
+                `SELECT id, request_fingerprint FROM meal_event_nutrition_results
+                 WHERE event_id = $1 AND version = 1`,
+                [result.event_id],
+            );
+            const targetIds = new Set(
+                targetProviders.rows.map((r) => r.id as string),
+            );
+            for (const mapping of lineage!.provider_mappings) {
+                expect(targetIds.has(mapping.target_provider_result_id)).toBe(
+                    true,
+                );
+                expect(
+                    sourceById.get(mapping.source_provider_result_id),
+                ).toBe(mapping.source_request_fingerprint);
+            }
+        });
+
+        test("target re-derives ready/non-compatibility through getMealEventProvenance", async () => {
+            const sourceId = await seedMealEvent(pool, "u1", {
+                idempotencyKey: "prov-src",
+                consumedAt: daysAgo(2),
+                items: [{ ordinal: 0, raw_item_text: "provenance oats" }],
+            });
+            const bundle = readyBundle(sourceId, 1);
+            await commitBundle(pool, "u1", bundle);
+
+            const result = await reuseMealCalculation(
+                pool,
+                reuseCommand({ source_event_id: sourceId }),
+            );
+            const readback = await getMealEventProvenance(
+                pool,
+                "u1",
+                result.event_id,
+            );
+
+            expect(readback).not.toBeNull();
+            expect(readback!.provenance_status).toBe("ready");
+            expect(readback!.compatibility).toBe(false);
+            expect(readback!.is_current).toBe(true);
+            expect(
+                readback!.aggregate.version.calculation_bundle_fingerprint,
+            ).toBe(bundle.fingerprint!);
+            expect(readback!.aggregate.canonical!.calories).toBe(500);
+            expect(readback!.aggregate.canonical!.protein_g).toBe(20);
+            expect(readback!.aggregate.canonical!.carbs_g).toBe(60);
+            expect(readback!.aggregate.canonical!.fat_g).toBe(15);
+            expect(result.provenance_status).toBe("ready");
+            expect(result.compatibility).toBe(false);
+            expect(result.source_bundle_fingerprint).toBe(bundle.fingerprint!);
+        });
+
+        test("source aggregate is byte-identical before and after reuse", async () => {
+            const sourceId = await seedMealEvent(pool, "u1", {
+                idempotencyKey: "immutable-src",
+                consumedAt: daysAgo(4),
+                items: [{ ordinal: 0, raw_item_text: "immutable oats" }],
+            });
+            await commitBundle(pool, "u1", readyBundle(sourceId, 1));
+            const before = await snapshotAggregate(pool, sourceId, 1);
+
+            await reuseMealCalculation(
+                pool,
+                reuseCommand({ source_event_id: sourceId }),
+            );
+
+            expect(await snapshotAggregate(pool, sourceId, 1)).toEqual(before);
+        });
+
+        test("reuses the requested historical version after a correction (source_was_current=false)", async () => {
+            const sourceId = await seedMealEvent(pool, "u1", {
+                idempotencyKey: "hist-src",
+                consumedAt: daysAgo(5),
+                items: [{ ordinal: 0, raw_item_text: "historical v1 oats" }],
+            });
+            const bundle = readyBundle(sourceId, 1);
+            await commitBundle(pool, "u1", bundle);
+            await correctMeal(pool, "u1", sourceId, {
+                correctionKey: "hist-src-v2",
+                items: [{ ordinal: 0, raw_item_text: "corrected v2 oats" }],
+            });
+            const sourceV1 = await snapshotAggregate(pool, sourceId, 1);
+
+            const result = await reuseMealCalculation(
+                pool,
+                reuseCommand({ source_event_id: sourceId, source_version: 1 }),
+            );
+
+            expect(result.source_was_current).toBe(false);
+            const target = await snapshotAggregate(pool, result.event_id, 1);
+            expect(target.items.map((r) => stripIdentity(r))).toEqual(
+                sourceV1.items.map((r) => stripIdentity(r)),
+            );
+            expect(
+                target.canonical_results.map((r) =>
+                    stripIdentity(r, ["source_result_ids"]),
+                ),
+            ).toEqual(
+                sourceV1.canonical_results.map((r) =>
+                    stripIdentity(r, ["source_result_ids"]),
+                ),
+            );
+            // The v2 correction text never leaks into the v1 copy.
+            expect(JSON.stringify(target.items)).not.toContain("corrected");
+        });
+
+        test("reuse of the current version sets source_was_current true", async () => {
+            const sourceId = await seedMealEvent(pool, "u1", {
+                idempotencyKey: "cur-src",
+                consumedAt: daysAgo(1),
+                items: [{ ordinal: 0, raw_item_text: "current oats" }],
+            });
+            await commitBundle(pool, "u1", readyBundle(sourceId, 1));
+
+            const result = await reuseMealCalculation(
+                pool,
+                reuseCommand({ source_event_id: sourceId, source_version: 1 }),
+            );
+
+            expect(result.source_was_current).toBe(true);
+        });
+
+        test("getReuseLineage returns the link user-scoped; null for another user", async () => {
+            const sourceId = await seedMealEvent(pool, "u1", {
+                idempotencyKey: "scope-src",
+                consumedAt: daysAgo(1),
+                items: [{ ordinal: 0, raw_item_text: "scoped oats" }],
+            });
+            await commitBundle(pool, "u1", readyBundle(sourceId, 1));
+
+            const result = await reuseMealCalculation(
+                pool,
+                reuseCommand({ source_event_id: sourceId }),
+            );
+
+            expect(
+                await getReuseLineage(pool, "u1", result.event_id),
+            ).not.toBeNull();
+            expect(
+                await getReuseLineage(pool, "u2", result.event_id),
+            ).toBeNull();
+            expect(await getReuseLineage(pool, "u1", sourceId)).toBeNull();
+        });
+    },
+);
