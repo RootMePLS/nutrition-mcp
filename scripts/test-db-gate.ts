@@ -31,6 +31,8 @@ const suites = [
     "src/calculation-acceptance.integration.test.ts",
     "src/supplements.integration.test.ts",
     "src/mcp-supplements.integration.test.ts",
+    "src/meal-reuse.integration.test.ts",
+    "src/mcp-reuse.integration.test.ts",
 ];
 const env = {
     ...process.env,
