@@ -53,6 +53,7 @@ plus the audit family itself and the gap-remediation campaign family.
 | `2026-08-05-calculation-provenance-enforcement-*` (brief, plan, terra reviews 1-9)                                       | 11    | implemented | Terra reviews 1-8 (FAIL) superseded by `2026-08-05-calculation-provenance-enforcement-terra-review-9.md` (PASS) | Audit row 56; implementation committed in `b5e369f`; working tree closed out by accepted slice S0 (`be94d98`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `2026-08-05-plan-vs-code-gap-audit.md` (audit family)                                                                    | 1     | superseded  | `2026-08-05-gap-remediation-campaign-plan.md`                                                                   | Governing audit for the campaign; campaign plan `.hermes/plans/2026-08-05-gap-remediation-campaign-plan.md`; archived by S0 commit `249698a`                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `2026-08-05-gap-remediation-campaign-{brief,plan}` (campaign family)                                                     | 2     | implemented | —                                                                                                               | Campaign plan slices S0-S11 complete; S0-S10 accepted (per-slice table below); campaign evidence range `36dd86f`..S11 closeout commit `b538d1e` (`docs: close out gap-remediation campaign`); this row owns only the campaign brief and plan — the closeout and all S11 review artifacts belong to the S11 subfamily row; final acceptance follows the effective-acceptance rule above: the literal Status cell is the dated-snapshot baseline, and effective status is `accepted` exactly when the latest committed `2026-08-05-gap-remediation-s11-terra-review*.md` has verdict PASS, otherwise `implemented` |
+| `2026-08-06-mcp-fixes-*` (brief, plan)                                                                                   | 2     | implemented | —                                                                                                               | Schema hardening (`append_meal_capture_message`, `confirm_meal_capture`, fingerprint docs) plus the commit-after-`update_meal` duplicate-key fix, implemented test-first per the plan; baseline typecheck fix `6127486`; task commits `a7567dc`, `fdcd3e3`, `ed33676`, `1d89ab7`, `09a6220`, `6126255`; the plan also records the MCP 2.0 migration assessment                                                                                                                                                                                                                                                   |
 
 ## Gap-remediation campaign per-slice subfamilies
 
@@ -100,3 +101,15 @@ matching `.hermes/plans/2026-08-05-gap-remediation-s11-terra-review*.md` is
 owned by the S11 subfamily row's dynamic pattern, so it increments Tracked and
 Covered together and preserves Unmatched 0 and Duplicates 0. Any other new
 plan file still requires a one-row INDEX update, as before.
+
+Snapshot 2026-08-06, taken at the mcp-fixes closeout
+(`docs: mcp fixes plan + index`), which adds the
+`2026-08-06-mcp-fixes-{brief,plan}` family (covered by its own family row
+above):
+
+- Tracked markdown files: 96
+- Covered: 95 (26 classification entries: 14 family rows + 12 slice subfamily
+  rows)
+- Unmatched: 0
+- Duplicates (file in more than one family): 0
+- Excluded from coverage by design: `INDEX.md` (this file)
