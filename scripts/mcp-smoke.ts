@@ -1,6 +1,9 @@
 // Local MCP SDK smoke: drives the real server tools over an in-memory MCP
-// transport against the disposable database in DATABASE_URL (which must equal
-// DATABASE_URL_TEST so nothing here can touch a non-test database).
+// transport against the approved disposable test database. It fails closed
+// before any pool, clock freeze, or scratch state unless DATABASE_URL and
+// DATABASE_URL_TEST are exactly equal AND the parsed URL's database pathname
+// decodes to exactly `nutrition_mcp_test`; DSN equality alone never
+// authorizes the DROP SCHEMA below.
 //
 // Covers the legacy surface end to end: log, bulk import, update, all eight
 // legacy reads (get_meals_by_date, get_meals_today, get_meals_by_date_range,
@@ -28,18 +31,42 @@ import { createMediaStore } from "../src/media-store.js";
 import { closePool } from "../src/db.js";
 import { flushAnalytics } from "../src/analytics.js";
 
-const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl || process.env.DATABASE_URL_TEST !== databaseUrl) {
-    console.error(
-        "MCP smoke refused: DATABASE_URL and DATABASE_URL_TEST must both be set " +
-            "to the same disposable PostgreSQL database.",
-    );
+// Fail closed before pool construction, clock freeze, or scratch creation.
+// Refusal output is explicit and non-secret: it names the reason and the
+// (non-secret) parsed database name only, never the DSN, which may carry
+// credentials.
+function refuse(reason: string): never {
+    console.error(`MCP smoke refused: ${reason}`);
     process.exit(2);
 }
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl || process.env.DATABASE_URL_TEST !== databaseUrl) {
+    refuse(
+        "DATABASE_URL and DATABASE_URL_TEST must both be set to the same " +
+            "disposable PostgreSQL database.",
+    );
+}
+const APPROVED_DATABASE = "nutrition_mcp_test";
+let databaseName: string;
+try {
+    databaseName = decodeURIComponent(
+        new URL(databaseUrl).pathname.replace(/^\/+/, ""),
+    );
+} catch {
+    refuse("DATABASE_URL could not be parsed as a PostgreSQL URL.");
+}
+if (databaseName !== APPROVED_DATABASE) {
+    refuse(
+        `database name ${JSON.stringify(databaseName)} is not the approved ` +
+            `disposable test database ${JSON.stringify(APPROVED_DATABASE)}; ` +
+            "equal DSNs alone do not authorize a destructive schema reset.",
+    );
+}
 
-const USER = "smoke-user";
-// Unique per run so idempotency keys never collide with a prior smoke run.
+// Unique per run so idempotency keys and the smoke-owned exports path never
+// collide with a prior smoke run or any other operator's exports.
 const RUN = `r${Math.random().toString(36).slice(2, 10)}`;
+const USER = `smoke-user-${RUN}`;
 // Freeze the clock at today's UTC noon: get_meals_today and the trend windows
 // resolve "today" server-side, so a fixed noon keeps the smoke deterministic
 // across the UTC midnight boundary (same approach as the legacy regression
@@ -50,7 +77,12 @@ setSystemTime(new Date(`${DAY}T12:00:00.000Z`));
 const exportsDir = join(
     fileURLToPath(new URL("..", import.meta.url)),
     "exports",
+    USER,
 );
+// Smoke-owned exports directory: exports/<unique per-run smoke user>. Every
+// cleanup path (normal exit, failure, process exit) removes only this
+// directory — never the repository-wide exports root — so unrelated users'
+// exports always survive.
 // Scratch media root for the capture attach path; removed in the finally.
 const mediaRoot = mkdtempSync(join(tmpdir(), "nutrition-mcp-smoke-media-"));
 // Belt-and-braces: whatever path the process exits by (including a setup
@@ -60,15 +92,43 @@ process.on("exit", () => {
     rmSync(mediaRoot, { recursive: true, force: true });
 });
 
-// Tiny PNG fixture (12-byte header), same class of payload the media attach
-// tests use; the server decodes it, checks the MIME allow-list and hashes it.
+// Tiny PNG fixture: a known-valid, independently decodable 1x1 RGBA image
+// (68 bytes; verified with the macOS image decoder, `sips`, as 1x1). The
+// server decodes it, checks the MIME allow-list and hashes it.
 const PNG_BYTES = new Uint8Array([
-    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 5, 6, 7, 8,
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
+    0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x00, 0x02, 0x00,
+    0x00, 0x05, 0x00, 0x01, 0x7a, 0x5e, 0xab, 0x3f, 0x00, 0x00, 0x00, 0x00,
+    0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 ]);
 const PNG_BASE64 = Buffer.from(PNG_BYTES).toString("base64");
 const PNG_SHA256 = new Bun.CryptoHasher("sha256")
     .update(PNG_BYTES)
     .digest("hex");
+
+// Direct pre-attachment fixture check: parse the PNG container ourselves and
+// require the 8-byte signature, an IHDR first chunk, and exactly 1x1
+// dimensions at minimum, so a broken fixture fails the smoke before the
+// attach path is ever exercised.
+function pngDimensions(
+    bytes: Uint8Array,
+): { width: number; height: number } | null {
+    const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    if (bytes.byteLength < 8 + 8 + 13) return null;
+    if (!signature.every((b, i) => bytes[i] === b)) return null;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (view.getUint32(8) !== 13) return null; // IHDR chunk length
+    if (
+        String.fromCharCode(bytes[12]!, bytes[13]!, bytes[14]!, bytes[15]!) !==
+        "IHDR"
+    ) {
+        return null;
+    }
+    return { width: view.getUint32(16), height: view.getUint32(20) };
+}
+const fixtureDimensions = pngDimensions(PNG_BYTES);
 
 interface ToolResult {
     isError?: boolean;
@@ -84,6 +144,17 @@ function check(step: string, ok: boolean, detail = ""): void {
     }
     console.log(`smoke ok: ${step}`);
 }
+
+// Fixture gate: runs before any pool or tool work so an invalid payload can
+// never reach the attach path.
+check(
+    "png fixture decodes as 1x1",
+    fixtureDimensions !== null &&
+        fixtureDimensions.width === 1 &&
+        fixtureDimensions.height === 1,
+    `fixture_bytes=${PNG_BYTES.byteLength} ` +
+        `dimensions=${JSON.stringify(fixtureDimensions)}`,
+);
 
 const pool = new Pool({ connectionString: databaseUrl });
 
