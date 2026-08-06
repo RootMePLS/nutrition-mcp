@@ -2044,9 +2044,15 @@ export async function logSupplementIntake(
                     );
                     const boundLabel = labelRows[0] as
                         { display_name: string } | undefined;
-                    const description =
-                        boundLabel?.display_name ??
-                        `Suppl. ${root.id.slice(0, 8)}`;
+                    // display_name is NOT NULL and the version row was verified
+                    // above; a missing row here is corruption, not a formatting
+                    // case. Fail closed rather than fabricating a label.
+                    if (!boundLabel) {
+                        throw new Error(
+                            "snack linkage could not read the bound label version display_name",
+                        );
+                    }
+                    const description = boundLabel.display_name;
 
                     // 2. Fetch the scaled snapshot nutrients that were just inserted
                     //    (visible inside the same transaction).
@@ -2117,6 +2123,23 @@ export async function logSupplementIntake(
                                 algorithm_version: "label-compat-v1",
                                 source_id: `suppl-snack:${intakeId}`,
                                 nutrients: ownNutrients,
+                                // Label-derived transparent provenance: the exact
+                                // historical label version this snack was
+                                // computed from. No external provider call.
+                                provenance: {
+                                    kind: "supplement_label",
+                                    intake_id: intakeId,
+                                    product_id: root.id,
+                                    product_version: boundVersion,
+                                    servings: fields.servings,
+                                },
+                                raw_payload: {
+                                    source: "supplement_intake_nutrient_snapshots",
+                                    scaled_by_servings: fields.servings,
+                                    nutrients: ownNutrients,
+                                },
+                                basis: "per_meal",
+                                units: "g_and_kcal",
                             },
                         ],
                         parser_policy_version: "label-compat-v1",
