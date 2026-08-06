@@ -269,6 +269,13 @@ version = 1, revision_idempotency_key)` group deterministically — the
    then does it create the same index `IF NOT EXISTS`. A database stuck at
    008's `could not create unique index` failure reaches head by applying
    009 and then re-applying 008, which succeeds as a no-op.
+10. `db/migrations/010_supplement_regimen_idempotency.sql` — additive and
+    rerun-safe: a nullable `idempotency_key` column on `supplement_regimens`
+    plus a partial unique index `uniq_supplement_regimens_user_idem` on
+    `(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL`, so
+    concurrent first-time regimen creates with the same key serialize at the
+    database exactly like product creates do under 008. Null keys stay
+    non-unique and different users never collide.
 
 For a new database:
 
@@ -282,9 +289,10 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/006_meal_reuse_and_supp
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/007_ownership_lineage_integrity.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/008_supplement_create_idempotency.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/009_supplement_create_idem_reconciliation.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/010_supplement_regimen_idempotency.sql
 ```
 
-`004`, `005`, `006`, `007`, `008`, and `009` are additive and rerunnable. `002` is forward-only and
+`004`, `005`, `006`, `007`, `008`, `009`, and `010` are additive and rerunnable. `002` is forward-only and
 irreversible because of the legacy reset. The disposable integration database
 is selected explicitly; do not treat skipped PostgreSQL tests as a pass:
 

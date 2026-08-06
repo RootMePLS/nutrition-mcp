@@ -22,6 +22,7 @@ const MIGRATION_007 = "db/migrations/007_ownership_lineage_integrity.sql";
 const MIGRATION_008 = "db/migrations/008_supplement_create_idempotency.sql";
 const MIGRATION_009 =
     "db/migrations/009_supplement_create_idem_reconciliation.sql";
+const MIGRATION_010 = "db/migrations/010_supplement_regimen_idempotency.sql";
 
 const MIGRATION_006_TABLES = [
     "meal_event_reuse_sources",
@@ -108,6 +109,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_007);
         await applyMigration(client, MIGRATION_008);
         await applyMigration(client, MIGRATION_009);
+        await applyMigration(client, MIGRATION_010);
 
         const tables = await tableNames(client);
         for (const table of NEW_TABLES) {
@@ -370,6 +372,163 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         expect(reuseUniques.length).toBeGreaterThanOrEqual(2);
     });
 
+    test("migration: 010 adds the regimen idempotency index over an already-applied 001-009 database", async () => {
+        await resetSchema(client);
+        await applyMigration(client, MIGRATION_001);
+        await applyMigration(client, MIGRATION_002);
+        await applyMigration(client, MIGRATION_003);
+        await applyMigration(client, MIGRATION_004);
+        await applyMigration(client, MIGRATION_005);
+        await applyMigration(client, MIGRATION_006);
+        await applyMigration(client, MIGRATION_007);
+        await applyMigration(client, MIGRATION_008);
+        await applyMigration(client, MIGRATION_009);
+
+        // Seed a populated pre-010 database: opt-in alcohol profile (UK
+        // units), a real meal event, and a regimen-less supplement product
+        // through the shipped write paths.
+        await client.query(
+            `INSERT INTO profiles (user_id, alcohol_tracking_enabled, preferred_drink_unit)
+             VALUES ($1, true, 'uk')`,
+            ["u1"],
+        );
+        const event = await createMealEvent(
+            pool,
+            {
+                user_id: "u1",
+                idempotency_key: "pre-010-event",
+                reported_at: "2026-08-05T12:00:00.000Z",
+                items: [{ ordinal: 0, raw_item_text: "oats" }],
+                inputs: [],
+                media: [],
+                provider_results: [
+                    {
+                        provider: "own",
+                        status: "succeeded",
+                        request_fingerprint: "pre-010-fp",
+                        algorithm_version: "v1",
+                        nutrients: { calories: 100 },
+                        raw_payload: { calories: 100 },
+                    },
+                ],
+                parser_policy_version: "test",
+                created_by: "test",
+            },
+            client,
+        );
+        const { rows: productRows } = await client.query(
+            `INSERT INTO supplement_products (user_id, category)
+             VALUES ('u1', 'supplement') RETURNING id`,
+        );
+        const productId = productRows[0].id as string;
+        await client.query(
+            `INSERT INTO supplement_product_versions
+                (product_id, version, user_id, display_name, label_evidence, created_by)
+             VALUES ($1, 1, 'u1', 'Creatine', '{}', 'test')`,
+            [productId],
+        );
+        await client.query(
+            `INSERT INTO supplement_product_nutrients
+                (product_id, version, nutrient_key, display_name, amount, unit, source_evidence)
+             VALUES ($1, 1, 'creatine_g', NULL, 5, 'g', '{}')`,
+            [productId],
+        );
+
+        // Apply 010 twice: forward-only and rerun-safe.
+        await applyMigration(client, MIGRATION_010);
+        await applyMigration(client, MIGRATION_010);
+
+        // Pre-existing rows survive untouched.
+        const { rows: profiles } = await client.query(
+            "SELECT alcohol_tracking_enabled, preferred_drink_unit FROM profiles WHERE user_id = 'u1'",
+        );
+        expect(profiles).toEqual([
+            { alcohol_tracking_enabled: true, preferred_drink_unit: "uk" },
+        ]);
+        const { rows: events } = await client.query(
+            "SELECT id, status, current_version FROM meal_events WHERE id = $1",
+            [event.event_id],
+        );
+        expect(events).toEqual([
+            { id: event.event_id, status: "active", current_version: 1 },
+        ]);
+        const { rows: products } = await client.query(
+            "SELECT id, status, current_version FROM supplement_products WHERE id = $1",
+            [productId],
+        );
+        expect(products).toEqual([
+            { id: productId, status: "active", current_version: 1 },
+        ]);
+        const { rows: nutrients } = await client.query(
+            "SELECT amount FROM supplement_product_nutrients WHERE product_id = $1",
+            [productId],
+        );
+        expect(Number(nutrients[0].amount)).toBe(5);
+
+        // The nullable idempotency column exists.
+        const { rows: columns } = await client.query(
+            `SELECT column_name, is_nullable FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'supplement_regimens'
+               AND column_name = 'idempotency_key'`,
+        );
+        expect(columns).toEqual([
+            { column_name: "idempotency_key", is_nullable: "YES" },
+        ]);
+
+        // The partial unique index exists.
+        const { rows: indexes } = await client.query(
+            `SELECT indexdef FROM pg_indexes
+             WHERE schemaname = 'public' AND tablename = 'supplement_regimens'
+               AND indexname = 'uniq_supplement_regimens_user_idem'`,
+        );
+        expect(indexes.length).toBe(1);
+        expect(indexes[0].indexdef as string).toContain("UNIQUE");
+        expect(indexes[0].indexdef as string).toContain(
+            "idempotency_key IS NOT NULL",
+        );
+
+        // The index actually enforces user-scoped create idempotency: same
+        // user + same key conflicts, different users may share a key, and
+        // NULL keys never collide.
+        // u2 needs its own product: migration 007 binds regimen
+        // (product_id, product_version, user_id) to a same-user version row.
+        const { rows: u2ProductRows } = await client.query(
+            `INSERT INTO supplement_products (user_id, category)
+             VALUES ('u2', 'supplement') RETURNING id`,
+        );
+        const u2ProductId = u2ProductRows[0].id as string;
+        await client.query(
+            `INSERT INTO supplement_product_versions
+                (product_id, version, user_id, display_name, label_evidence, created_by)
+             VALUES ($1, 1, 'u2', 'Creatine', '{}', 'test')`,
+            [u2ProductId],
+        );
+        async function insertRegimen(
+            userId: string,
+            product: string,
+            key: string | null,
+        ): Promise<void> {
+            await client.query(
+                `INSERT INTO supplement_regimens
+                    (user_id, product_id, product_version, dose_servings,
+                     schedule, timezone, starts_on, created_by, idempotency_key)
+                 VALUES ($1, $2, 1, 1,
+                         '{"timezone":"UTC","frequency":"daily","local_time":"08:00"}',
+                         'UTC', '2026-08-01', 'test', $3)`,
+                [userId, product, key],
+            );
+        }
+        await insertRegimen("u1", productId, "reg-key");
+        await expect(
+            insertRegimen("u1", productId, "reg-key"),
+        ).rejects.toMatchObject({
+            code: "23505",
+        });
+        await insertRegimen("u2", u2ProductId, "reg-key");
+        await insertRegimen("u1", productId, null);
+        await insertRegimen("u1", productId, null);
+    });
+
     test("migration: public_landing_stats counts meal_events current versions", async () => {
         await resetSchema(client);
         await applyMigration(client, MIGRATION_001);
@@ -420,6 +579,7 @@ const INTEGRITY_CHAIN = [
     MIGRATION_007,
     MIGRATION_008,
     MIGRATION_009,
+    MIGRATION_010,
 ];
 
 // Reviewer-terra finding 2: direct persistence must not be able to create
