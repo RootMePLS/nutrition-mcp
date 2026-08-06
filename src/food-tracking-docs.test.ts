@@ -33,6 +33,7 @@ test("agent-driven docs enumerate the forward migration chain", async () => {
         "003_meal_captures.sql",
         "004_calculation_bundles.sql",
         "005_calculation_corrections.sql",
+        "006_meal_reuse_and_supplements.sql",
     ];
     for (const migration of migrations) {
         expect(docs).toContain(migration);

@@ -297,6 +297,8 @@ function sha256Hex(parts: (string | number | null | undefined)[]): string {
         .digest("hex");
 }
 
+export { sha256Hex };
+
 export function deriveCreateFingerprint(
     command: CreateMealEventCommand,
 ): string {
@@ -317,6 +319,33 @@ export function deriveCorrectionFingerprint(args: {
         args.event_id,
         args.correction_idempotency_key,
         ...args.command.items.map((i) => `${i.ordinal}:${i.raw_item_text}`),
+    ])}`;
+}
+
+// A reuse identity binds the caller's reuse idempotency key to the exact
+// source event/version and the new occurrence timestamps. Replaying the same
+// key with the same identity converges on the original reused event; the same
+// key with any differing source, version, or timestamp is a stable conflict,
+// never a silent second reuse.
+export interface ReuseIdempotencyIdentity {
+    user_id: string;
+    reuse_idempotency_key: string;
+    source_event_id: string;
+    source_version: number;
+    reported_at: Date | string;
+    consumed_at: Date | string;
+}
+
+export function deriveReuseIdempotencyFingerprint(
+    identity: ReuseIdempotencyIdentity,
+): string {
+    return `reuse:${sha256Hex([
+        identity.user_id,
+        identity.reuse_idempotency_key,
+        identity.source_event_id,
+        identity.source_version,
+        String(identity.reported_at),
+        String(identity.consumed_at),
     ])}`;
 }
 

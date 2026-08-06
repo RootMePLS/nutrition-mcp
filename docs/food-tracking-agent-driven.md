@@ -214,6 +214,12 @@ Apply the forward-only migrations in this exact order:
    version fingerprint columns.
 5. `db/migrations/005_calculation_corrections.sql` — immutable correction and
    canonical audit columns.
+6. `db/migrations/006_meal_reuse_and_supplements.sql` — additive meal-reuse
+   lineage and supplement/sports-nutrition catalogue substrate (products,
+   immutable label versions, aliases, generic nutrients, label limits,
+   declarative regimens, append-only intake facts, nutrient snapshots, and
+   intake↔snack links). Schema only: no MCP tools are registered for these
+   tables yet.
 
 For a new database:
 
@@ -223,9 +229,10 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/002_food_tracking.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/003_meal_captures.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/004_calculation_bundles.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/005_calculation_corrections.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/006_meal_reuse_and_supplements.sql
 ```
 
-`004` and `005` are additive and rerunnable. `002` is forward-only and
+`004`, `005`, and `006` are additive and rerunnable. `002` is forward-only and
 irreversible because of the legacy reset. The disposable integration database
 is selected explicitly; do not treat skipped PostgreSQL tests as a pass:
 
