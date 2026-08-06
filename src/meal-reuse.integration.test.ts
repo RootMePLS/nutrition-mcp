@@ -945,3 +945,286 @@ describeDb(
         });
     },
 );
+
+
+// ---------------------------------------------------------------------------
+// Slice 4 fail-closed eligibility: every rejection class carries a stable
+// typed error, writes nothing, and never fabricates a zero-valued canonical.
+// ---------------------------------------------------------------------------
+
+import {
+    MealReuseIdempotencyConflictError,
+    MealReuseSourceIneligibleError,
+    MealReuseSourceNotFoundError,
+    MealReuseSourceVersionError,
+} from "./meal-reuse.js";
+import { MealEventValidationError } from "./meal-events.js";
+
+/** No rejection path may leave a fabricated zero nutrient anywhere. */
+async function expectNoZeroCanonical(pool: Pool): Promise<void> {
+    const { rows } = await pool.query(
+        `SELECT count(*)::int AS c FROM meal_event_canonical_results
+         WHERE calories = 0 OR protein_g = 0 OR carbs_g = 0 OR fat_g = 0`,
+    );
+    expect(rows[0]!.c).toBe(0);
+}
+
+async function catchReuseError(
+    promise: Promise<unknown>,
+): Promise<Error> {
+    try {
+        await promise;
+    } catch (err) {
+        return err as Error;
+    }
+    throw new Error("expected reuseMealCalculation to reject, but it resolved");
+}
+
+describeDb(
+    "reuse_meal_calculation fail-closed eligibility (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await pool.end();
+        });
+
+        beforeEach(async () => {
+            await resetSchema(pool);
+        });
+
+        afterEach(async () => {
+            await flushAnalytics();
+        });
+
+        async function seedReadySource(
+            userId: string,
+            key: string,
+            itemText: string,
+        ): Promise<string> {
+            const id = await seedMealEvent(pool, userId, {
+                idempotencyKey: key,
+                consumedAt: daysAgo(1),
+                items: [{ ordinal: 0, raw_item_text: itemText }],
+            });
+            await commitBundle(pool, userId, readyBundle(id, 1));
+            return id;
+        }
+
+        test("absent source id -> meal_reuse_source_not_found, zero writes", async () => {
+            const before = await domainTableCounts(pool);
+            const err = await catchReuseError(
+                reuseMealCalculation(
+                    pool,
+                    reuseCommand({
+                        source_event_id:
+                            "99999999-9999-9999-9999-999999999999",
+                    }),
+                ),
+            );
+            expect(err).toBeInstanceOf(MealReuseSourceNotFoundError);
+            expect(
+                (err as MealReuseSourceNotFoundError).code,
+            ).toBe("meal_reuse_source_not_found");
+            expect(await domainTableCounts(pool)).toEqual(before);
+            await expectNoZeroCanonical(pool);
+        });
+
+        test("cross-user source -> identical not_found; error leaks no source text or ids", async () => {
+            const sourceId = await seedReadySource(
+                "u1",
+                "xu-src",
+                "u1 private porridge",
+            );
+            const before = await domainTableCounts(pool);
+            const crossUser = await catchReuseError(
+                reuseMealCalculation(
+                    pool,
+                    reuseCommand({
+                        user_id: "u2",
+                        source_event_id: sourceId,
+                    }),
+                ),
+            );
+            const absent = await catchReuseError(
+                reuseMealCalculation(
+                    pool,
+                    reuseCommand({
+                        user_id: "u2",
+                        source_event_id:
+                            "99999999-9999-9999-9999-999999999999",
+                        idempotency_key: "xu-absent",
+                    }),
+                ),
+            );
+            expect(crossUser).toBeInstanceOf(MealReuseSourceNotFoundError);
+            // Indistinguishable from a genuinely absent source by design.
+            expect(crossUser.message).toBe(absent.message);
+            expect(JSON.stringify(crossUser)).not.toContain("private");
+            expect(JSON.stringify(crossUser)).not.toContain(sourceId);
+            expect(await domainTableCounts(pool)).toEqual(before);
+            await expectNoZeroCanonical(pool);
+        });
+
+        test("deleted source -> not_found, zero writes", async () => {
+            const sourceId = await seedReadySource(
+                "u1",
+                "del-src",
+                "deleted porridge",
+            );
+            await deleteMealEvent(pool, "u1", sourceId);
+            const before = await domainTableCounts(pool);
+            const err = await catchReuseError(
+                reuseMealCalculation(
+                    pool,
+                    reuseCommand({ source_event_id: sourceId }),
+                ),
+            );
+            expect(err).toBeInstanceOf(MealReuseSourceNotFoundError);
+            expect(await domainTableCounts(pool)).toEqual(before);
+            await expectNoZeroCanonical(pool);
+        });
+
+        test("source_version 0 is rejected by validation before any query", async () => {
+            const sourceId = await seedReadySource(
+                "u1",
+                "v0-src",
+                "version zero oats",
+            );
+            const before = await domainTableCounts(pool);
+            const err = await catchReuseError(
+                reuseMealCalculation(
+                    pool,
+                    reuseCommand({
+                        source_event_id: sourceId,
+                        source_version: 0,
+                    }),
+                ),
+            );
+            expect(err).toBeInstanceOf(MealEventValidationError);
+            expect(err.message).toContain("source_version");
+            expect(await domainTableCounts(pool)).toEqual(before);
+        });
+
+        test("nonexistent version (current+1) -> version error, never a leak of version existence across users", async () => {
+            const sourceId = await seedReadySource(
+                "u1",
+                "v99-src",
+                "version ninety-nine oats",
+            );
+            const before = await domainTableCounts(pool);
+            const err = await catchReuseError(
+                reuseMealCalculation(
+                    pool,
+                    reuseCommand({
+                        source_event_id: sourceId,
+                        source_version: 99,
+                    }),
+                ),
+            );
+            expect(err).toBeInstanceOf(MealReuseSourceVersionError);
+            expect((err as MealReuseSourceVersionError).code).toBe(
+                "meal_reuse_source_version_not_current_or_historical",
+            );
+            // Scope check precedes the version check: u2 sees not_found even
+            // for a version number that also does not exist.
+            const crossUser = await catchReuseError(
+                reuseMealCalculation(
+                    pool,
+                    reuseCommand({
+                        user_id: "u2",
+                        source_event_id: sourceId,
+                        source_version: 99,
+                        idempotency_key: "v99-xu",
+                    }),
+                ),
+            );
+            expect(crossUser).toBeInstanceOf(MealReuseSourceNotFoundError);
+            expect(await domainTableCounts(pool)).toEqual(before);
+            await expectNoZeroCanonical(pool);
+        });
+
+        test("bundle-less pending source -> ineligible: compatibility", async () => {
+            const sourceId = await seedMealEvent(pool, "u1", {
+                idempotencyKey: "pending-src",
+                consumedAt: daysAgo(1),
+                items: [{ ordinal: 0, raw_item_text: "pending oats" }],
+            });
+            const before = await domainTableCounts(pool);
+            const err = await catchReuseError(
+                reuseMealCalculation(
+                    pool,
+                    reuseCommand({ source_event_id: sourceId }),
+                ),
+            );
+            expect(err).toBeInstanceOf(MealReuseSourceIneligibleError);
+            expect(
+                (err as MealReuseSourceIneligibleError).category,
+            ).toBe("compatibility");
+            expect(err.message).toContain(
+                "meal_reuse_source_ineligible: compatibility",
+            );
+            expect(await domainTableCounts(pool)).toEqual(before);
+            await expectNoZeroCanonical(pool);
+        });
+
+        test("unavailable bundle source -> ineligible: unavailable", async () => {
+            const sourceId = await seedMealEvent(pool, "u1", {
+                idempotencyKey: "unavail-src",
+                consumedAt: daysAgo(1),
+                items: [{ ordinal: 0, raw_item_text: "unavailable oats" }],
+            });
+            await commitBundle(pool, "u1", unavailableBundle(sourceId, 1));
+            const before = await domainTableCounts(pool);
+            const err = await catchReuseError(
+                reuseMealCalculation(
+                    pool,
+                    reuseCommand({ source_event_id: sourceId }),
+                ),
+            );
+            expect(err).toBeInstanceOf(MealReuseSourceIneligibleError);
+            expect(
+                (err as MealReuseSourceIneligibleError).category,
+            ).toBe("unavailable");
+            expect(await domainTableCounts(pool)).toEqual(before);
+            await expectNoZeroCanonical(pool);
+        });
+
+        test("ready-then-tampered canonical (emptied audit_evidence) -> ineligible: pending, nothing created", async () => {
+            const sourceId = await seedReadySource(
+                "u1",
+                "tamper-src",
+                "tampered oats",
+            );
+            await pool.query(
+                `UPDATE meal_event_canonical_results
+                 SET audit_evidence = '{}'::jsonb
+                 WHERE event_id = $1 AND version = 1 AND ordinal IS NULL`,
+                [sourceId],
+            );
+            const before = await domainTableCounts(pool);
+            const err = await catchReuseError(
+                reuseMealCalculation(
+                    pool,
+                    reuseCommand({ source_event_id: sourceId }),
+                ),
+            );
+            expect(err).toBeInstanceOf(MealReuseSourceIneligibleError);
+            expect(
+                (err as MealReuseSourceIneligibleError).category,
+            ).toBe("pending");
+            expect(await domainTableCounts(pool)).toEqual(before);
+            await expectNoZeroCanonical(pool);
+        });
+
+        test("idempotency conflict error carries the shared stable code", async () => {
+            const err = new MealReuseIdempotencyConflictError();
+            expect(err.code).toBe("idempotency_conflict");
+            expect(err.message).toContain("idempotency_conflict");
+        });
+    },
+);
