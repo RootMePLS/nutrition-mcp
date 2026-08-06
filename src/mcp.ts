@@ -298,6 +298,17 @@ import {
 } from "./db.js";
 import { withAnalytics } from "./analytics.js";
 import {
+    createSupplementProduct,
+    getSupplementProduct,
+    listSupplementProducts,
+    reviseSupplementProductLabel,
+    searchSupplementProducts,
+    SupplementIdempotencyConflictError,
+    SupplementProductInactiveError,
+    SupplementProductNotFoundError,
+    SupplementValidationError,
+} from "./supplements.js";
+import {
     todayInTz,
     validateTz,
     shiftLocalDate,
@@ -1705,6 +1716,105 @@ export const WEIGHT_TRENDS_OUTPUT_SCHEMA = {
 // Shared by set_widget_display and get_widget_display.
 export const WIDGET_DISPLAY_OUTPUT_SCHEMA = {
     widgets_enabled: z.boolean(),
+};
+
+// ---------------------------------------------------------------------------
+// Supplement / sports-nutrition product catalogue schemas (Slice 2)
+// ---------------------------------------------------------------------------
+// Output shapes mirror the supplements.ts readbacks exactly so transport
+// tests can parse real structuredContent against the declared contract.
+
+const SUPPLEMENT_NUTRIENT_OUTPUT_SCHEMA = {
+    nutrient_key: z.string(),
+    display_name: z.string().nullable(),
+    amount: z.number(),
+    unit: z.string(),
+    source_evidence: z.record(z.string(), z.unknown()),
+};
+
+const SUPPLEMENT_LABEL_LIMIT_OUTPUT_SCHEMA = {
+    nutrient_key: z.string(),
+    unit: z.string(),
+    maximum_amount: z.number(),
+    source_evidence: z.record(z.string(), z.unknown()),
+};
+
+const SUPPLEMENT_PRODUCT_VERSION_OUTPUT_SCHEMA = {
+    version: z.number().int(),
+    is_current: z.boolean(),
+    display_name: z.string(),
+    short_name: z.string().nullable(),
+    brand: z.string().nullable(),
+    form: z.string().nullable(),
+    serving_amount: z.number().nullable(),
+    serving_unit: z.string().nullable(),
+    serving_description: z.string().nullable(),
+    aliases: z.array(z.string()),
+    nutrients: z.array(z.object(SUPPLEMENT_NUTRIENT_OUTPUT_SCHEMA)),
+    label_limits: z.array(z.object(SUPPLEMENT_LABEL_LIMIT_OUTPUT_SCHEMA)),
+    label_evidence: z.record(z.string(), z.unknown()),
+    label_source_kind: z.string().nullable(),
+    created_at: z.string(),
+};
+
+const SUPPLEMENT_PRODUCT_OUTPUT_SCHEMA = {
+    product_id: z.string(),
+    category: z.enum(["supplement", "sports_nutrition"]),
+    status: z.enum(["active", "deleted"]),
+    current_version: z.number().int(),
+    created_at: z.string(),
+    updated_at: z.string(),
+    version: z.object(SUPPLEMENT_PRODUCT_VERSION_OUTPUT_SCHEMA),
+};
+
+const SUPPLEMENT_PRODUCT_SUMMARY_OUTPUT_SCHEMA = {
+    product_id: z.string(),
+    category: z.enum(["supplement", "sports_nutrition"]),
+    status: z.enum(["active", "deleted"]),
+    current_version: z.number().int(),
+    display_name: z.string(),
+    short_name: z.string().nullable(),
+    brand: z.string().nullable(),
+    form: z.string().nullable(),
+    aliases: z.array(z.string()),
+    created_at: z.string(),
+    updated_at: z.string(),
+};
+
+// Label fields shared by create and revise. Unknown nutrients are omitted,
+// never sent as null; an explicit numeric zero is real label data (min 0).
+const SUPPLEMENT_LABEL_INPUT_SCHEMA = {
+    display_name: z.string().min(1),
+    short_name: z.string().nullable().optional(),
+    brand: z.string().nullable().optional(),
+    form: z.string().nullable().optional(),
+    serving_amount: z.number().positive().nullable().optional(),
+    serving_unit: z.string().nullable().optional(),
+    serving_description: z.string().nullable().optional(),
+    aliases: z.array(z.string()).default([]),
+    nutrients: z
+        .array(
+            z.object({
+                nutrient_key: z.string().min(1),
+                display_name: z.string().optional(),
+                amount: z.number().min(0),
+                unit: z.string().min(1),
+                source_evidence: z.record(z.string(), z.unknown()).optional(),
+            }),
+        )
+        .min(1),
+    label_limits: z
+        .array(
+            z.object({
+                nutrient_key: z.string().min(1),
+                unit: z.string().min(1),
+                maximum_amount: z.number().positive(),
+                source_evidence: z.record(z.string(), z.unknown()).optional(),
+            }),
+        )
+        .optional(),
+    label_evidence: z.record(z.string(), z.unknown()),
+    label_source_kind: z.string().nullable().optional(),
 };
 
 // One media store per process. MEDIA_ROOT is resolved lazily so tests that
@@ -5526,6 +5636,317 @@ export function registerTools(
                 ],
                 structuredContent,
             };
+        },
+    );
+
+    // ----------------------------------------------------------------------
+    // Supplement / sports-nutrition product catalogue (Slice 2)
+    // ----------------------------------------------------------------------
+    // Handlers only adapt transport args to repository commands and map typed
+    // domain errors to stable public codes; validation, user scoping,
+    // idempotency, and transactions live in supplements.ts.
+    const supplementToolError = (error: unknown): never => {
+        if (error instanceof SupplementProductNotFoundError) {
+            throw new Error("supplement_product_not_found");
+        }
+        if (error instanceof SupplementProductInactiveError) {
+            throw new Error("supplement_product_inactive");
+        }
+        if (error instanceof SupplementIdempotencyConflictError) {
+            throw new Error("idempotency_conflict");
+        }
+        if (error instanceof SupplementValidationError) {
+            throw new Error(`supplement_validation_failed: ${error.message}`);
+        }
+        throw error;
+    };
+
+    server.registerTool(
+        "create_supplement_product",
+        {
+            title: "Create Supplement Product",
+            description:
+                "Register a supplement or sports-nutrition product from a verified label: category, names/aliases, serving, the supplied nutrient list (explicit numeric zero is real data; omit unknown nutrients), and label evidence. Creates an immutable version 1 and returns the product readback. Replaying the same idempotency_key with the same label returns the original product; a different label with the same key is a conflict.",
+            annotations: {
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                category: z.enum(["supplement", "sports_nutrition"]),
+                ...SUPPLEMENT_LABEL_INPUT_SCHEMA,
+                idempotency_key: z
+                    .string()
+                    .min(1)
+                    .max(255)
+                    .nullable()
+                    .optional(),
+            },
+            outputSchema: {
+                product: z.object(SUPPLEMENT_PRODUCT_OUTPUT_SCHEMA),
+                deduplicated: z.boolean(),
+            },
+        },
+        async ({ idempotency_key, ...label }) => {
+            return withAnalytics(
+                "create_supplement_product",
+                async () => {
+                    const result = await createSupplementProduct(
+                        mealEventsPool,
+                        {
+                            ...label,
+                            user_id: userId,
+                            idempotency_key: idempotency_key ?? null,
+                            created_by: "create_supplement_product",
+                        },
+                    ).catch(supplementToolError);
+                    const structuredContent = {
+                        product: result.product,
+                        deduplicated: result.deduplicated,
+                    };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "get_supplement_product",
+        {
+            title: "Get Supplement Product",
+            description:
+                "Read one of the user's supplement products: the current label version by default, or an immutable historical version when version is given. Unknown, deleted, or another user's product is a stable supplement_product_not_found error.",
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                product_id: z.string().uuid(),
+                version: z.number().int().min(1).optional(),
+            },
+            outputSchema: {
+                product: z.object(SUPPLEMENT_PRODUCT_OUTPUT_SCHEMA),
+            },
+        },
+        async ({ product_id, version }) => {
+            return withAnalytics(
+                "get_supplement_product",
+                async () => {
+                    const product = await getSupplementProduct(
+                        mealEventsPool,
+                        userId,
+                        product_id,
+                        version,
+                    );
+                    if (!product) {
+                        throw new Error("supplement_product_not_found");
+                    }
+                    const structuredContent = { product };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "list_supplement_products",
+        {
+            title: "List Supplement Products",
+            description:
+                "List the user's supplement products with their current label summary, ordered by name. Deleted products are excluded unless include_deleted is set.",
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                include_deleted: z.boolean().optional(),
+                limit: z.number().int().min(1).max(200).optional(),
+            },
+            outputSchema: {
+                products: z.array(
+                    z.object(SUPPLEMENT_PRODUCT_SUMMARY_OUTPUT_SCHEMA),
+                ),
+            },
+        },
+        async ({ include_deleted, limit }) => {
+            return withAnalytics(
+                "list_supplement_products",
+                async () => {
+                    const products = await listSupplementProducts(
+                        mealEventsPool,
+                        userId,
+                        {
+                            includeDeleted: include_deleted ?? false,
+                            limit,
+                        },
+                    );
+                    const structuredContent = { products };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "search_supplement_products",
+        {
+            title: "Search Supplement Products",
+            description:
+                "Case-insensitive substring search over the user's CURRENT label version display name, short name, and aliases. Active products only; historical-version aliases no longer match after a revision.",
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                query: z.string().min(1),
+                limit: z.number().int().min(1).max(200).optional(),
+            },
+            outputSchema: {
+                products: z.array(
+                    z.object(SUPPLEMENT_PRODUCT_SUMMARY_OUTPUT_SCHEMA),
+                ),
+            },
+        },
+        async ({ query, limit }) => {
+            return withAnalytics(
+                "search_supplement_products",
+                async () => {
+                    const products = await searchSupplementProducts(
+                        mealEventsPool,
+                        userId,
+                        query,
+                        { limit },
+                    );
+                    const structuredContent = { products };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "revise_supplement_product_label",
+        {
+            title: "Revise Supplement Product Label",
+            description:
+                "Record a new label for an existing supplement product: inserts an immutable version N+1 and moves the current pointer in one transaction. Historical versions are never rewritten and stay readable via get_supplement_product. Replaying the same revision_idempotency_key with the same label returns the existing version; a different label with the same key is a conflict. Deleted products cannot be revised.",
+            annotations: {
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                product_id: z.string().uuid(),
+                ...SUPPLEMENT_LABEL_INPUT_SCHEMA,
+                revision_idempotency_key: z
+                    .string()
+                    .min(1)
+                    .max(255)
+                    .nullable()
+                    .optional(),
+            },
+            outputSchema: {
+                product: z.object(SUPPLEMENT_PRODUCT_OUTPUT_SCHEMA),
+                previous_version: z.number().int(),
+                deduplicated: z.boolean(),
+            },
+        },
+        async ({ product_id, revision_idempotency_key, ...label }) => {
+            return withAnalytics(
+                "revise_supplement_product_label",
+                async () => {
+                    const result = await reviseSupplementProductLabel(
+                        mealEventsPool,
+                        {
+                            ...label,
+                            user_id: userId,
+                            product_id,
+                            revision_idempotency_key:
+                                revision_idempotency_key ?? null,
+                            created_by: "revise_supplement_product_label",
+                        },
+                    ).catch(supplementToolError);
+                    const structuredContent = {
+                        product: result.product,
+                        previous_version: result.previous_version,
+                        deduplicated: result.deduplicated,
+                    };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(
+                                    structuredContent,
+                                    null,
+                                    2,
+                                ),
+                            },
+                        ],
+                        structuredContent,
+                    };
+                },
+                { userId },
+            );
         },
     );
 }

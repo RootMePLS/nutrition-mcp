@@ -29,6 +29,8 @@ const suites = [
     "src/backup-policy.test.ts",
     "src/legacy-meal-tools.integration.test.ts",
     "src/calculation-acceptance.integration.test.ts",
+    "src/supplements.integration.test.ts",
+    "src/mcp-supplements.integration.test.ts",
 ];
 const env = {
     ...process.env,
