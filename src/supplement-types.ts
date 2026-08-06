@@ -185,11 +185,9 @@ export function validateRegimenSchedule(schedule: unknown): string[] {
                 seen.add(day);
             }
         }
-    } else if (
-        s.frequency === "daily" &&
-        Array.isArray(s.weekdays) &&
-        s.weekdays.length > 0
-    ) {
+    } else if (s.frequency === "daily" && s.weekdays !== undefined) {
+        // Any DEFINED weekdays on a daily schedule is invalid — including []
+        // and null. Only an absent property is a valid daily schedule.
         errors.push("daily schedule must not carry weekdays");
     }
     return errors;

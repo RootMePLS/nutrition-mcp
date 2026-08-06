@@ -1217,6 +1217,22 @@ describeDb(
                     schedule: {
                         timezone: "UTC",
                         frequency: "daily",
+                        local_time: "08:00",
+                        weekdays: [],
+                    },
+                },
+                {
+                    schedule: {
+                        timezone: "UTC",
+                        frequency: "daily",
+                        local_time: "08:00",
+                        weekdays: null,
+                    },
+                },
+                {
+                    schedule: {
+                        timezone: "UTC",
+                        frequency: "daily",
                         local_time: "25:00",
                     },
                 },

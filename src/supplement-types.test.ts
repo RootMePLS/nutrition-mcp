@@ -192,15 +192,25 @@ describe("regimen schedule validation", () => {
         }
     });
 
-    test("daily must not carry weekdays", () => {
+    test("daily must not carry any defined weekdays, including [] and null", () => {
+        for (const weekdays of [[1], [], null]) {
+            expect(
+                validateRegimenSchedule({
+                    timezone: "Europe/London",
+                    frequency: "daily",
+                    local_time: "07:00",
+                    weekdays,
+                }).length,
+            ).toBeGreaterThan(0);
+        }
+        // Absent weekdays stays valid for daily.
         expect(
             validateRegimenSchedule({
                 timezone: "Europe/London",
                 frequency: "daily",
                 local_time: "07:00",
-                weekdays: [1],
-            }).length,
-        ).toBeGreaterThan(0);
+            }),
+        ).toEqual([]);
     });
 
     test("rejects invalid IANA timezones", () => {

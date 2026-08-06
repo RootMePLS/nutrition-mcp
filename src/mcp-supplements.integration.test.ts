@@ -1138,6 +1138,17 @@ describeDb(
                         "create_supplement_regimen",
                         validRegimenArgs(productId, {
                             schedule: {
+                                timezone: "UTC",
+                                frequency: "daily",
+                                local_time: "08:00",
+                                weekdays: [],
+                            },
+                        }),
+                    ],
+                    [
+                        "create_supplement_regimen",
+                        validRegimenArgs(productId, {
+                            schedule: {
                                 timezone: "Atlantis/North",
                                 frequency: "daily",
                                 local_time: "08:00",
