@@ -5,14 +5,19 @@
 // decodes to exactly `nutrition_mcp_test`; DSN equality alone never
 // authorizes the DROP SCHEMA below.
 //
+// Covers the full migration chain: the schema reset below replays
+// 001-010. The public surface is asserted with a client.listTools()
+// inventory check (all reuse/supplement tools advertised, 66+ total).
 // Covers the legacy surface end to end: log, bulk import, update, all eight
 // legacy reads (get_meals_by_date, get_meals_today, get_meals_by_date_range,
 // search_meals, get_nutrition_summary, get_goal_progress, get_trends,
 // get_meal_patterns), export, delete, plus the capture media round trip
 // (start_meal_capture -> attach_meal_capture_media with a tiny PNG fixture ->
 // save_meal_capture_draft -> confirm_meal_capture) re-read through
-// get_meal_capture and get_meals_by_date. Exits non-zero on the first failed
-// step.
+// get_meal_capture and get_meals_by_date, plus a minimal supplement
+// transport round trip (create_supplement_product -> log_supplement_intake
+// with snack linkage -> get_calculation_provenance -> get_supplement_intakes).
+// Exits non-zero on the first failed step.
 //
 //   DATABASE_URL=postgres://localhost/nutrition_mcp_test \
 //   DATABASE_URL_TEST=postgres://localhost/nutrition_mcp_test \
@@ -168,6 +173,11 @@ try {
         "003_meal_captures.sql",
         "004_calculation_bundles.sql",
         "005_calculation_corrections.sql",
+        "006_meal_reuse_and_supplements.sql",
+        "007_ownership_lineage_integrity.sql",
+        "008_supplement_create_idempotency.sql",
+        "009_supplement_create_idem_reconciliation.sql",
+        "010_supplement_regimen_idempotency.sql",
     ]) {
         await client0.query(
             await Bun.file(`db/migrations/${migration}`).text(),
@@ -195,6 +205,40 @@ const call = (name: string, args: Record<string, unknown> = {}) =>
     client.callTool({ name, arguments: args }) as Promise<ToolResult>;
 
 try {
+    // Public inventory: the advertised tool set must cover the reuse and
+    // supplement families and the full Release 1 head (66 tools).
+    const { tools: advertised } = await client.listTools();
+    const advertisedNames = new Set(advertised.map((t) => t.name));
+    for (const required of [
+        "search_meals",
+        "reuse_meal_calculation",
+        "create_supplement_product",
+        "get_supplement_product",
+        "list_supplement_products",
+        "search_supplement_products",
+        "revise_supplement_product_label",
+        "create_supplement_regimen",
+        "list_supplement_regimens",
+        "set_supplement_regimen_active",
+        "resolve_supplement_product",
+        "log_supplement_intake",
+        "get_supplement_intakes",
+        "get_supplement_regimen_status",
+        "get_supplement_nutrition_summary",
+        "get_supplement_data_flags",
+    ]) {
+        check(
+            `inventory: ${required}`,
+            advertisedNames.has(required),
+            required,
+        );
+    }
+    check(
+        "inventory size",
+        advertisedNames.size >= 66,
+        `advertised=${advertisedNames.size}`,
+    );
+
     // log
     const logged = await call("log_meal", {
         description: "smoke oatmeal",
@@ -499,13 +543,102 @@ try {
         JSON.stringify(eventMediaRows),
     );
 
+    // Minimal supplement transport round trip: create a caloric
+    // sports_nutrition product from a verified label, log a done intake
+    // (which atomically links one label-derived snack event), re-read the
+    // snack's public provenance, and read the intake fact back.
+    const created = await call("create_supplement_product", {
+        category: "sports_nutrition",
+        display_name: "Smoke Whey",
+        serving_amount: 30,
+        serving_unit: "g",
+        nutrients: [
+            { nutrient_key: "calories", amount: 120, unit: "kcal" },
+            { nutrient_key: "protein_g", amount: 21, unit: "g" },
+            // Explicit numeric zero: real label data, must read back as 0.
+            { nutrient_key: "fat_g", amount: 0, unit: "g" },
+        ],
+        label_evidence: { kind: "label_photo", verified_by: "user" },
+        label_source_kind: "user_verified_label",
+        idempotency_key: `smoke-product-${RUN}`,
+    });
+    check(
+        "create_supplement_product",
+        !created.isError &&
+            typeof (
+                created.structuredContent?.product as { product_id?: unknown }
+            )?.product_id === "string",
+        JSON.stringify(created.structuredContent ?? created.content),
+    );
+    const productId = (
+        created.structuredContent!.product as { product_id: string }
+    ).product_id;
+
+    const intake = await call("log_supplement_intake", {
+        product_id: productId,
+        servings: 2,
+        occurred_at: `${DAY}T09:00:00.000Z`,
+        state_action: "done",
+        idempotency_key: `smoke-intake-${RUN}`,
+    });
+    check(
+        "log_supplement_intake (snack linkage)",
+        !intake.isError &&
+            typeof intake.structuredContent?.snack_event_id === "string" &&
+            typeof intake.structuredContent?.snack_version === "number",
+        JSON.stringify(intake.structuredContent ?? intake.content),
+    );
+    const snackEventId = intake.structuredContent!.snack_event_id as string;
+    const snackVersion = intake.structuredContent!.snack_version as number;
+
+    const snackProvenance = await call("get_calculation_provenance", {
+        event_id: snackEventId,
+        version: snackVersion,
+    });
+    const snackPayload = snackProvenance.structuredContent as
+        | {
+              compatibility?: boolean;
+              bundle_fingerprint?: string | null;
+              providers?: Array<{
+                  provider?: string;
+                  source_id?: string | null;
+              }>;
+          }
+        | undefined;
+    check(
+        "snack provenance is label-derived",
+        !snackProvenance.isError &&
+            snackPayload?.compatibility === true &&
+            snackPayload?.bundle_fingerprint === null &&
+            snackPayload?.providers?.length === 1 &&
+            snackPayload.providers[0]!.provider === "own" &&
+            typeof snackPayload.providers[0]!.source_id === "string" &&
+            snackPayload.providers[0]!.source_id!.startsWith("suppl-snack:"),
+        JSON.stringify(snackProvenance.structuredContent),
+    );
+
+    const intakeHistory = await call("get_supplement_intakes", {});
+    const intakeFacts = (
+        intakeHistory.structuredContent as
+            { intakes?: Array<{ visible_state?: string }> } | undefined
+    )?.intakes;
+    check(
+        "get_supplement_intakes reads back done fact",
+        !intakeHistory.isError &&
+            Array.isArray(intakeFacts) &&
+            intakeFacts.some((fact) => fact.visible_state === "done"),
+        JSON.stringify(intakeHistory.structuredContent),
+    );
+
     console.log(
         "MCP smoke: all steps passed — log_meal, bulk_import_meals, update_meal, " +
             "get_meals_today, get_meals_by_date, get_meals_by_date_range, " +
             "search_meals, get_nutrition_summary, get_goal_progress, get_trends, " +
             "get_meal_patterns, export_meals, delete_meal, start_meal_capture, " +
             "attach_meal_capture_media, save_meal_capture_draft, " +
-            "confirm_meal_capture, get_meal_capture.",
+            "confirm_meal_capture, get_meal_capture, create_supplement_product, " +
+            "log_supplement_intake, get_calculation_provenance, " +
+            "get_supplement_intakes.",
     );
 } catch (error) {
     console.error(error instanceof Error ? error.message : error);
