@@ -13,11 +13,14 @@ import {
     getSupplementProduct,
     listSupplementProducts,
     searchSupplementProducts,
+    createSupplementRegimen,
     SupplementIdempotencyConflictError,
     SupplementProductInactiveError,
     SupplementProductNotFoundError,
+    SupplementProductVersionNotFoundError,
     SupplementValidationError,
     type CreateSupplementProductCommand,
+    type CreateSupplementRegimenCommand,
 } from "./supplements.js";
 
 // ---------------------------------------------------------------------------
@@ -942,3 +945,370 @@ describeDb("supplement product repository (requires DATABASE_URL_TEST)", () => {
         });
     });
 });
+
+// ---------------------------------------------------------------------------
+// Slice 5: supplement regimens — transactional, idempotent creation over the
+// migration 010 partial unique index. Real PostgreSQL only.
+// ---------------------------------------------------------------------------
+
+function validRegimenCommand(
+    productId: string,
+    overrides: Record<string, unknown> = {},
+): CreateSupplementRegimenCommand {
+    return {
+        user_id: "u1",
+        product_id: productId,
+        dose_servings: 1.5,
+        schedule: {
+            timezone: "Europe/Berlin",
+            frequency: "weekly",
+            local_time: "08:30",
+            weekdays: [1, 4],
+        },
+        starts_on: "2026-08-01",
+        ends_on: "2026-12-31",
+        idempotency_key: `regimen:${crypto.randomUUID()}`,
+        created_by: "test",
+        ...overrides,
+    } as CreateSupplementRegimenCommand;
+}
+
+async function sliceFiveWriteTableCounts(
+    pool: Pool,
+): Promise<Record<string, number>> {
+    return {
+        supplement_intake_events: await tableCount(
+            pool,
+            "supplement_intake_events",
+        ),
+        supplement_intake_nutrient_snapshots: await tableCount(
+            pool,
+            "supplement_intake_nutrient_snapshots",
+        ),
+        supplement_intake_meal_links: await tableCount(
+            pool,
+            "supplement_intake_meal_links",
+        ),
+        meal_events: await tableCount(pool, "meal_events"),
+    };
+}
+
+const ZERO_SLICE_FIVE_WRITES: Record<string, number> = {
+    supplement_intake_events: 0,
+    supplement_intake_nutrient_snapshots: 0,
+    supplement_intake_meal_links: 0,
+    meal_events: 0,
+};
+
+describeDb(
+    "supplement regimen repository: create (requires DATABASE_URL_TEST)",
+    () => {
+        let pool: Pool;
+
+        beforeAll(() => {
+            pool = new Pool({ connectionString: DATABASE_URL_TEST });
+        });
+
+        afterAll(async () => {
+            await pool.end();
+        });
+
+        beforeEach(async () => {
+            await resetSchema(pool);
+        });
+
+        async function seedProduct(
+            overrides: Record<string, unknown> = {},
+        ): Promise<{ product_id: string }> {
+            const result = await createSupplementProduct(
+                pool,
+                validCreateCommand({
+                    idempotency_key: `product:${crypto.randomUUID()}`,
+                    ...overrides,
+                }),
+            );
+            return { product_id: result.product.product_id };
+        }
+
+        async function reviseToV2(productId: string, displayName: string) {
+            return reviseSupplementProductLabel(pool, {
+                user_id: "u1",
+                product_id: productId,
+                display_name: displayName,
+                short_name: "Whey",
+                brand: "MyProtein",
+                form: "powder",
+                serving_amount: 32,
+                serving_unit: "g",
+                serving_description: "1 heaped scoop",
+                aliases: ["impact whey"],
+                nutrients: [
+                    { nutrient_key: "calories", amount: 128, unit: "kcal" },
+                    { nutrient_key: "protein_g", amount: 23, unit: "g" },
+                ],
+                label_evidence: { kind: "label_photo", verified_by: "user" },
+                label_source_kind: "user_verified_label",
+                revision_idempotency_key: `revise:${crypto.randomUUID()}`,
+                created_by: "test",
+            });
+        }
+
+        test("create regimen persists version binding, schedule, window, and audit metadata", async () => {
+            const { product_id } = await seedProduct();
+            const result = await createSupplementRegimen(
+                pool,
+                validRegimenCommand(product_id, {
+                    idempotency_key: "reg:persist",
+                }),
+            );
+            expect(result.deduplicated).toBe(false);
+            const r = result.regimen;
+            expect(typeof r.regimen_id).toBe("string");
+            expect(r.product_id).toBe(product_id);
+            expect(r.product_version).toBe(1);
+            expect(r.product_display_name).toBe("Impact Whey Protein");
+            expect(r.category).toBe("sports_nutrition");
+            expect(r.dose_servings).toBe(1.5);
+            expect(r.schedule).toEqual({
+                timezone: "Europe/Berlin",
+                frequency: "weekly",
+                local_time: "08:30",
+                weekdays: [1, 4],
+            });
+            expect(r.starts_on).toBe("2026-08-01");
+            expect(r.ends_on).toBe("2026-12-31");
+            expect(r.active).toBe(true);
+            expect(r.deactivated_at).toBeNull();
+            expect(typeof r.created_at).toBe("string");
+            expect(typeof r.updated_at).toBe("string");
+
+            // The stored row denormalizes timezone from the schedule and carries
+            // the caller's audit metadata.
+            const { rows } = await pool.query(
+                `SELECT timezone, created_by, idempotency_key
+             FROM supplement_regimens WHERE id = $1`,
+                [r.regimen_id],
+            );
+            expect(rows[0]).toEqual({
+                timezone: "Europe/Berlin",
+                created_by: "test",
+                idempotency_key: "reg:persist",
+            });
+            expect(await tableCount(pool, "supplement_regimens")).toBe(1);
+        });
+
+        test("omitted product_version defaults to the current version at create time and pins it", async () => {
+            const { product_id } = await seedProduct();
+            const created = await createSupplementRegimen(
+                pool,
+                validRegimenCommand(product_id),
+            );
+            expect(created.regimen.product_version).toBe(1);
+
+            await reviseToV2(product_id, "Impact Whey Protein (new formula)");
+
+            // A later label revision never moves the regimen's bound version.
+            const { rows } = await pool.query(
+                `SELECT product_version FROM supplement_regimens WHERE id = $1`,
+                [created.regimen.regimen_id],
+            );
+            expect(rows[0]!.product_version).toBe(1);
+        });
+
+        test("an explicit historical version binds that version and its display name", async () => {
+            const { product_id } = await seedProduct();
+            await reviseToV2(product_id, "Impact Whey Protein (new formula)");
+
+            const created = await createSupplementRegimen(
+                pool,
+                validRegimenCommand(product_id, { product_version: 1 }),
+            );
+            expect(created.regimen.product_version).toBe(1);
+            expect(created.regimen.product_display_name).toBe(
+                "Impact Whey Protein",
+            );
+        });
+
+        test("a version the product does not have fails closed with zero rows", async () => {
+            const { product_id } = await seedProduct();
+            await expect(
+                createSupplementRegimen(
+                    pool,
+                    validRegimenCommand(product_id, { product_version: 7 }),
+                ),
+            ).rejects.toBeInstanceOf(SupplementProductVersionNotFoundError);
+            expect(await tableCount(pool, "supplement_regimens")).toBe(0);
+        });
+
+        test("unknown, cross-user, and deleted products all fail closed as not found", async () => {
+            const { product_id } = await seedProduct();
+
+            await expect(
+                createSupplementRegimen(
+                    pool,
+                    validRegimenCommand(crypto.randomUUID()),
+                ),
+            ).rejects.toBeInstanceOf(SupplementProductNotFoundError);
+
+            await expect(
+                createSupplementRegimen(
+                    pool,
+                    validRegimenCommand(product_id, { user_id: "u2" }),
+                ),
+            ).rejects.toBeInstanceOf(SupplementProductNotFoundError);
+
+            await pool.query(
+                `UPDATE supplement_products SET status = 'deleted' WHERE id = $1`,
+                [product_id],
+            );
+            await expect(
+                createSupplementRegimen(pool, validRegimenCommand(product_id)),
+            ).rejects.toBeInstanceOf(SupplementProductNotFoundError);
+            expect(await tableCount(pool, "supplement_regimens")).toBe(0);
+        });
+
+        test("rejects nonpositive/nonfinite dose, invalid schedule, inverted window, and junk dates with zero rows", async () => {
+            const { product_id } = await seedProduct();
+            const rejections: Record<string, unknown>[] = [
+                { dose_servings: 0 },
+                { dose_servings: -2 },
+                { dose_servings: Number.NaN },
+                { dose_servings: Number.POSITIVE_INFINITY },
+                {
+                    schedule: {
+                        timezone: "Mars/Olympus",
+                        frequency: "daily",
+                        local_time: "08:00",
+                    },
+                },
+                {
+                    schedule: {
+                        timezone: "UTC",
+                        frequency: "hourly",
+                        local_time: "08:00",
+                    },
+                },
+                {
+                    schedule: {
+                        timezone: "UTC",
+                        frequency: "weekly",
+                        local_time: "08:00",
+                    },
+                },
+                {
+                    schedule: {
+                        timezone: "UTC",
+                        frequency: "daily",
+                        local_time: "08:00",
+                        weekdays: [1],
+                    },
+                },
+                {
+                    schedule: {
+                        timezone: "UTC",
+                        frequency: "daily",
+                        local_time: "25:00",
+                    },
+                },
+                { ends_on: "2026-07-31" },
+                { starts_on: "2026-02-30" },
+                { starts_on: "not-a-date" },
+                { starts_on: "2026-08-01T00:00:00Z" },
+                { ends_on: "2026-13-01" },
+            ];
+            for (const overrides of rejections) {
+                await expect(
+                    createSupplementRegimen(
+                        pool,
+                        validRegimenCommand(product_id, overrides),
+                    ),
+                ).rejects.toBeInstanceOf(SupplementValidationError);
+            }
+            expect(await tableCount(pool, "supplement_regimens")).toBe(0);
+        });
+
+        test("same-key same-identity replay returns the deduplicated original", async () => {
+            const { product_id } = await seedProduct();
+            const command = validRegimenCommand(product_id, {
+                idempotency_key: "reg:replay",
+            });
+            const first = await createSupplementRegimen(pool, command);
+            const replay = await createSupplementRegimen(pool, command);
+            expect(first.deduplicated).toBe(false);
+            expect(replay.deduplicated).toBe(true);
+            expect(replay.regimen.regimen_id).toBe(first.regimen.regimen_id);
+            expect(await tableCount(pool, "supplement_regimens")).toBe(1);
+        });
+
+        test("same key with a differing identity is a stable conflict, never a second row", async () => {
+            const { product_id } = await seedProduct();
+            await createSupplementRegimen(
+                pool,
+                validRegimenCommand(product_id, {
+                    idempotency_key: "reg:conflict",
+                }),
+            );
+            for (const overrides of [
+                { dose_servings: 2 },
+                {
+                    schedule: {
+                        timezone: "Europe/Berlin",
+                        frequency: "daily",
+                        local_time: "08:30",
+                    },
+                },
+                { starts_on: "2026-08-02" },
+                { ends_on: null },
+            ]) {
+                await expect(
+                    createSupplementRegimen(
+                        pool,
+                        validRegimenCommand(product_id, {
+                            idempotency_key: "reg:conflict",
+                            ...overrides,
+                        }),
+                    ),
+                ).rejects.toBeInstanceOf(SupplementIdempotencyConflictError);
+            }
+            expect(await tableCount(pool, "supplement_regimens")).toBe(1);
+        });
+
+        test("two concurrent same-key creates converge on exactly one row", async () => {
+            const { product_id } = await seedProduct();
+            const command = validRegimenCommand(product_id, {
+                idempotency_key: "reg:race",
+            });
+            const results = await Promise.all([
+                createSupplementRegimen(pool, command),
+                createSupplementRegimen(pool, command),
+            ]);
+            expect(results[0]!.regimen.regimen_id).toBe(
+                results[1]!.regimen.regimen_id,
+            );
+            expect(results.filter((r) => r.deduplicated).length).toBe(1);
+            expect(await tableCount(pool, "supplement_regimens")).toBe(1);
+        });
+
+        test("an injected post-insert/pre-commit failure rolls back every row", async () => {
+            const { product_id } = await seedProduct();
+            await expect(
+                createSupplementRegimen(pool, validRegimenCommand(product_id), {
+                    beforeCommit: () =>
+                        Promise.reject(new Error("injected rollback")),
+                }),
+            ).rejects.toThrow("injected rollback");
+            expect(await tableCount(pool, "supplement_regimens")).toBe(0);
+        });
+
+        test("creating a regimen writes zero intake, snapshot, meal, or link rows", async () => {
+            const { product_id } = await seedProduct();
+            await createSupplementRegimen(
+                pool,
+                validRegimenCommand(product_id),
+            );
+            expect(await sliceFiveWriteTableCounts(pool)).toEqual(
+                ZERO_SLICE_FIVE_WRITES,
+            );
+        });
+    },
+);

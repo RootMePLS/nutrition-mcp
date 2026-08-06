@@ -28,10 +28,13 @@ import { withTransaction } from "./db.js";
 import { sha256Hex } from "./meal-types.js";
 import { escapeLikePattern } from "./search.js";
 import {
+    deriveSupplementRegimenIdempotencyFingerprint,
     isSupplementProductCategory,
     normalizeSupplementAlias,
     stableStringify,
     validateLabelNutrients,
+    validateRegimenSchedule,
+    type RegimenSchedule,
     type SupplementLabelNutrientInput,
     type SupplementProductCategory,
 } from "./supplement-types.js";
@@ -73,6 +76,55 @@ export class SupplementIdempotencyConflictError extends Error {
             "idempotency key was already used with a different label identity",
         );
         this.name = "SupplementIdempotencyConflictError";
+    }
+}
+
+// Slice 5 errors (regimens/intakes). Same stable-code style as above.
+
+export interface ResolvedProductCandidate {
+    product_id: string;
+    category: SupplementProductCategory;
+    display_name: string;
+    brand: string | null;
+    form: string | null;
+    current_version: number;
+    matched_alias: string;
+}
+
+export class SupplementAliasAmbiguousError extends Error {
+    readonly code = "supplement_alias_ambiguous";
+    constructor(readonly candidates: ResolvedProductCandidate[]) {
+        super(
+            `supplement_alias_ambiguous: alias matches ${candidates.length} products; pass a direct product_id (candidates: ${candidates
+                .map((c) => `${c.display_name} ${c.product_id}`)
+                .join(", ")})`,
+        );
+        this.name = "SupplementAliasAmbiguousError";
+    }
+}
+
+export class SupplementProductVersionNotFoundError extends Error {
+    readonly code = "supplement_product_version_not_found";
+    constructor() {
+        super("this product has no such label version");
+        this.name = "SupplementProductVersionNotFoundError";
+    }
+}
+
+export class SupplementRegimenNotFoundError extends Error {
+    readonly code = "supplement_regimen_not_found";
+    constructor() {
+        // Unknown id or another user's regimen: indistinguishable by design.
+        super("no supplement regimen with this id exists for this user");
+        this.name = "SupplementRegimenNotFoundError";
+    }
+}
+
+export class SupplementRegimenInactiveError extends Error {
+    readonly code = "supplement_regimen_inactive";
+    constructor() {
+        super("regimen is deactivated; reactivate it or log an ad-hoc intake");
+        this.name = "SupplementRegimenInactiveError";
     }
 }
 
@@ -582,13 +634,18 @@ async function insertLabelChildren(
 // PUBLIC REPOSITORY API
 // ---------------------------------------------------------------------------
 
-// A pg DatabaseError for a unique violation on migration 008's create-key
-// index (SQLSTATE 23505 on uniq_spv_user_create_idem). Matching the index
-// name keeps unrelated unique violations (duplicate alias/nutrient rows,
-// revision-key collisions) fail-fast instead of silently retried.
-function isCreateKeyRaceViolation(err: unknown): boolean {
+// A pg DatabaseError for a unique violation (SQLSTATE 23505) on a specific
+// named idempotency index. Matching the index name keeps unrelated unique
+// violations (duplicate alias/nutrient rows, revision-key collisions)
+// fail-fast instead of silently retried.
+function isKeyRaceViolation(err: unknown, constraint: string): boolean {
     const e = err as { code?: string; constraint?: string } | null;
-    return e?.code === "23505" && e.constraint === "uniq_spv_user_create_idem";
+    return e?.code === "23505" && e.constraint === constraint;
+}
+
+// Migration 008's product create-key index.
+function isCreateKeyRaceViolation(err: unknown): boolean {
+    return isKeyRaceViolation(err, "uniq_spv_user_create_idem");
 }
 
 export async function createSupplementProduct(
@@ -934,4 +991,336 @@ export async function searchSupplementProducts(
         [userId, pattern, limit],
     );
     return summariesFromRows(pool, rows as SummaryRow[]);
+}
+
+// ===========================================================================
+// SUPPLEMENT REGIMENS (Slice 5)
+// ===========================================================================
+// A regimen is declarative intent bound to one immutable product version:
+// creating, listing, or reading one never writes an intake fact, a meal
+// event, a scheduler job, or a reminder. Create idempotency is enforced by
+// migration 010's partial unique index (uniq_supplement_regimens_user_idem),
+// not by lookup ordering — concurrent same-key creates serialize at the
+// database and the loser converges as a deduplicated read or a stable
+// idempotency_conflict, exactly like product creation under 008.
+
+export interface CreateSupplementRegimenCommand {
+    user_id: string;
+    product_id: string;
+    /** Defaults to the product's current version at create time. */
+    product_version?: number | null;
+    dose_servings: number;
+    schedule: RegimenSchedule;
+    /** YYYY-MM-DD. */
+    starts_on: string;
+    /** YYYY-MM-DD on or after starts_on, or null for open-ended. */
+    ends_on?: string | null;
+    idempotency_key?: string | null;
+    created_by: string;
+}
+
+export interface SupplementRegimenReadback {
+    regimen_id: string;
+    product_id: string;
+    product_version: number;
+    /** Display name of the BOUND version, not the current one. */
+    product_display_name: string;
+    category: SupplementProductCategory;
+    dose_servings: number;
+    schedule: RegimenSchedule;
+    starts_on: string;
+    ends_on: string | null;
+    active: boolean;
+    created_at: string;
+    updated_at: string;
+    deactivated_at: string | null;
+}
+
+export interface CreateSupplementRegimenResult {
+    regimen: SupplementRegimenReadback;
+    deduplicated: boolean;
+}
+
+const LOCAL_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+function isLocalDateString(value: unknown): value is string {
+    if (typeof value !== "string" || !LOCAL_DATE_PATTERN.test(value)) {
+        return false;
+    }
+    const [y, m, d] = value.split("-").map(Number);
+    const parsed = new Date(Date.UTC(y!, m! - 1, d!));
+    return (
+        parsed.getUTCFullYear() === y &&
+        parsed.getUTCMonth() === m! - 1 &&
+        parsed.getUTCDate() === d
+    );
+}
+
+interface NormalizedRegimenFields {
+    dose_servings: number;
+    schedule: RegimenSchedule;
+    starts_on: string;
+    ends_on: string | null;
+}
+
+function validateRegimenFields(
+    command: CreateSupplementRegimenCommand,
+): NormalizedRegimenFields {
+    const errors: string[] = [];
+    if (
+        typeof command.dose_servings !== "number" ||
+        !Number.isFinite(command.dose_servings) ||
+        command.dose_servings <= 0
+    ) {
+        errors.push("dose_servings must be a finite positive number");
+    }
+    errors.push(...validateRegimenSchedule(command.schedule));
+    if (!isLocalDateString(command.starts_on)) {
+        errors.push("starts_on must be a real YYYY-MM-DD date");
+    }
+    const endsOn = command.ends_on ?? null;
+    if (endsOn !== null) {
+        if (!isLocalDateString(endsOn)) {
+            errors.push("ends_on must be a real YYYY-MM-DD date");
+        } else if (
+            isLocalDateString(command.starts_on) &&
+            endsOn < command.starts_on
+        ) {
+            errors.push("ends_on must be on or after starts_on");
+        }
+    }
+    if (
+        command.product_version !== undefined &&
+        command.product_version !== null
+    ) {
+        if (
+            typeof command.product_version !== "number" ||
+            !Number.isInteger(command.product_version) ||
+            command.product_version < 1
+        ) {
+            errors.push("product_version must be a positive integer");
+        }
+    }
+    if (errors.length > 0) {
+        throw new SupplementValidationError(errors);
+    }
+    return {
+        dose_servings: command.dose_servings,
+        schedule: command.schedule,
+        starts_on: command.starts_on,
+        ends_on: endsOn,
+    };
+}
+
+// Dates are read back through to_char so the pg DATE parser can never shift
+// a local calendar date into a Date object.
+const REGIMEN_SELECT = `
+    SELECT id, user_id, product_id, product_version, dose_servings, schedule,
+           timezone, to_char(starts_on, 'YYYY-MM-DD') AS starts_on,
+           to_char(ends_on, 'YYYY-MM-DD') AS ends_on,
+           active, created_by, created_at, updated_at, deactivated_at,
+           idempotency_key
+    FROM supplement_regimens`;
+
+interface RegimenRow {
+    id: string;
+    user_id: string;
+    product_id: string;
+    product_version: number;
+    dose_servings: string | number;
+    schedule: RegimenSchedule;
+    timezone: string;
+    starts_on: string;
+    ends_on: string | null;
+    active: boolean;
+    created_by: string;
+    created_at: Date | string;
+    updated_at: Date | string;
+    deactivated_at: Date | string | null;
+    idempotency_key: string | null;
+}
+
+async function readRegimenRow(
+    q: Queryable,
+    regimenId: string,
+): Promise<RegimenRow | null> {
+    const { rows } = await q.query(`${REGIMEN_SELECT} WHERE id = $1`, [
+        regimenId,
+    ]);
+    return (rows[0] as RegimenRow | undefined) ?? null;
+}
+
+async function assembleRegimenReadback(
+    q: Queryable,
+    row: RegimenRow,
+): Promise<SupplementRegimenReadback> {
+    const { rows } = await q.query(
+        `SELECT v.display_name, p.category
+         FROM supplement_product_versions v
+         JOIN supplement_products p ON p.id = v.product_id
+         WHERE v.product_id = $1 AND v.version = $2`,
+        [row.product_id, row.product_version],
+    );
+    const product = rows[0] as
+        | { display_name: string; category: SupplementProductCategory }
+        | undefined;
+    if (!product) throw new Error("regimen bound version row is missing");
+    return {
+        regimen_id: row.id,
+        product_id: row.product_id,
+        product_version: row.product_version,
+        product_display_name: product.display_name,
+        category: product.category,
+        dose_servings: Number(row.dose_servings),
+        schedule: row.schedule,
+        starts_on: row.starts_on,
+        ends_on: row.ends_on,
+        active: row.active,
+        created_at: iso(row.created_at),
+        updated_at: iso(row.updated_at),
+        deactivated_at:
+            row.deactivated_at === null ? null : iso(row.deactivated_at),
+    };
+}
+
+function regimenIdentityFingerprint(
+    row: RegimenRow,
+    idempotencyKey: string,
+): string {
+    return deriveSupplementRegimenIdempotencyFingerprint({
+        user_id: row.user_id,
+        idempotency_key: idempotencyKey,
+        product_id: row.product_id,
+        product_version: row.product_version,
+        dose_servings: Number(row.dose_servings),
+        schedule: row.schedule,
+        starts_on: row.starts_on,
+        ends_on: row.ends_on,
+    });
+}
+
+export async function createSupplementRegimen(
+    pool: Pool,
+    command: CreateSupplementRegimenCommand,
+    opts: { beforeCommit?: () => Promise<void> } = {},
+): Promise<CreateSupplementRegimenResult> {
+    const fields = validateRegimenFields(command);
+    const idempotencyKey = optionalText(command.idempotency_key);
+
+    // Concurrent first-time creates with the same key serialize on migration
+    // 010's uniq_supplement_regimens_user_idem partial unique index: the
+    // loser's insert aborts with a unique violation once the winner commits,
+    // and the retry below converges on the winner's row as a deduplicated
+    // read or a stable idempotency_conflict — never a second regimen.
+    const MAX_CREATE_ATTEMPTS = 3;
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await withTransaction(pool, async (client) => {
+                // Lock the authoritative product root (user-scoped) before
+                // resolving the version or inserting intent.
+                const { rows: rootRows } = await client.query(
+                    `SELECT id, user_id, category, status, current_version, created_at, updated_at
+                     FROM supplement_products
+                     WHERE id = $1 AND user_id = $2
+                     FOR UPDATE`,
+                    [command.product_id, command.user_id],
+                );
+                const root = rootRows[0] as ProductRootRow | undefined;
+                // Unknown id, another user's product, or a deleted product:
+                // one identical closed failure so existence never leaks.
+                if (!root || root.status !== "active") {
+                    throw new SupplementProductNotFoundError();
+                }
+
+                const version = command.product_version ?? root.current_version;
+                const { rows: versionRows } = await client.query(
+                    `SELECT 1 FROM supplement_product_versions
+                     WHERE product_id = $1 AND version = $2 AND user_id = $3`,
+                    [root.id, version, command.user_id],
+                );
+                if (versionRows.length === 0) {
+                    throw new SupplementProductVersionNotFoundError();
+                }
+
+                if (idempotencyKey !== null) {
+                    // Retry convergence: a regimen row with this user's key
+                    // means the original create already committed. Migration
+                    // 010 guarantees at most one such row can ever exist.
+                    const { rows } = await client.query(
+                        `${REGIMEN_SELECT} WHERE user_id = $1 AND idempotency_key = $2`,
+                        [command.user_id, idempotencyKey],
+                    );
+                    const existing = rows[0] as RegimenRow | undefined;
+                    if (existing) {
+                        const fingerprint =
+                            deriveSupplementRegimenIdempotencyFingerprint({
+                                user_id: command.user_id,
+                                idempotency_key: idempotencyKey,
+                                product_id: root.id,
+                                product_version: version,
+                                dose_servings: fields.dose_servings,
+                                schedule: fields.schedule,
+                                starts_on: fields.starts_on,
+                                ends_on: fields.ends_on,
+                            });
+                        if (
+                            regimenIdentityFingerprint(
+                                existing,
+                                idempotencyKey,
+                            ) !== fingerprint
+                        ) {
+                            throw new SupplementIdempotencyConflictError();
+                        }
+                        return {
+                            regimen: await assembleRegimenReadback(
+                                client,
+                                existing,
+                            ),
+                            deduplicated: true,
+                        };
+                    }
+                }
+
+                const { rows: inserted } = await client.query(
+                    `INSERT INTO supplement_regimens
+                        (user_id, product_id, product_version, dose_servings,
+                         schedule, timezone, starts_on, ends_on, created_by,
+                         idempotency_key)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     RETURNING id`,
+                    [
+                        command.user_id,
+                        root.id,
+                        version,
+                        fields.dose_servings,
+                        JSON.stringify(fields.schedule),
+                        fields.schedule.timezone,
+                        fields.starts_on,
+                        fields.ends_on,
+                        command.created_by,
+                        idempotencyKey,
+                    ],
+                );
+                await opts.beforeCommit?.();
+                const row = await readRegimenRow(
+                    client,
+                    (inserted[0] as { id: string }).id,
+                );
+                if (!row) throw new Error("failed to read created regimen");
+                return {
+                    regimen: await assembleRegimenReadback(client, row),
+                    deduplicated: false,
+                };
+            });
+        } catch (err) {
+            if (
+                idempotencyKey !== null &&
+                attempt < MAX_CREATE_ATTEMPTS &&
+                isKeyRaceViolation(err, "uniq_supplement_regimens_user_idem")
+            ) {
+                continue;
+            }
+            throw err;
+        }
+    }
 }
