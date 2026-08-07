@@ -18,6 +18,7 @@ import {
     alcoholHiddenNote,
     registerTools,
     START_IMPORT_OUTPUT_SCHEMA,
+    LOG_MEAL_EVENT_OUTPUT_SCHEMA,
     GOALS_ITEM,
     TOTALS_ITEM,
     TRENDS_DAY_ITEM,
@@ -1157,6 +1158,52 @@ describe("structuredContent literals satisfy their schemas", () => {
             carbs_g: 1,
             fat_g: 1,
         });
+    });
+});
+
+// Ensure LOG_MEAL_EVENT_OUTPUT_SCHEMA's canonical sub-object includes the consensus
+// audit fields that canonicalOutput() always emits — these were learned after the
+// initial schema was written and the mismatch caused structuredContent validation
+// failures in the MCP SDK layer.
+describe("log_meal_event output schema includes consensus audit fields", () => {
+    test("canonical shape declares source_result_ids, audit_evidence, and algorithm_version", () => {
+        const schema = z.object(LOG_MEAL_EVENT_OUTPUT_SCHEMA);
+        const canonicalShape = (
+            schema.shape.canonical as z.ZodNullable<z.ZodObject<any>>
+        ).unwrap();
+        expect(canonicalShape.shape).toHaveProperty("source_result_ids");
+        expect(canonicalShape.shape).toHaveProperty("audit_evidence");
+        expect(canonicalShape.shape).toHaveProperty("algorithm_version");
+    });
+
+    test("canonical payload with all three audit fields parses successfully", () => {
+        const fullCanonical = {
+            status: "ready",
+            consensus_status: "all_agree",
+            calories: 500,
+            protein_g: 30,
+            carbs_g: 60,
+            fat_g: 15,
+            fiber_g: null,
+            sugar_g: null,
+            alcohol_g: null,
+            eligible_providers: ["p1"],
+            outlier_providers: [],
+            threshold_percent: 10,
+            policy_version: "v1",
+            source_result_ids: ["sr-1"],
+            audit_evidence: { fp: "abc" },
+            algorithm_version: "v1",
+        };
+        const canonicalShape = (
+            z.object(LOG_MEAL_EVENT_OUTPUT_SCHEMA).shape
+                .canonical as z.ZodNullable<z.ZodObject<any>>
+        ).unwrap();
+        expect(() => canonicalShape.parse(fullCanonical)).not.toThrow();
+        const parsed = canonicalShape.parse(fullCanonical);
+        expect(parsed.source_result_ids).toEqual(["sr-1"]);
+        expect(parsed.audit_evidence).toEqual({ fp: "abc" });
+        expect(parsed.algorithm_version).toBe("v1");
     });
 });
 

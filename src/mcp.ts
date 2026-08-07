@@ -1018,6 +1018,9 @@ export const LOG_MEAL_EVENT_OUTPUT_SCHEMA = {
             outlier_providers: z.array(z.string()),
             threshold_percent: z.number(),
             policy_version: z.string(),
+            source_result_ids: z.array(z.string().min(1)).nullable(),
+            audit_evidence: z.record(z.string(), z.unknown()).nullable(),
+            algorithm_version: z.string().min(1).nullable(),
         })
         .nullable(),
     journal: z.array(
