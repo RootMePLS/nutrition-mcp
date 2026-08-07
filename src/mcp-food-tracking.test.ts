@@ -1026,6 +1026,276 @@ describeDb("attach_meal_capture_media MCP tool", () => {
 });
 
 // ---------------------------------------------------------------------------
+// attach_meal_capture_media file_path MCP tool
+// ---------------------------------------------------------------------------
+
+describeDb("attach_meal_capture_media file_path MCP tool", () => {
+    let pool: Pool;
+    let mediaRoot: string;
+    let mediaStore: MediaStore;
+    let tmpFilePath: string;
+
+    beforeAll(() => {
+        pool = new Pool({ connectionString: DATABASE_URL_TEST });
+    });
+    afterAll(async () => {
+        await pool.end();
+    });
+    afterEach(async () => {
+        await flushAnalytics();
+        await rm(mediaRoot, { recursive: true, force: true });
+    });
+    beforeEach(async () => {
+        await resetSchemaWithMigrations(pool, [
+            "001_initial_schema.sql",
+            "002_food_tracking.sql",
+            "003_meal_captures.sql",
+            "004_calculation_bundles.sql",
+            "005_calculation_corrections.sql",
+        ]);
+        mediaRoot = await mkdtemp(
+            join(tmpdir(), "mcp-capture-media-filepath-"),
+        );
+        mediaStore = createMediaStore(mediaRoot);
+
+        // Write a real temp file for the file_path tests inside the media
+        // root so the regular root cleanup handles it.
+        tmpFilePath = join(mediaRoot, "test-photo.png");
+        await Bun.write(tmpFilePath, MCP_PNG_BYTES);
+    });
+
+    test("attach via file_path produces same result as bytes_base64", async () => {
+        await withTools(
+            pool,
+            async (call) => {
+                const started = await call("start_meal_capture", {
+                    conversation_key: "filepath-flow",
+                    idempotency_key: "mcp-filepath-flow",
+                });
+                const captureId = JSON.parse(
+                    started.content[0]!.text!,
+                ).capture_id;
+
+                const attached = await call("attach_meal_capture_media", {
+                    capture_id: captureId,
+                    kind: "photo",
+                    mime_type: "image/png",
+                    file_path: tmpFilePath,
+                    idempotency_key: "mcp-filepath-attach-1",
+                });
+                expect(attached.isError).not.toBe(true);
+                const media = ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA.parse(
+                    attached.structuredContent,
+                );
+                expect(media.capture_id).toBe(captureId);
+                expect(media.deduplicated).toBe(false);
+                expect(media.sha256).toBe(MCP_PNG_SHA256);
+                expect(media.byte_size).toBe(MCP_PNG_BYTES.byteLength);
+                expect(media.storage_key).toBe(
+                    `capture/${captureId}/photo-${MCP_PNG_SHA256}`,
+                );
+
+                // Full round-trip: attach → draft → confirm → verify media
+                await call("save_meal_capture_draft", {
+                    capture_id: captureId,
+                    draft: {
+                        reported_at: "2026-08-05T12:00:00Z",
+                        items: [{ ordinal: 0, raw_item_text: "oatmeal" }],
+                        inputs: [
+                            {
+                                source_kind: "user_text",
+                                content: "oatmeal",
+                            },
+                        ],
+                        media: [
+                            {
+                                kind: media.kind,
+                                storage_key: media.storage_key,
+                                mime_type: media.mime_type,
+                                byte_size: media.byte_size,
+                                sha256: media.sha256,
+                                metadata: media.metadata,
+                            },
+                        ],
+                        parser_policy_version: "hermes.v1",
+                        created_by: "hermes",
+                    },
+                });
+                const confirmed = await call("confirm_meal_capture", {
+                    capture_id: captureId,
+                    confirmation: "add",
+                });
+                expect(confirmed.isError).not.toBe(true);
+            },
+            { mediaStore },
+        );
+    });
+
+    test("rejects both file_path and bytes_base64", async () => {
+        await withTools(
+            pool,
+            async (call) => {
+                const started = await call("start_meal_capture", {
+                    conversation_key: "filepath-both",
+                    idempotency_key: "mcp-filepath-both",
+                });
+                const captureId = JSON.parse(
+                    started.content[0]!.text!,
+                ).capture_id;
+                const r = await call("attach_meal_capture_media", {
+                    capture_id: captureId,
+                    kind: "photo",
+                    mime_type: "image/png",
+                    file_path: tmpFilePath,
+                    bytes_base64: MCP_PNG_BASE64,
+                });
+                expect(r.isError).toBe(true);
+                expect(r.content[0]!.text).toContain("not both");
+            },
+            { mediaStore },
+        );
+    });
+
+    test("rejects relative file_path", async () => {
+        await withTools(
+            pool,
+            async (call) => {
+                const started = await call("start_meal_capture", {
+                    conversation_key: "filepath-relative",
+                    idempotency_key: "mcp-filepath-relative",
+                });
+                const captureId = JSON.parse(
+                    started.content[0]!.text!,
+                ).capture_id;
+                const r = await call("attach_meal_capture_media", {
+                    capture_id: captureId,
+                    kind: "photo",
+                    mime_type: "image/png",
+                    file_path: "test-photo.png",
+                });
+                expect(r.isError).toBe(true);
+                expect(r.content[0]!.text).toContain("absolute path");
+            },
+            { mediaStore },
+        );
+    });
+
+    test("rejects file_path that does not exist", async () => {
+        await withTools(
+            pool,
+            async (call) => {
+                const started = await call("start_meal_capture", {
+                    conversation_key: "filepath-missing",
+                    idempotency_key: "mcp-filepath-missing",
+                });
+                const captureId = JSON.parse(
+                    started.content[0]!.text!,
+                ).capture_id;
+                const r = await call("attach_meal_capture_media", {
+                    capture_id: captureId,
+                    kind: "photo",
+                    mime_type: "image/png",
+                    file_path: "/tmp/nonexistent-file-xxx.png",
+                });
+                expect(r.isError).toBe(true);
+                expect(r.content[0]!.text).toContain("does not exist");
+            },
+            { mediaStore },
+        );
+    });
+
+    test("rejects file_path with .. segments", async () => {
+        await withTools(
+            pool,
+            async (call) => {
+                const started = await call("start_meal_capture", {
+                    conversation_key: "filepath-dotdot",
+                    idempotency_key: "mcp-filepath-dotdot",
+                });
+                const captureId = JSON.parse(
+                    started.content[0]!.text!,
+                ).capture_id;
+                const r = await call("attach_meal_capture_media", {
+                    capture_id: captureId,
+                    kind: "photo",
+                    mime_type: "image/png",
+                    file_path: "/tmp/../etc/passwd",
+                });
+                expect(r.isError).toBe(true);
+                expect(r.content[0]!.text).toContain("..");
+            },
+            { mediaStore },
+        );
+    });
+
+    test("sha256 cross-check on file_path (mismatch → error)", async () => {
+        await withTools(
+            pool,
+            async (call) => {
+                const started = await call("start_meal_capture", {
+                    conversation_key: "filepath-sha256",
+                    idempotency_key: "mcp-filepath-sha256",
+                });
+                const captureId = JSON.parse(
+                    started.content[0]!.text!,
+                ).capture_id;
+                const r = await call("attach_meal_capture_media", {
+                    capture_id: captureId,
+                    kind: "photo",
+                    mime_type: "image/png",
+                    file_path: tmpFilePath,
+                    sha256: "f".repeat(64),
+                });
+                expect(r.isError).toBe(true);
+                expect(r.content[0]!.text).toContain("sha256 does not match");
+            },
+            { mediaStore },
+        );
+    });
+
+    test("retry with file_path is idempotent", async () => {
+        await withTools(
+            pool,
+            async (call) => {
+                const started = await call("start_meal_capture", {
+                    conversation_key: "filepath-retry",
+                    idempotency_key: "mcp-filepath-retry",
+                });
+                const captureId = JSON.parse(
+                    started.content[0]!.text!,
+                ).capture_id;
+                const args = {
+                    capture_id: captureId,
+                    kind: "photo",
+                    mime_type: "image/png",
+                    file_path: tmpFilePath,
+                };
+                const first = await call("attach_meal_capture_media", args);
+                const second = await call("attach_meal_capture_media", args);
+                expect(first.isError).not.toBe(true);
+                expect(second.isError).not.toBe(true);
+                const a = ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA.parse(
+                    first.structuredContent,
+                );
+                const b = ATTACH_MEAL_CAPTURE_MEDIA_OUTPUT_SCHEMA.parse(
+                    second.structuredContent,
+                );
+                expect(a.deduplicated).toBe(false);
+                expect(b.deduplicated).toBe(true);
+                expect(b.media_id).toBe(a.media_id);
+                expect(b.storage_key).toBe(a.storage_key);
+                const { rows } = await pool.query(
+                    `SELECT count(*) AS n FROM meal_capture_media WHERE capture_id=$1`,
+                    [captureId],
+                );
+                expect(Number(rows[0]!.n)).toBe(1);
+            },
+            { mediaStore },
+        );
+    });
+});
+
+// ---------------------------------------------------------------------------
 // S6 capture lifecycle structured-output contracts. Every one of the nine
 // lifecycle tools must (a) advertise a declared outputSchema over listTools
 // and (b) return runtime structuredContent on success that parses through the

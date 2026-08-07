@@ -40,3 +40,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Already-tracked historical plan files are unaffected (gitignore only guards
 # UNTRACKED paths); this stops `git add -A` from ever re-tracking new ones.
 .hermes/
+
+# Local media store (test artifacts, never committed)
+var/

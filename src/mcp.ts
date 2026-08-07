@@ -5895,7 +5895,7 @@ export function registerTools(
         {
             title: "Attach Meal Capture Media",
             description:
-                "Attach raw media bytes (base64) to an editable meal capture. The backend decodes and verifies the bytes (8 MiB decoded cap; image/jpeg, image/png, image/webp, audio/ogg, audio/mpeg, audio/mp4 only), computes SHA-256 server-side, generates the capture-scoped storage key, and stages the file before persisting metadata — you never supply storage_key, and an optional sha256 must match the server-computed hash. Re-attaching identical bytes is idempotent and returns the existing media identity. No STT/OCR/vision runs here.",
+                "Attach raw media bytes to an editable meal capture. Provide exactly one of `bytes_base64` (the full file as a canonical base64 string) or `file_path` (an absolute path to the file on the server's filesystem). The backend decodes/reads the bytes (8 MiB cap; image/jpeg, image/png, image/webp, audio/ogg, audio/mpeg, audio/mp4 only), computes SHA-256 server-side, generates the capture-scoped storage key, and stages the file before persisting metadata — you never supply storage_key, and an optional sha256 must match the server-computed hash. Re-attaching identical bytes is idempotent and returns the existing media identity. No STT/OCR/vision runs here.",
             annotations: {
                 readOnlyHint: false,
                 destructiveHint: false,
@@ -5906,7 +5906,8 @@ export function registerTools(
                 capture_id: z.string().min(1),
                 kind: z.enum(["photo", "audio"]),
                 mime_type: z.string().min(1),
-                bytes_base64: z.string().min(1),
+                bytes_base64: z.string().min(1).optional(),
+                file_path: z.string().min(1).optional(),
                 sha256: z
                     .string()
                     .regex(/^[0-9a-f]{64}$/)
@@ -5929,6 +5930,7 @@ export function registerTools(
                     kind: args.kind,
                     mime_type: args.mime_type,
                     bytes_base64: args.bytes_base64,
+                    file_path: args.file_path,
                     sha256: args.sha256,
                     duration_ms: args.duration_ms,
                     width: args.width,

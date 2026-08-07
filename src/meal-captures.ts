@@ -273,7 +273,8 @@ const STRICT_BASE64 =
 export interface AttachCaptureMediaInput {
     kind: "photo" | "audio";
     mime_type: string;
-    bytes_base64: string;
+    bytes_base64?: string;
+    file_path?: string;
     sha256?: string;
     duration_ms?: number | null;
     width?: number | null;
@@ -408,22 +409,49 @@ export async function attachCaptureMediaBytes(
             `media mime_type is not in the capture allow-list for ${kind}`,
         );
     }
+
+    // Validate mutual exclusivity of bytes_base64 and file_path.
+    const hasBytes =
+        typeof input.bytes_base64 === "string" && input.bytes_base64.length > 0;
+    const hasPath =
+        typeof input.file_path === "string" && input.file_path.length > 0;
+    if (hasBytes && hasPath) {
+        errors.push("provide file_path or bytes_base64, not both");
+    } else if (!hasBytes && !hasPath) {
+        errors.push("file_path or bytes_base64 is required");
+    }
+
     let bytes: Uint8Array | null = null;
-    if (
-        typeof input.bytes_base64 !== "string" ||
-        !STRICT_BASE64.test(input.bytes_base64)
-    ) {
-        errors.push("media bytes_base64 must be canonical base64");
-    } else {
-        const decoded = Buffer.from(input.bytes_base64, "base64");
-        if (decoded.toString("base64") !== input.bytes_base64) {
+    if (hasBytes) {
+        // --- bytes_base64 path ---
+        if (!STRICT_BASE64.test(input.bytes_base64!)) {
             errors.push("media bytes_base64 must be canonical base64");
-        } else if (decoded.byteLength > CAPTURE_MEDIA_MAX_BYTES) {
-            errors.push("media bytes exceed the 8 MiB decoded capture limit");
         } else {
-            bytes = new Uint8Array(decoded);
+            const decoded = Buffer.from(input.bytes_base64!, "base64");
+            if (decoded.toString("base64") !== input.bytes_base64) {
+                errors.push("media bytes_base64 must be canonical base64");
+            } else if (decoded.byteLength > CAPTURE_MEDIA_MAX_BYTES) {
+                errors.push(
+                    "media bytes exceed the 8 MiB decoded capture limit",
+                );
+            } else {
+                bytes = new Uint8Array(decoded);
+            }
+        }
+    } else if (hasPath) {
+        // --- file_path validation (shape only; existence checked later) ---
+        const fp = input.file_path!;
+        if (fp.includes("\u0000")) {
+            errors.push("file_path must not contain NUL bytes");
+        } else if (fp.includes("\\")) {
+            errors.push("file_path must use forward slashes");
+        } else if (fp.split("/").includes("..")) {
+            errors.push("file_path must not contain '..' segments");
+        } else if (!fp.startsWith("/")) {
+            errors.push("file_path must be an absolute path");
         }
     }
+
     for (const [field, value] of [
         ["duration_ms", input.duration_ms],
         ["width", input.width],
@@ -437,6 +465,29 @@ export async function attachCaptureMediaBytes(
             errors.push(`media ${field} must be a non-negative integer`);
     }
     if (errors.length) throw new MealCaptureValidationError(errors);
+
+    // --- If file_path, read the file now (schema is clean) ---
+    if (hasPath && !hasBytes) {
+        const fp = input.file_path!;
+        const file = Bun.file(fp);
+        if (!(await file.exists())) {
+            throw new MealCaptureValidationError([
+                `file_path does not exist or is not readable: ${fp}`,
+            ]);
+        }
+        const buf = new Uint8Array(await file.arrayBuffer());
+        if (buf.byteLength === 0) {
+            throw new MealCaptureValidationError([
+                `file_path is an empty file: ${fp}`,
+            ]);
+        }
+        if (buf.byteLength > CAPTURE_MEDIA_MAX_BYTES) {
+            throw new MealCaptureValidationError([
+                `file at file_path exceeds the 8 MiB capture limit`,
+            ]);
+        }
+        bytes = buf;
+    }
 
     // The server is the sole authority on identity: hash the decoded bytes,
     // never trust a caller-supplied digest.
