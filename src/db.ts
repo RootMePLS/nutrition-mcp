@@ -558,6 +558,23 @@ export async function upsertProfile(
         preferred_drink_unit?: DrinkUnit | null;
     },
 ): Promise<Profile> {
+    // Sparse-patch contract: a field is part of the patch iff it was passed
+    // with a value other than undefined. `null` is a real value for the two
+    // clearable unit columns ("clear the preference"); an OMITTED field must
+    // keep its stored value on update. The per-field booleans below feed the
+    // CASE arms in the single atomic upsert — never merge in JS with a prior
+    // SELECT, which would reintroduce a read-modify-write race between
+    // concurrent setters. On first insert, omitted fields take the documented
+    // defaults (timezone 'UTC', widgets on, alcohol off, units unset),
+    // matching both the column defaults in 001_initial_schema.sql and the
+    // pre-fix insert behavior.
+    const provided = [
+        patch.timezone !== undefined,
+        patch.preferred_weight_unit !== undefined,
+        patch.widgets_enabled !== undefined,
+        patch.alcohol_tracking_enabled !== undefined,
+        patch.preferred_drink_unit !== undefined,
+    ];
     try {
         const { rows } = await pool.query(
             `INSERT INTO profiles (user_id, timezone, preferred_weight_unit,
@@ -570,11 +587,16 @@ export async function upsertProfile(
                  $6,
                  $7)
              ON CONFLICT (user_id) DO UPDATE SET
-                 timezone = COALESCE(EXCLUDED.timezone, profiles.timezone),
-                 preferred_weight_unit = EXCLUDED.preferred_weight_unit,
-                 widgets_enabled = COALESCE(EXCLUDED.widgets_enabled, profiles.widgets_enabled),
-                 alcohol_tracking_enabled = COALESCE(EXCLUDED.alcohol_tracking_enabled, profiles.alcohol_tracking_enabled),
-                 preferred_drink_unit = EXCLUDED.preferred_drink_unit,
+                 timezone = CASE WHEN $8::boolean
+                     THEN EXCLUDED.timezone ELSE profiles.timezone END,
+                 preferred_weight_unit = CASE WHEN $9::boolean
+                     THEN EXCLUDED.preferred_weight_unit ELSE profiles.preferred_weight_unit END,
+                 widgets_enabled = CASE WHEN $10::boolean
+                     THEN EXCLUDED.widgets_enabled ELSE profiles.widgets_enabled END,
+                 alcohol_tracking_enabled = CASE WHEN $11::boolean
+                     THEN EXCLUDED.alcohol_tracking_enabled ELSE profiles.alcohol_tracking_enabled END,
+                 preferred_drink_unit = CASE WHEN $12::boolean
+                     THEN EXCLUDED.preferred_drink_unit ELSE profiles.preferred_drink_unit END,
                  updated_at = EXCLUDED.updated_at
              RETURNING *`,
             [
@@ -585,6 +607,7 @@ export async function upsertProfile(
                 patch.alcohol_tracking_enabled ?? null,
                 patch.preferred_drink_unit ?? null,
                 new Date().toISOString(),
+                ...provided,
             ],
         );
         return profileFromRow(rows[0]!);
