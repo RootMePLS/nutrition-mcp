@@ -506,6 +506,7 @@ export async function attachCaptureMediaBytes(
             capture_id: captureId,
             kind: kind as "photo" | "audio",
             sha256,
+            mime_type: input.mime_type,
         }),
         mime_type: input.mime_type,
         byte_size: bytes!.byteLength,

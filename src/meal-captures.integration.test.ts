@@ -443,7 +443,7 @@ describeDb("capture media byte lifecycle (attachCaptureMediaBytes)", () => {
         expect(result.sha256).toBe(sha256HexOf(PNG_BYTES));
         expect(result.byte_size).toBe(PNG_BYTES.byteLength);
         expect(result.storage_key).toBe(
-            `capture/${capture.capture_id}/photo-${result.sha256}`,
+            `capture/${capture.capture_id}/photo-${result.sha256}.png`,
         );
         // Filesystem truth: the file exists and its bytes recompute to the
         // returned hash.
@@ -488,7 +488,7 @@ describeDb("capture media byte lifecycle (attachCaptureMediaBytes)", () => {
         expect(Number(rows[0]!.n)).toBe(0);
         const stagedPath = join(
             mediaRoot,
-            `capture/${capture.capture_id}/photo-${sha256HexOf(PNG_BYTES)}`,
+            `capture/${capture.capture_id}/photo-${sha256HexOf(PNG_BYTES)}.png`,
         );
         expect(await Bun.file(stagedPath).exists()).toBe(false);
     });
@@ -1025,7 +1025,7 @@ describeDb(
                 bytes_base64: PNG_BASE64,
             });
         const stagedKeyOf = (captureId: string) =>
-            `capture/${captureId}/photo-${sha256HexOf(PNG_BYTES)}`;
+            `capture/${captureId}/photo-${sha256HexOf(PNG_BYTES)}.png`;
         const expectFileIntact = async (storageKey: string) => {
             const path = join(mediaRoot, storageKey);
             expect(await Bun.file(path).exists()).toBe(true);

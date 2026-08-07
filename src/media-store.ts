@@ -90,13 +90,28 @@ function assertSafeKey(key: string): void {
     }
 }
 
+const MIME_TO_EXTENSION: Record<string, string> = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "audio/ogg": ".ogg",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+};
+
+function mimeToExtension(mime_type: string): string {
+    return MIME_TO_EXTENSION[mime_type] ?? "";
+}
+
 export function generateStorageKey(args: {
     event_id: string;
     version: number;
     kind: "photo" | "audio";
     sha256: string;
+    mime_type?: string;
 }): string {
-    return `${args.event_id}/${args.version}/${args.kind}-${args.sha256}`;
+    const ext = args.mime_type ? mimeToExtension(args.mime_type) : "";
+    return `${args.event_id}/${args.version}/${args.kind}-${args.sha256}${ext}`;
 }
 
 export function isGeneratedStorageKey(args: {
@@ -105,6 +120,7 @@ export function isGeneratedStorageKey(args: {
     version: number;
     kind: "photo" | "audio";
     sha256: string;
+    mime_type?: string;
 }): boolean {
     return args.storage_key === generateStorageKey(args);
 }
@@ -116,8 +132,10 @@ export function generateCaptureStorageKey(args: {
     capture_id: string;
     kind: "photo" | "audio";
     sha256: string;
+    mime_type?: string;
 }): string {
-    return `capture/${args.capture_id}/${args.kind}-${args.sha256}`;
+    const ext = args.mime_type ? mimeToExtension(args.mime_type) : "";
+    return `capture/${args.capture_id}/${args.kind}-${args.sha256}${ext}`;
 }
 
 export function isGeneratedCaptureStorageKey(args: {
@@ -125,6 +143,7 @@ export function isGeneratedCaptureStorageKey(args: {
     capture_id: string;
     kind: "photo" | "audio";
     sha256: string;
+    mime_type?: string;
 }): boolean {
     return args.storage_key === generateCaptureStorageKey(args);
 }
@@ -182,6 +201,7 @@ export function createMediaStore(root: string): MediaStore {
                     version,
                     kind,
                     sha256: sha256Hex(bytes),
+                    mime_type,
                 }),
                 bytes,
                 mime_type,
@@ -194,6 +214,7 @@ export function createMediaStore(root: string): MediaStore {
                     capture_id,
                     kind,
                     sha256: sha256Hex(bytes),
+                    mime_type,
                 }),
                 bytes,
                 mime_type,

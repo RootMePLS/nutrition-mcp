@@ -756,7 +756,7 @@ describeDb("attach_meal_capture_media MCP tool", () => {
                 expect(media.sha256).toBe(MCP_PNG_SHA256);
                 expect(media.byte_size).toBe(MCP_PNG_BYTES.byteLength);
                 expect(media.storage_key).toBe(
-                    `capture/${captureId}/photo-${MCP_PNG_SHA256}`,
+                    `capture/${captureId}/photo-${MCP_PNG_SHA256}.png`,
                 );
                 expect(media.capture_state).toBe("receiving");
                 // Filesystem truth before confirm.
@@ -1092,7 +1092,7 @@ describeDb("attach_meal_capture_media file_path MCP tool", () => {
                 expect(media.sha256).toBe(MCP_PNG_SHA256);
                 expect(media.byte_size).toBe(MCP_PNG_BYTES.byteLength);
                 expect(media.storage_key).toBe(
-                    `capture/${captureId}/photo-${MCP_PNG_SHA256}`,
+                    `capture/${captureId}/photo-${MCP_PNG_SHA256}.png`,
                 );
 
                 // Full round-trip: attach → draft → confirm → verify media

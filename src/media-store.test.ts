@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     createMediaStore,
+    generateCaptureStorageKey,
+    generateStorageKey,
     MediaChecksumError,
     MediaNotFoundError,
     UnsafeStorageKeyError,
@@ -159,5 +161,123 @@ describe("media store", () => {
                 mime_type: "image/jpeg",
             }),
         ).rejects.toBeInstanceOf(UnsafeStorageKeyError);
+    });
+
+    // --- storage key extension tests ---
+
+    test("storage key includes file extension for known MIME types", async () => {
+        const store = createMediaStore(root);
+        const meta = await store.put({
+            event_id: "evt-ext",
+            version: 1,
+            kind: "photo",
+            bytes: BYTES,
+            mime_type: "image/png",
+        });
+        expect(meta.storage_key).toEndWith(".png");
+    });
+
+    test("storage key omits extension for unknown MIME types", async () => {
+        const store = createMediaStore(root);
+        const meta = await store.put({
+            event_id: "evt-noext",
+            version: 1,
+            kind: "photo",
+            bytes: BYTES,
+            mime_type: "application/octet-stream",
+        });
+        expect(meta.storage_key).not.toContain(".octet-stream");
+        const sha = new Bun.CryptoHasher("sha256").update(BYTES).digest("hex");
+        expect(meta.storage_key).toEndWith(`photo-${sha}`);
+    });
+
+    test("generateStorageKey appends extension for known MIME", () => {
+        const key = generateStorageKey({
+            event_id: "evt-1",
+            version: 1,
+            kind: "photo",
+            sha256: "abc123",
+            mime_type: "image/jpeg",
+        });
+        expect(key).toBe("evt-1/1/photo-abc123.jpg");
+    });
+
+    test("generateStorageKey omits extension when mime_type missing", () => {
+        const key = generateStorageKey({
+            event_id: "evt-1",
+            version: 1,
+            kind: "photo",
+            sha256: "abc123",
+        });
+        expect(key).toBe("evt-1/1/photo-abc123");
+    });
+
+    test("generateStorageKey omits extension for unknown MIME", () => {
+        const key = generateStorageKey({
+            event_id: "evt-1",
+            version: 1,
+            kind: "photo",
+            sha256: "abc123",
+            mime_type: "application/octet-stream",
+        });
+        expect(key).toBe("evt-1/1/photo-abc123");
+    });
+
+    test("generateCaptureStorageKey appends extension for known MIME", () => {
+        const key = generateCaptureStorageKey({
+            capture_id: "cap-1",
+            kind: "photo",
+            sha256: "abc123",
+            mime_type: "image/webp",
+        });
+        expect(key).toBe("capture/cap-1/photo-abc123.webp");
+    });
+
+    test("generateCaptureStorageKey appends .ogg for audio", () => {
+        const key = generateCaptureStorageKey({
+            capture_id: "cap-2",
+            kind: "audio",
+            sha256: "def456",
+            mime_type: "audio/ogg",
+        });
+        expect(key).toBe("capture/cap-2/audio-def456.ogg");
+    });
+
+    test("generateCaptureStorageKey omits extension when mime_type missing", () => {
+        const key = generateCaptureStorageKey({
+            capture_id: "cap-1",
+            kind: "photo",
+            sha256: "abc123",
+        });
+        expect(key).toBe("capture/cap-1/photo-abc123");
+    });
+
+    test("generateCaptureStorageKey omits extension for unknown MIME", () => {
+        const key = generateCaptureStorageKey({
+            capture_id: "cap-1",
+            kind: "photo",
+            sha256: "abc123",
+            mime_type: "application/octet-stream",
+        });
+        expect(key).toBe("capture/cap-1/photo-abc123");
+    });
+
+    test("audio MIME types get correct extensions", () => {
+        expect(
+            generateCaptureStorageKey({
+                capture_id: "cap-a",
+                kind: "audio",
+                sha256: "xyz",
+                mime_type: "audio/mpeg",
+            }),
+        ).toBe("capture/cap-a/audio-xyz.mp3");
+        expect(
+            generateCaptureStorageKey({
+                capture_id: "cap-a",
+                kind: "audio",
+                sha256: "xyz",
+                mime_type: "audio/mp4",
+            }),
+        ).toBe("capture/cap-a/audio-xyz.m4a");
     });
 });

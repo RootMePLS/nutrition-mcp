@@ -811,6 +811,7 @@ export async function createMealEvent(
                             version: 1,
                             kind: media.kind,
                             sha256: media.sha256,
+                            mime_type: media.mime_type,
                         })
                     ) {
                         throw new MealEventValidationError([
