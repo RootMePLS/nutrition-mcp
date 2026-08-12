@@ -322,6 +322,12 @@ against the EXISTING host PostgreSQL database `nutrition_mcp` on
 - **This targets the live database.** `migrate-hostdb` runs first and only
   re-applies the forward-only, idempotent migrations — a no-op on an
   already-migrated database. Nothing is dropped, created, or volumed.
+- **Fail-closed safety guard:** migration 002 is destructive (`DELETE FROM
+meals; DROP TABLE meals`, retiring the legacy `meals` table), so
+  `migrate-hostdb` refuses to run at all — before executing any migration —
+  if the host database still contains the legacy `meals` table. No data can
+  be destroyed by the opt-in path; migrate `meals` → `meal_events` outside
+  this profile first if that ever applies.
 - The app is published on http://localhost:18081 (`:8080` is the non-Docker
   dev server, `:18080` the isolated compose app). MCP endpoint:
   http://localhost:18081/mcp

@@ -40,10 +40,14 @@ services:
     # ------------------------------------------------------------------
     # OPT-IN `hostdb` profile — targets the LIVE host PostgreSQL database
     # `nutrition_mcp` on 127.0.0.1:5432 (reached via host.docker.internal).
-    # This is the user's REAL data. Nothing here is destructive:
-    # migrate-hostdb only re-applies the forward-only idempotent
-    # migrations (a no-op on an already-migrated database), and no
-    # service in this profile creates, drops, or volumes any database.
+    # This is the user's REAL data. migrate-hostdb sets
+    # REFUSE_IF_LEGACY_MEALS=1 so scripts/migrate.sh FAILS CLOSED (non-zero
+    # exit, blocking app-hostdb via service_completed_successfully) if the
+    # host database still has a legacy `meals` table — migration 002 is
+    # destructive (DELETE FROM meals; DROP TABLE meals) and the guard makes
+    # sure this opt-in path can never reach it. On an already-migrated
+    # database (no `meals`) the remaining migrations are additive no-ops.
+    # No service in this profile creates, drops, or volumes any database.
     # A plain `docker compose up` NEVER starts these services; they run
     # only with `docker compose --profile hostdb ...`.
     # ------------------------------------------------------------------
@@ -55,6 +59,7 @@ services:
             PGPORT: "5432"
             PGUSER: ${HOSTDB_PGUSER:-fishhead}
             PGDATABASE: nutrition_mcp
+            REFUSE_IF_LEGACY_MEALS: "1"
         volumes:
             - ./db/migrations:/migrations:ro
             - ./scripts/migrate.sh:/migrate.sh:ro
