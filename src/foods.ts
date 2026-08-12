@@ -9,6 +9,8 @@
 
 import { getPool } from "./db.js";
 import { gramsFromDrink, formatAlcohol, type DrinkUnit } from "./alcohol.js";
+import { NUTRIENT_UNITS, type NutrientField } from "./meal-types.js";
+import { gToMg } from "./nutrient-units.js";
 
 const OFF_PRODUCT_URL = "https://world.openfoodfacts.org/api/v2/product";
 const REQUEST_TIMEOUT_MS = 8_000;
@@ -43,6 +45,19 @@ export interface FoodResult {
     fiber_g: number | null;
     sugar_g: number | null; // TOTAL sugars, incl. naturally occurring
     alcohol_g: number | null; // pure ethanol; often null — see resolveAlcoholGrams
+    // Slice-1 nutrient expansion (2026-08-12): canonical unit lives in the
+    // field-name suffix. All null when OFF lacks the key — never 0.
+    saturated_fat_g: number | null;
+    polyunsaturated_fat_g: number | null;
+    monounsaturated_fat_g: number | null;
+    trans_fat_g: number | null;
+    cholesterol_mg: number | null;
+    sodium_mg: number | null;
+    potassium_mg: number | null;
+    calcium_mg: number | null;
+    iron_mg: number | null;
+    vitamin_c_mg: number | null;
+    vitamin_a_mcg_rae: number | null; // mcg retinol activity equivalents
     source: string; // stable id, e.g. "off:737628064502"
     source_name: typeof SOURCE_OFF;
     barcode: string;
@@ -155,6 +170,34 @@ function normalizeOFFProduct(product: OFFProduct, barcode: string): FoodResult {
     const pick = (servingKey: string, hundredKey: string) =>
         hasServing ? num(n[servingKey]) : num(n[hundredKey]);
 
+    // Gram-scale fat subtypes reuse pick(), but community-corrupt negatives
+    // refuse to null (num() already refuses non-finite).
+    const pickG = (servingKey: string, hundredKey: string) => {
+        const g = pick(servingKey, hundredKey);
+        return g != null && g < 0 ? null : g;
+    };
+    // Milligram/microgram nutrients sit far below num()'s 0.1 g rounding
+    // (30 mg cholesterol = 0.03 g would round to 0.0 g), so read them raw
+    // and round AFTER conversion into the smaller canonical unit.
+    const numRaw = (value: unknown): number | null => {
+        const v =
+            typeof value === "string" ? parseFloat(value) : (value as number);
+        return typeof v === "number" && Number.isFinite(v) ? v : null;
+    };
+    const pickRaw = (servingKey: string, hundredKey: string) =>
+        hasServing ? numRaw(n[servingKey]) : numRaw(n[hundredKey]);
+    const pickMg = (servingKey: string, hundredKey: string) => {
+        const g = pickRaw(servingKey, hundredKey); // OFF mass values are grams
+        if (g == null || g < 0) return null;
+        const mg = gToMg(g);
+        return mg == null ? null : Math.round(mg * 10) / 10;
+    };
+    const vitaminAUnit =
+        typeof n["vitamin-a_unit"] === "string"
+            ? n["vitamin-a_unit"].trim().toLowerCase()
+            : null;
+    const vitaminAG = pickRaw("vitamin-a_serving", "vitamin-a_100g");
+
     return {
         name: product.product_name?.trim() || `Product ${barcode}`,
         brand: product.brands?.split(",")[0]?.trim() || null,
@@ -172,6 +215,33 @@ function normalizeOFFProduct(product: OFFProduct, barcode: string): FoodResult {
         // stored field is total sugar.
         sugar_g: pick("sugars_serving", "sugars_100g"),
         alcohol_g: resolveAlcoholGrams(product, n, hasServing),
+        saturated_fat_g: pickG("saturated-fat_serving", "saturated-fat_100g"),
+        polyunsaturated_fat_g: pickG(
+            "polyunsaturated-fat_serving",
+            "polyunsaturated-fat_100g",
+        ),
+        monounsaturated_fat_g: pickG(
+            "monounsaturated-fat_serving",
+            "monounsaturated-fat_100g",
+        ),
+        trans_fat_g: pickG("trans-fat_serving", "trans-fat_100g"),
+        cholesterol_mg: pickMg("cholesterol_serving", "cholesterol_100g"),
+        // OFF computes `sodium` from `salt` itself — never derive from salt
+        // here, that risks double conversion on products that carry both.
+        sodium_mg: pickMg("sodium_serving", "sodium_100g"),
+        potassium_mg: pickMg("potassium_serving", "potassium_100g"),
+        calcium_mg: pickMg("calcium_serving", "calcium_100g"),
+        iron_mg: pickMg("iron_serving", "iron_100g"),
+        vitamin_c_mg: pickMg("vitamin-c_serving", "vitamin-c_100g"),
+        // Only µg/mcg-labelled vitamin A is unambiguous (OFF grams -> mcg,
+        // treated as RAE per OFF convention). IU without a declared form
+        // refuses to null.
+        vitamin_a_mcg_rae:
+            vitaminAG != null &&
+            vitaminAG >= 0 &&
+            (vitaminAUnit === "µg" || vitaminAUnit === "mcg")
+                ? Math.round(vitaminAG * 1_000_000 * 10) / 10
+                : null,
         source: `off:${barcode}`,
         source_name: SOURCE_OFF,
         barcode,
@@ -306,6 +376,31 @@ function macro(value: number | null, unit: string): string {
     return value == null ? "n/a" : `${value} ${unit}`;
 }
 
+// Slice-1 micronutrient / fat-subtype lines, rendered only when the value
+// is non-null — a printed "0" or "n/a" would read as data. Display order
+// follows the canonical NUTRIENT_FIELDS append order.
+const MICRONUTRIENT_DISPLAY: readonly {
+    field: NutrientField;
+    label: string;
+}[] = [
+    { field: "saturated_fat_g", label: "Saturated fat" },
+    { field: "polyunsaturated_fat_g", label: "Polyunsaturated fat" },
+    { field: "monounsaturated_fat_g", label: "Monounsaturated fat" },
+    { field: "trans_fat_g", label: "Trans fat" },
+    { field: "cholesterol_mg", label: "Cholesterol" },
+    { field: "sodium_mg", label: "Sodium" },
+    { field: "potassium_mg", label: "Potassium" },
+    { field: "calcium_mg", label: "Calcium" },
+    { field: "iron_mg", label: "Iron" },
+    { field: "vitamin_c_mg", label: "Vitamin C" },
+    { field: "vitamin_a_mcg_rae", label: "Vitamin A" },
+];
+
+function displayUnit(field: NutrientField): string {
+    const unit = NUTRIENT_UNITS[field];
+    return unit === "mcg_rae" ? "mcg RAE" : unit;
+}
+
 /**
  * Render a lookup for the model. `alcoholUnit` is the user's drink unit, or null
  * when alcohol tracking is off for them — in which case the alcohol line is
@@ -339,6 +434,12 @@ export function formatFoodResult(
     ];
     if (alcoholUnit && food.alcohol_g != null) {
         lines.push(`Alcohol: ${formatAlcohol(food.alcohol_g, alcoholUnit)}`);
+    }
+    for (const { field, label } of MICRONUTRIENT_DISPLAY) {
+        const value = food[field];
+        if (value != null) {
+            lines.push(`${label}: ${value} ${displayUnit(field)}`);
+        }
     }
     lines.push(`Source: Open Food Facts (barcode ${food.barcode})`);
     return lines.join("\n");

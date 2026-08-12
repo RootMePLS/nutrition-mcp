@@ -442,6 +442,94 @@ describe("fetchProductFromOFF alcohol (ABV, not grams)", () => {
     });
 });
 
+describe("OFF micronutrient and fat-subtype mapping", () => {
+    test("maps micronutrients to canonical units (g -> mg, g -> mcg)", async () => {
+        mockFetch(() =>
+            jsonResponse({
+                status: 1,
+                product: {
+                    product_name: "Test",
+                    nutriments: {
+                        "energy-kcal_100g": 250,
+                        proteins_100g: 10,
+                        "saturated-fat_100g": 4.5,
+                        "polyunsaturated-fat_100g": 1.2,
+                        "monounsaturated-fat_100g": 2.3,
+                        "trans-fat_100g": 0.1,
+                        cholesterol_100g: 0.03, // 30 mg
+                        sodium_100g: 0.4, // 400 mg
+                        potassium_100g: 0.35,
+                        calcium_100g: 0.12,
+                        iron_100g: 0.0021,
+                        "vitamin-c_100g": 0.06,
+                        "vitamin-a_100g": 0.00075,
+                        "vitamin-a_unit": "µg",
+                    },
+                },
+            }),
+        );
+
+        const food = await fetchProductFromOFF("737628064502");
+        expect(food!.saturated_fat_g).toBeCloseTo(4.5);
+        expect(food!.polyunsaturated_fat_g).toBeCloseTo(1.2);
+        expect(food!.monounsaturated_fat_g).toBeCloseTo(2.3);
+        expect(food!.trans_fat_g).toBeCloseTo(0.1);
+        expect(food!.cholesterol_mg).toBeCloseTo(30);
+        expect(food!.sodium_mg).toBeCloseTo(400);
+        expect(food!.potassium_mg).toBeCloseTo(350);
+        expect(food!.calcium_mg).toBeCloseTo(120);
+        expect(food!.iron_mg).toBeCloseTo(2.1);
+        expect(food!.vitamin_c_mg).toBeCloseTo(60);
+        expect(food!.vitamin_a_mcg_rae).toBeCloseTo(750);
+    });
+
+    test("absent micronutrients stay null; vitamin A IU refuses", async () => {
+        mockFetch(() =>
+            jsonResponse({
+                status: 1,
+                product: {
+                    product_name: "Bare",
+                    nutriments: {
+                        "energy-kcal_100g": 100,
+                        "vitamin-a_100g": 0.001,
+                        "vitamin-a_unit": "IU",
+                    },
+                },
+            }),
+        );
+
+        const food = await fetchProductFromOFF("12345678");
+        expect(food!.sodium_mg).toBeNull();
+        expect(food!.trans_fat_g).toBeNull();
+        expect(food!.vitamin_a_mcg_rae).toBeNull(); // IU form unknown -> refuse
+    });
+
+    test("salt never derives sodium; corrupt (negative) values refuse", async () => {
+        mockFetch(() =>
+            jsonResponse({
+                status: 1,
+                product: {
+                    product_name: "Salty",
+                    nutriments: {
+                        "energy-kcal_100g": 100,
+                        // OFF computes sodium from salt itself; a salt key
+                        // without a sodium key must NOT be converted here
+                        // (double-conversion risk on products carrying both).
+                        salt_100g: 2.5,
+                        cholesterol_100g: -0.5, // community-corrupt negative
+                        "trans-fat_100g": -0.2,
+                    },
+                },
+            }),
+        );
+
+        const food = await fetchProductFromOFF("12345678");
+        expect(food!.sodium_mg).toBeNull();
+        expect(food!.cholesterol_mg).toBeNull();
+        expect(food!.trans_fat_g).toBeNull();
+    });
+});
+
 describe("formatFoodResult", () => {
     const base: FoodResult = {
         name: "Coconut Milk",
@@ -454,6 +542,17 @@ describe("formatFoodResult", () => {
         fiber_g: 0.5,
         sugar_g: 1.8,
         alcohol_g: null,
+        saturated_fat_g: null,
+        polyunsaturated_fat_g: null,
+        monounsaturated_fat_g: null,
+        trans_fat_g: null,
+        cholesterol_mg: null,
+        sodium_mg: null,
+        potassium_mg: null,
+        calcium_mg: null,
+        iron_mg: null,
+        vitamin_c_mg: null,
+        vitamin_a_mcg_rae: null,
         source: "off:737628064502",
         source_name: "openfoodfacts",
         barcode: "737628064502",
@@ -476,5 +575,20 @@ describe("formatFoodResult", () => {
         expect(text).toContain("Coconut Milk\n");
         expect(text).not.toContain("()");
         expect(text).toContain("Calories: n/a");
+    });
+
+    test("renders present micronutrients with units, omits null ones", () => {
+        const text = formatFoodResult({
+            ...base,
+            sodium_mg: 400,
+            vitamin_a_mcg_rae: 750,
+        });
+        expect(text).toContain("Sodium: 400 mg");
+        expect(text).toContain("Vitamin A: 750 mcg RAE");
+        // Null micros are omitted entirely — never printed as 0 or n/a,
+        // which would read as data.
+        expect(text).not.toContain("Potassium");
+        expect(text).not.toContain("Cholesterol");
+        expect(text).not.toContain("n/a mg");
     });
 });
