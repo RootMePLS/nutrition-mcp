@@ -1,0 +1,69 @@
+# One-shot local stack: `docker compose up -d --build` brings up PostgreSQL,
+# applies all forward-only migrations via the one-shot `migrate` service, then
+# starts the app. App is healthy only when /ready proves a real DB query works.
+#
+# Host port 18080 is used because the live local dev server occupies :8080.
+# The db service intentionally publishes no host port (local postgres owns 5432).
+
+services:
+    db:
+        image: postgres:16-alpine
+        environment:
+            POSTGRES_USER: nutrition
+            POSTGRES_PASSWORD: nutrition
+            POSTGRES_DB: nutrition_mcp
+        volumes:
+            - nutrition-mcp-db:/var/lib/postgresql/data
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U nutrition -d nutrition_mcp"]
+            interval: 5s
+            timeout: 3s
+            retries: 10
+
+    migrate:
+        image: postgres:16-alpine
+        depends_on:
+            db:
+                condition: service_healthy
+        environment:
+            PGHOST: db
+            PGPORT: "5432"
+            PGUSER: nutrition
+            PGPASSWORD: nutrition
+            PGDATABASE: nutrition_mcp
+        volumes:
+            - ./db/migrations:/migrations:ro
+            - ./scripts/migrate.sh:/migrate.sh:ro
+        entrypoint: ["sh", "/migrate.sh"]
+        restart: "no"
+
+    app:
+        build: .
+        depends_on:
+            db:
+                condition: service_healthy
+            migrate:
+                condition: service_completed_successfully
+        environment:
+            DATABASE_URL: postgres://nutrition:nutrition@db:5432/nutrition_mcp
+            PORT: "8080"
+            MEDIA_ROOT: /app/var/media
+            OFF_USER_AGENT: ${OFF_USER_AGENT:-}
+        ports:
+            - "18080:8080"
+        healthcheck:
+            test:
+                [
+                    "CMD",
+                    "bun",
+                    "-e",
+                    "fetch('http://localhost:8080/ready').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+                ]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+            start_period: 15s
+        restart: unless-stopped
+
+volumes:
+    nutrition-mcp-db:
