@@ -692,7 +692,9 @@ async function stagedMediaFiles(root: string): Promise<string[]> {
         return entries
             .map((entry) => entry.toString())
             .filter((entry) =>
-                /(?:^|\/)(?:photo|audio)-[0-9a-f]{64}$/.test(entry),
+                /(?:^|\/)(?:photo|audio)-[0-9a-f]{64}(?:\.[a-z0-9]+)?$/.test(
+                    entry,
+                ),
             )
             .sort();
     } catch {
