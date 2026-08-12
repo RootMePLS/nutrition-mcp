@@ -6,13 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 nutrition-mcp is a Model Context Protocol (MCP) server for nutrition-related functionality, built with Bun and TypeScript. Entry point is `src/index.ts`. Server version must be updated in three places: `package.json`, `src/mcp.ts` (McpServer constructor), and `server.json`. The server icon is at `public/favicon.ico`. Tool call analytics (duration, success/failure, error category) are tracked via `src/analytics.ts` and persisted to the `tool_analytics` table in the local PostgreSQL database.
 
-## Deploying
+## Running / deploying
 
-This is a remote MCP server, and DigitalOcean auto-deploys `main`. **Merging to `main` ships to production** — there is no separate deploy step to run and no version bump or tag needed for a change to reach clients. Every client hitting `https://nutrition-mcp.com/mcp` picks it up as soon as the deploy finishes, so treat a merge as a release: prompt and tool-description edits go live exactly like code does.
+The runtime server runs locally on this machine — there is no second server, no DigitalOcean, and no auto-deploy. `bun run src/index.ts` serves `http://localhost:8080/mcp` against the local PostgreSQL database `nutrition_mcp` (`postgres://localhost:5432/nutrition_mcp`). Merging to `main` only updates the source repository on GitHub; nothing ships anywhere. To apply a source change, restart the local server (`bun --watch src/index.ts` restarts automatically). Apply schema changes locally with `psql` per the README "Self-hosting" migration list. Registry/npm publishing (next section) is discovery metadata only and never deploys or affects the running server.
 
 ## Publishing to the registry
 
-Separate from deploying, and rarely required. The MCP Registry is only discovery metadata pointing at `https://nutrition-mcp.com/mcp`, so a fix takes effect without republishing. To refresh the registry listing on a release, bump the version in all three places above, merge to `main`, then push a matching `v*` tag:
+Legacy tail from the original hosted project, and rarely required — publishing only refreshes MCP Registry discovery metadata and has no effect on the locally-running server. The MCP Registry is only discovery metadata pointing at `https://nutrition-mcp.com/mcp`, so a fix takes effect without republishing. To refresh the registry listing on a release, bump the version in all three places above, merge to `main`, then push a matching `v*` tag:
 
 ```
 git tag v1.13.3 && git push origin v1.13.3
