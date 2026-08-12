@@ -1,11 +1,15 @@
 name: CI
 
-# Runs on every pull request and on every push to main. Merging to main is the
-# release — DigitalOcean auto-deploys it — so this is the last gate before a
-# change reaches clients at https://nutrition-mcp.com/mcp.
+# Runs on every pull request and on every push to main. There is no remote
+# auto-deploy: the runtime server runs locally (bun run src/index.ts). This
+# workflow is the correctness gate — it runs the same acceptance gates the
+# repo defines (format, typecheck, unit gate, destructive DB gate against a
+# disposable service PostgreSQL) and proves the Docker image assembles.
 #
-# The format check keeps the tree prettier-clean, which is what makes
-# `bun run format` safe to run: it only ever touches files you actually edited.
+# The DB gate (scripts/test-db-gate.ts) refuses to run unless DATABASE_URL and
+# DATABASE_URL_TEST both point at the SAME disposable database; it drops and
+# rebuilds schema `public` and applies all migrations itself before every
+# suite, so no separate migration step is needed here.
 
 on:
     pull_request:
@@ -15,6 +19,21 @@ on:
 jobs:
     check:
         runs-on: ubuntu-latest
+
+        services:
+            postgres:
+                image: postgres:16
+                env:
+                    POSTGRES_USER: postgres
+                    POSTGRES_PASSWORD: postgres
+                    POSTGRES_DB: nutrition_mcp_test
+                ports:
+                    - 5432:5432
+                options: >-
+                    --health-cmd pg_isready
+                    --health-interval 5s
+                    --health-timeout 5s
+                    --health-retries 10
 
         steps:
             - name: Checkout code
@@ -32,5 +51,17 @@ jobs:
             - name: Typecheck src/
               run: bun run typecheck
 
-            - name: Run tests
-              run: bun test
+            - name: Unit gate (non-DB suites)
+              run: bun run test:unit
+
+            - name: DB gate (destructive suites on disposable service DB)
+              env:
+                  DATABASE_URL: postgres://postgres:postgres@localhost:5432/nutrition_mcp_test
+                  DATABASE_URL_TEST: postgres://postgres:postgres@localhost:5432/nutrition_mcp_test
+              run: bun run test:db
+
+            - name: Validate compose file
+              run: docker compose config -q
+
+            - name: Docker image builds
+              run: docker build -t nutrition-mcp:ci .
