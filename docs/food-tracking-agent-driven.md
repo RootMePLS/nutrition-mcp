@@ -385,6 +385,15 @@ version = 1, revision_idempotency_key)` group deterministically — the
     concurrent first-time regimen creates with the same key serialize at the
     database exactly like product creates do under 008. Null keys stay
     non-unique and different users never collide.
+11. `db/migrations/011_nutrient_expansion.sql` — additive and rerun-safe:
+    eleven nullable `numeric` micronutrient / fat-subtype columns
+    (`saturated_fat_g`, `polyunsaturated_fat_g`, `monounsaturated_fat_g`,
+    `trans_fat_g`, `cholesterol_mg`, `sodium_mg`, `potassium_mg`,
+    `calcium_mg`, `iron_mg`, `vitamin_c_mg`, `vitamin_a_mcg_rae`) on both
+    `meal_event_nutrition_results` and `meal_event_canonical_results` via
+    `ADD COLUMN IF NOT EXISTS`. No defaults, no backfill; old rows read as
+    NULL. Must be applied to production BEFORE any code release that writes
+    or reads these columns.
 
 For a new database:
 
@@ -399,9 +408,10 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/007_ownership_lineage_i
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/008_supplement_create_idempotency.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/009_supplement_create_idem_reconciliation.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/010_supplement_regimen_idempotency.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/011_nutrient_expansion.sql
 ```
 
-`004`, `005`, `006`, `007`, `008`, `009`, and `010` are additive and rerunnable. `002` is forward-only and
+`004`, `005`, `006`, `007`, `008`, `009`, `010`, and `011` are additive and rerunnable. `002` is forward-only and
 irreversible because of the legacy reset. The disposable integration database
 is selected explicitly; do not treat skipped PostgreSQL tests as a pass:
 

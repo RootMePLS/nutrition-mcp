@@ -178,6 +178,7 @@ try {
         "008_supplement_create_idempotency.sql",
         "009_supplement_create_idem_reconciliation.sql",
         "010_supplement_regimen_idempotency.sql",
+        "011_nutrient_expansion.sql",
     ]) {
         await client0.query(
             await Bun.file(`db/migrations/${migration}`).text(),

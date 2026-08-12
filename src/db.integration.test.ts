@@ -23,6 +23,7 @@ const MIGRATION_008 = "db/migrations/008_supplement_create_idempotency.sql";
 const MIGRATION_009 =
     "db/migrations/009_supplement_create_idem_reconciliation.sql";
 const MIGRATION_010 = "db/migrations/010_supplement_regimen_idempotency.sql";
+const MIGRATION_011 = "db/migrations/011_nutrient_expansion.sql";
 
 const MIGRATION_006_TABLES = [
     "meal_event_reuse_sources",
@@ -110,6 +111,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_008);
         await applyMigration(client, MIGRATION_009);
         await applyMigration(client, MIGRATION_010);
+        await applyMigration(client, MIGRATION_011);
 
         const tables = await tableNames(client);
         for (const table of NEW_TABLES) {
@@ -580,6 +582,7 @@ const INTEGRITY_CHAIN = [
     MIGRATION_008,
     MIGRATION_009,
     MIGRATION_010,
+    MIGRATION_011,
 ];
 
 // Reviewer-terra finding 2: direct persistence must not be able to create
