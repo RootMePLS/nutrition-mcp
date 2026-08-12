@@ -14,6 +14,8 @@ import {
     type NutrientUnit,
 } from "./meal-types.js";
 import type { NutritionGoals } from "./db.js"; // type-only: no runtime dep
+import type { Pool } from "pg";
+import { zonedDayStartUtc, zonedNextDayStartUtc } from "./tz.js";
 
 export interface MealDayRow {
     nutrients: Nutrients;
@@ -173,4 +175,44 @@ export function summarizeDay(
         micronutrient_completeness_percent: microCompleteness,
         notes,
     };
+}
+
+/**
+ * Event-scope canonical nutrients for every active meal event consumed on
+ * `date` (local calendar day in `tz`), at each event's current version.
+ * Events whose canonical row is missing still count as meals — their
+ * nutrients are all-null, which the summarizer reports as missing data.
+ */
+export async function getMealDayRows(
+    pool: Pool,
+    userId: string,
+    date: string,
+    tz: string,
+): Promise<MealDayRow[]> {
+    const start = zonedDayStartUtc(date, tz);
+    const end = zonedNextDayStartUtc(date, tz);
+    const cols = NUTRIENT_FIELDS.map((f) => `c.${f}`).join(", ");
+    const { rows } = await pool.query(
+        `SELECT ${cols}
+           FROM meal_events e
+           LEFT JOIN meal_event_canonical_results c
+             ON c.event_id = e.id
+            AND c.version = e.current_version
+            AND c.ordinal IS NULL
+          WHERE e.user_id = $1
+            AND e.status = 'active'
+            AND e.consumed_at >= $2
+            AND e.consumed_at < $3
+          ORDER BY e.consumed_at ASC, e.id ASC`,
+        [userId, start, end],
+    );
+    return rows.map((row) => ({
+        nutrients: Object.fromEntries(
+            NUTRIENT_FIELDS.map((f) => {
+                const v = row[f];
+                const n = v == null ? null : Number(v);
+                return [f, n != null && Number.isFinite(n) ? n : null];
+            }),
+        ) as Nutrients,
+    }));
 }
