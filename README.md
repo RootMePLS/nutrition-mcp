@@ -310,6 +310,36 @@ The container still requires a reachable PostgreSQL `DATABASE_URL` (provided
 by the `db` service in compose); it does not provide Supabase or OAuth
 services.
 
+### Opt-in: run against the existing host database
+
+By default, `docker compose up` uses its own throwaway `db` container and
+volume — your local data is never involved. To run the containerized server
+against the EXISTING host PostgreSQL database `nutrition_mcp` on
+127.0.0.1:5432 (your real data) instead, use the `hostdb` profile:
+
+    docker compose --profile hostdb up -d --build app-hostdb
+
+- **This targets the live database.** `migrate-hostdb` runs first and only
+  re-applies the forward-only, idempotent migrations — a no-op on an
+  already-migrated database. Nothing is dropped, created, or volumed.
+- The app is published on http://localhost:18081 (`:8080` is the non-Docker
+  dev server, `:18080` the isolated compose app). MCP endpoint:
+  http://localhost:18081/mcp
+- Avoid treating this and the non-Docker dev server as two long-running
+  writers against the same database at once; the profile is meant for
+  verification and opt-in Docker runs, not for doubling the live instance.
+- Connection defaults assume Homebrew PostgreSQL trust auth as the local
+  user; override the user with `HOSTDB_PGUSER=<name>` in the environment if
+  your setup differs (add a password to `DATABASE_URL` manually only if your
+  host requires one — none is stored in the compose file).
+
+Note: `docker compose --profile hostdb up -d --build` without a service name
+also starts the default isolated stack (profiles add to the default set);
+naming `app-hostdb` starts only the host-DB pair. Stop it with:
+
+    docker compose --profile hostdb stop app-hostdb migrate-hostdb
+    docker compose --profile hostdb rm -f app-hostdb migrate-hostdb
+
 ## CI
 
 Every PR and push to main runs, in order: `format:check`, `typecheck`,
