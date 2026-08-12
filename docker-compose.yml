@@ -37,6 +37,30 @@ services:
         entrypoint: ["sh", "/migrate.sh"]
         restart: "no"
 
+    # ------------------------------------------------------------------
+    # OPT-IN `hostdb` profile — targets the LIVE host PostgreSQL database
+    # `nutrition_mcp` on 127.0.0.1:5432 (reached via host.docker.internal).
+    # This is the user's REAL data. Nothing here is destructive:
+    # migrate-hostdb only re-applies the forward-only idempotent
+    # migrations (a no-op on an already-migrated database), and no
+    # service in this profile creates, drops, or volumes any database.
+    # A plain `docker compose up` NEVER starts these services; they run
+    # only with `docker compose --profile hostdb ...`.
+    # ------------------------------------------------------------------
+    migrate-hostdb:
+        image: postgres:16-alpine
+        profiles: ["hostdb"]
+        environment:
+            PGHOST: host.docker.internal
+            PGPORT: "5432"
+            PGUSER: ${HOSTDB_PGUSER:-fishhead}
+            PGDATABASE: nutrition_mcp
+        volumes:
+            - ./db/migrations:/migrations:ro
+            - ./scripts/migrate.sh:/migrate.sh:ro
+        entrypoint: ["sh", "/migrate.sh"]
+        restart: "no"
+
     app:
         build: .
         depends_on:
@@ -51,6 +75,36 @@ services:
             OFF_USER_AGENT: ${OFF_USER_AGENT:-}
         ports:
             - "18080:8080"
+        healthcheck:
+            test:
+                [
+                    "CMD",
+                    "bun",
+                    "-e",
+                    "fetch('http://localhost:8080/ready').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+                ]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+            start_period: 15s
+        restart: unless-stopped
+
+    # App instance for the `hostdb` profile — connects to the LIVE host
+    # `nutrition_mcp` (real data). Published on :18081 because :8080 is
+    # the non-Docker dev server and :18080 is the isolated compose app.
+    app-hostdb:
+        build: .
+        profiles: ["hostdb"]
+        depends_on:
+            migrate-hostdb:
+                condition: service_completed_successfully
+        environment:
+            DATABASE_URL: postgres://${HOSTDB_PGUSER:-fishhead}@host.docker.internal:5432/nutrition_mcp
+            PORT: "8080"
+            MEDIA_ROOT: /app/var/media
+            OFF_USER_AGENT: ${OFF_USER_AGENT:-}
+        ports:
+            - "18081:8080"
         healthcheck:
             test:
                 [
