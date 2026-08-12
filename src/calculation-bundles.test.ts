@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { computeConsensus } from "./meal-consensus.js";
+import { emptyNutrients } from "./meal-types.js";
 import {
     stableBundleFingerprint,
     validateCalculationBundle,
@@ -72,15 +73,7 @@ describe("calculation bundle commit seam", () => {
             canonical: {
                 status: "ready",
                 consensus_status: "all_agree",
-                nutrients: {
-                    calories: 1,
-                    protein_g: null,
-                    carbs_g: null,
-                    fat_g: null,
-                    fiber_g: null,
-                    sugar_g: null,
-                    alcohol_g: null,
-                },
+                nutrients: { ...emptyNutrients(), calories: 1 },
                 eligible_providers: [],
                 outlier_providers: [],
                 threshold_percent: 10,

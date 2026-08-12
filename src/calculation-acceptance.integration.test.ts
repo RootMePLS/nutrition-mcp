@@ -44,6 +44,7 @@ const migrationPaths = [
     "db/migrations/003_meal_captures.sql",
     "db/migrations/004_calculation_bundles.sql",
     "db/migrations/005_calculation_corrections.sql",
+    "db/migrations/011_nutrient_expansion.sql",
 ];
 
 if (!DATABASE_URL_TEST) {

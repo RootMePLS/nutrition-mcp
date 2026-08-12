@@ -27,7 +27,11 @@ import { Pool, type PoolClient } from "pg";
 import { withTransaction } from "./db.js";
 import { createMealEvent } from "./meal-events.js";
 import type { CreateMealEventCommand, Nutrients } from "./meal-types.js";
-import { isStrictIsoTimestamp, sha256Hex } from "./meal-types.js";
+import {
+    isStrictIsoTimestamp,
+    NUTRIENT_UNITS,
+    sha256Hex,
+} from "./meal-types.js";
 import { escapeLikePattern } from "./search.js";
 import {
     dateInTz,
@@ -2498,9 +2502,11 @@ function compareNutrientIdentity(
 }
 
 /**
- * Food-side nutrient identities are fixed by the canonical model: calories
- * are kcal, the six gram fields are grams. A supplement snapshot combines
- * with food only when its stored (key, unit) matches exactly.
+ * Food-side nutrient identities are fixed by the canonical model: the unit
+ * of every field is carried by its name suffix (NUTRIENT_UNITS — calories
+ * are kcal, _g fields grams, _mg milligrams, _mcg_rae mcg RAE). A
+ * supplement snapshot combines with food only when its stored (key, unit)
+ * matches exactly.
  */
 const FOOD_CANONICAL_NUTRIENT_FIELDS = FOOD_COMPATIBLE_NUTRIENT_KEYS;
 
@@ -2510,7 +2516,7 @@ const FOOD_FIELD_IDENTITY: Record<
 > = Object.fromEntries(
     FOOD_CANONICAL_NUTRIENT_FIELDS.map((field) => [
         field,
-        { nutrient_key: field, unit: field === "calories" ? "kcal" : "g" },
+        { nutrient_key: field, unit: NUTRIENT_UNITS[field] },
     ]),
 );
 
@@ -2601,15 +2607,13 @@ export async function getSupplementNutritionSummary(
     // is never counted on both sides. SQL SUM/COUNT ignore NULLs, which is
     // exactly the presence semantics needed: canonical NULL contributes
     // nothing and is not counted present; an explicit 0 sums as 0 and counts.
+    const foodSumCountSelect = FOOD_CANONICAL_NUTRIENT_FIELDS.map(
+        (field) =>
+            `SUM(c.${field}) AS ${field}_sum, COUNT(c.${field})::int AS ${field}_count`,
+    ).join(",\n                ");
     const { rows: foodRows } = await pool.query(
         `SELECT count(*)::int AS meal_event_count,
-                SUM(c.calories) AS calories_sum, COUNT(c.calories)::int AS calories_count,
-                SUM(c.protein_g) AS protein_g_sum, COUNT(c.protein_g)::int AS protein_g_count,
-                SUM(c.carbs_g) AS carbs_g_sum, COUNT(c.carbs_g)::int AS carbs_g_count,
-                SUM(c.fat_g) AS fat_g_sum, COUNT(c.fat_g)::int AS fat_g_count,
-                SUM(c.fiber_g) AS fiber_g_sum, COUNT(c.fiber_g)::int AS fiber_g_count,
-                SUM(c.sugar_g) AS sugar_g_sum, COUNT(c.sugar_g)::int AS sugar_g_count,
-                SUM(c.alcohol_g) AS alcohol_g_sum, COUNT(c.alcohol_g)::int AS alcohol_g_count
+                ${foodSumCountSelect}
          FROM meal_events e
          JOIN meal_event_versions v
              ON v.event_id = e.id AND v.version = e.current_version

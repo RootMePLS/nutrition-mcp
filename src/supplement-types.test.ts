@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { deriveReuseIdempotencyFingerprint } from "./meal-types.js";
+import { NUTRIENT_FIELDS } from "./meal-types.js";
 import {
     FOOD_COMPATIBLE_NUTRIENT_KEYS,
     isSupplementProductCategory,
@@ -144,19 +145,13 @@ describe("label nutrients: unknown is absent, explicit zero is real data", () =>
         }
     });
 
-    test("food-compatible keys are the seven canonical meal fields only", () => {
+    test("food-compatible keys mirror the canonical meal nutrient fields", () => {
+        // Slice-1 nutrient expansion (2026-08-12): FOOD_COMPATIBLE_NUTRIENT_KEYS
+        // tracks NUTRIENT_FIELDS, so supplement labels with the 11 new
+        // micronutrient/fat-subtype keys are food-compatible automatically.
         const keys: string[] = [...FOOD_COMPATIBLE_NUTRIENT_KEYS];
-        expect(keys.sort()).toEqual(
-            [
-                "alcohol_g",
-                "calories",
-                "carbs_g",
-                "fat_g",
-                "fiber_g",
-                "protein_g",
-                "sugar_g",
-            ].sort(),
-        );
+        expect(keys.sort()).toEqual([...NUTRIENT_FIELDS].sort());
+        expect(keys).toHaveLength(18);
     });
 });
 

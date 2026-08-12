@@ -201,7 +201,8 @@ describe("meal event domain contracts", () => {
         expect(isProviderResultStatus("failed")).toBe(true);
         expect(isProviderResultStatus("unavailable")).toBe(true);
         expect(isProviderResultStatus("ok")).toBe(false);
-        // Nutrient fields are the seven canonical names, all nullable —
+        // Nutrient fields are the canonical names (7 macros + the 11 slice-1
+        // micronutrient/fat-subtype fields appended last), all nullable —
         // a missing value is NULL, never a fabricated zero.
         expect(NUTRIENT_FIELDS).toEqual([
             "calories",
@@ -211,6 +212,17 @@ describe("meal event domain contracts", () => {
             "fiber_g",
             "sugar_g",
             "alcohol_g",
+            "saturated_fat_g",
+            "polyunsaturated_fat_g",
+            "monounsaturated_fat_g",
+            "trans_fat_g",
+            "cholesterol_mg",
+            "sodium_mg",
+            "potassium_mg",
+            "calcium_mg",
+            "iron_mg",
+            "vitamin_c_mg",
+            "vitamin_a_mcg_rae",
         ]);
     });
 
@@ -356,6 +368,7 @@ const MIGRATION_002 = "db/migrations/002_food_tracking.sql";
 const MIGRATION_003 = "db/migrations/003_meal_captures.sql";
 const MIGRATION_004 = "db/migrations/004_calculation_bundles.sql";
 const MIGRATION_005 = "db/migrations/005_calculation_corrections.sql";
+const MIGRATION_011 = "db/migrations/011_nutrient_expansion.sql";
 
 async function prepareFreshDb(pool: Pool): Promise<void> {
     const client = await pool.connect();
@@ -366,6 +379,7 @@ async function prepareFreshDb(pool: Pool): Promise<void> {
         await client.query(await Bun.file(MIGRATION_003).text());
         await client.query(await Bun.file(MIGRATION_004).text());
         await client.query(await Bun.file(MIGRATION_005).text());
+        await client.query(await Bun.file(MIGRATION_011).text());
     } finally {
         client.release();
     }

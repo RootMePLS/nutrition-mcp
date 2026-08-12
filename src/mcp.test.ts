@@ -1,5 +1,6 @@
 import { test, expect, describe, mock, beforeEach, afterAll } from "bun:test";
 import { z } from "zod";
+import { emptyNutrients } from "./meal-types.js";
 import {
     formatGoalLine,
     formatProgress,
@@ -2041,15 +2042,7 @@ describe("calculation bundle output contracts", () => {
     const canonicalRow = {
         status: "ready",
         consensus_status: "all_agree",
-        nutrients: {
-            calories: 505,
-            protein_g: null,
-            carbs_g: null,
-            fat_g: null,
-            fiber_g: null,
-            sugar_g: null,
-            alcohol_g: null,
-        },
+        nutrients: { ...emptyNutrients(), calories: 505 },
         eligible_providers: ["nutrition-local", "own"],
         outlier_providers: [],
         threshold_percent: 10,

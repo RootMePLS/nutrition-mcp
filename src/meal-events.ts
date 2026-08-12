@@ -385,16 +385,9 @@ export function deriveWriteProvenance(
     };
 }
 
-export interface MealEventCanonical {
+export interface MealEventCanonical extends Nutrients {
     status: string;
     consensus_status: string;
-    calories: number | null;
-    protein_g: number | null;
-    carbs_g: number | null;
-    fat_g: number | null;
-    fiber_g: number | null;
-    sugar_g: number | null;
-    alcohol_g: number | null;
     eligible_providers: string[] | null;
     outlier_providers: string[] | null;
     threshold_percent: number;
@@ -1126,13 +1119,9 @@ export async function getMealEvent(
     }): MealEventCanonical => ({
         status: row.status as string,
         consensus_status: row.consensus_status as string,
-        calories: numOrNull(row.calories),
-        protein_g: numOrNull(row.protein_g),
-        carbs_g: numOrNull(row.carbs_g),
-        fat_g: numOrNull(row.fat_g),
-        fiber_g: numOrNull(row.fiber_g),
-        sugar_g: numOrNull(row.sugar_g),
-        alcohol_g: numOrNull(row.alcohol_g),
+        ...(Object.fromEntries(
+            NUTRIENT_FIELDS.map((f) => [f, numOrNull(row[f])]),
+        ) as Nutrients),
         eligible_providers: row.eligible_providers as string[] | null,
         outlier_providers: row.outlier_providers as string[] | null,
         threshold_percent: Number(row.threshold_percent),

@@ -86,22 +86,53 @@ export const NUTRIENT_FIELDS = [
     "fiber_g",
     "sugar_g",
     "alcohol_g",
+    // Slice-1 nutrient expansion (2026-08-12). Canonical unit lives in the
+    // field-name suffix; see NUTRIENT_UNITS. Append-only: generated SQL column
+    // lists and positional params derive order from this array.
+    "saturated_fat_g",
+    "polyunsaturated_fat_g",
+    "monounsaturated_fat_g",
+    "trans_fat_g",
+    "cholesterol_mg",
+    "sodium_mg",
+    "potassium_mg",
+    "calcium_mg",
+    "iron_mg",
+    "vitamin_c_mg",
+    "vitamin_a_mcg_rae",
 ] as const;
 
 export type NutrientField = (typeof NUTRIENT_FIELDS)[number];
 
 export type Nutrients = Record<NutrientField, number | null>;
 
+export type NutrientUnit = "kcal" | "g" | "mg" | "mcg_rae";
+
+export const NUTRIENT_UNITS: Record<NutrientField, NutrientUnit> = {
+    calories: "kcal",
+    protein_g: "g",
+    carbs_g: "g",
+    fat_g: "g",
+    fiber_g: "g",
+    sugar_g: "g",
+    alcohol_g: "g",
+    saturated_fat_g: "g",
+    polyunsaturated_fat_g: "g",
+    monounsaturated_fat_g: "g",
+    trans_fat_g: "g",
+    cholesterol_mg: "mg",
+    sodium_mg: "mg",
+    potassium_mg: "mg",
+    calcium_mg: "mg",
+    iron_mg: "mg",
+    vitamin_c_mg: "mg",
+    vitamin_a_mcg_rae: "mcg_rae",
+};
+
 export function emptyNutrients(): Nutrients {
-    return {
-        calories: null,
-        protein_g: null,
-        carbs_g: null,
-        fat_g: null,
-        fiber_g: null,
-        sugar_g: null,
-        alcohol_g: null,
-    };
+    return Object.fromEntries(
+        NUTRIENT_FIELDS.map((f) => [f, null]),
+    ) as Nutrients;
 }
 
 // ---------------------------------------------------------------------------

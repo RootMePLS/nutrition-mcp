@@ -5467,18 +5467,22 @@ export function registerTools(
                                     "Item scope; omit for the event aggregate.",
                                 ),
                             nutrients: z
-                                .object({
-                                    calories: z.number().nullish(),
-                                    protein_g: z.number().nullish(),
-                                    carbs_g: z.number().nullish(),
-                                    fat_g: z.number().nullish(),
-                                    fiber_g: z.number().nullish(),
-                                    sugar_g: z.number().nullish(),
-                                    alcohol_g: z.number().nullish(),
-                                })
+                                .object(
+                                    Object.fromEntries(
+                                        NUTRIENT_FIELDS.map((field) => [
+                                            field,
+                                            z.number().nullish(),
+                                        ]),
+                                    ) as unknown as Record<
+                                        NutrientField,
+                                        z.ZodOptional<
+                                            z.ZodNullable<z.ZodNumber>
+                                        >
+                                    >,
+                                )
                                 .optional()
                                 .describe(
-                                    "Normalized nutrients. Missing values stay NULL — never report zero for a value you don't have.",
+                                    "Normalized nutrients in canonical units — the field-name suffix is the unit (_g grams, _mg milligrams, _mcg_rae mcg retinol-activity-equivalents; calories = kcal). Convert BEFORE calling; keep original provider units in raw_payload. Missing values stay NULL — never report zero for a value you don't have.",
                                 ),
                             error_code: z.string().optional(),
                             error_message: z.string().optional(),

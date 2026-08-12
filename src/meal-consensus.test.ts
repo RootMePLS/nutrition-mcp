@@ -6,6 +6,11 @@ import {
     ZERO_EPSILON,
     type ProviderNutrientResult,
 } from "./meal-consensus.js";
+import {
+    NUTRIENT_FIELDS,
+    NUTRIENT_UNITS,
+    emptyNutrients,
+} from "./meal-types.js";
 
 // ---------------------------------------------------------------------------
 // Pure consensus policy: 10% relative threshold, explicit outlier rule.
@@ -198,5 +203,40 @@ describe("consensus policy", () => {
             "own",
             "myfitnesspal",
         ]);
+    });
+});
+
+describe("slice-1 nutrient expansion", () => {
+    test("canonical nutrient set includes slice-1 micronutrients, appended last", () => {
+        expect(NUTRIENT_FIELDS.slice(7)).toEqual([
+            "saturated_fat_g",
+            "polyunsaturated_fat_g",
+            "monounsaturated_fat_g",
+            "trans_fat_g",
+            "cholesterol_mg",
+            "sodium_mg",
+            "potassium_mg",
+            "calcium_mg",
+            "iron_mg",
+            "vitamin_c_mg",
+            "vitamin_a_mcg_rae",
+        ]);
+        const empty = emptyNutrients();
+        for (const f of NUTRIENT_FIELDS) expect(empty[f]).toBeNull();
+        expect(NUTRIENT_UNITS.sodium_mg).toBe("mg");
+        expect(NUTRIENT_UNITS.vitamin_a_mcg_rae).toBe("mcg_rae");
+        expect(NUTRIENT_UNITS.calories).toBe("kcal");
+    });
+
+    test("consensus keeps unknown micronutrients NULL and does not downgrade status", () => {
+        const r = computeConsensus([
+            ok("nutrition-local", { calories: 100, sodium_mg: 400 }),
+            ok("own", { calories: 102 }),
+        ]);
+        expect(r.nutrients.sodium_mg).toBe(400); // single source, kept
+        expect(r.per_nutrient.sodium_mg.consensus_status).toBe(
+            "insufficient_data",
+        );
+        expect(r.nutrients.calcium_mg).toBeNull(); // never zero
     });
 });

@@ -112,6 +112,7 @@ describeDb(
                 for (const path of [
                     "db/migrations/001_initial_schema.sql",
                     "db/migrations/002_food_tracking.sql",
+                    "db/migrations/011_nutrient_expansion.sql",
                 ]) {
                     await client.query(await Bun.file(path).text());
                 }

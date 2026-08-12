@@ -172,6 +172,7 @@ describeDb("ordinary delete tombstone (requires DATABASE_URL_TEST)", () => {
                 "003_meal_captures.sql",
                 "004_calculation_bundles.sql",
                 "005_calculation_corrections.sql",
+                "011_nutrient_expansion.sql",
             ]) {
                 await client.query(
                     await Bun.file(`db/migrations/${migration}`).text(),

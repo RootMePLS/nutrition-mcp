@@ -171,6 +171,7 @@ describeDb("log_meal_event MCP tool (requires DATABASE_URL_TEST)", () => {
             "003_meal_captures.sql",
             "004_calculation_bundles.sql",
             "005_calculation_corrections.sql",
+            "011_nutrient_expansion.sql",
         ]);
     });
 
@@ -356,6 +357,7 @@ describeDb(
                 "003_meal_captures.sql",
                 "004_calculation_bundles.sql",
                 "005_calculation_corrections.sql",
+                "011_nutrient_expansion.sql",
             ]);
         });
 
@@ -489,6 +491,7 @@ describeDb("meal capture MCP lifecycle tools", () => {
             "001_initial_schema.sql",
             "002_food_tracking.sql",
             "003_meal_captures.sql",
+            "011_nutrient_expansion.sql",
         ]);
     });
     test("rejects cross-user capture message, answer, and draft mutations", async () => {
@@ -723,6 +726,7 @@ describeDb("attach_meal_capture_media MCP tool", () => {
             "003_meal_captures.sql",
             "004_calculation_bundles.sql",
             "005_calculation_corrections.sql",
+            "011_nutrient_expansion.sql",
         ]);
         // Fresh media root per test: the DB resets per test, so the
         // filesystem must too, or staged files from prior tests leak in.
@@ -1054,6 +1058,7 @@ describeDb("attach_meal_capture_media file_path MCP tool", () => {
             "003_meal_captures.sql",
             "004_calculation_bundles.sql",
             "005_calculation_corrections.sql",
+            "011_nutrient_expansion.sql",
         ]);
         mediaRoot = await mkdtemp(
             join(tmpdir(), "mcp-capture-media-filepath-"),
@@ -1425,6 +1430,7 @@ describeDb(
                 "003_meal_captures.sql",
                 "004_calculation_bundles.sql",
                 "005_calculation_corrections.sql",
+                "011_nutrient_expansion.sql",
             ]);
             mediaRoot = await mkdtemp(join(tmpdir(), "mcp-capture-s6-test-"));
             mediaStore = createMediaStore(mediaRoot);

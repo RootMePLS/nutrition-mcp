@@ -207,6 +207,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_007);
         await applyMigration(client, MIGRATION_008);
         await applyMigration(client, MIGRATION_009);
+        await applyMigration(client, MIGRATION_011);
         const event = await createMealEvent(
             pool,
             {
@@ -249,6 +250,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_003);
         await applyMigration(client, MIGRATION_004);
         await applyMigration(client, MIGRATION_005);
+        await applyMigration(client, MIGRATION_011);
 
         // Seed an opt-in alcohol profile (UK units) and a real meal event
         // through the existing write path before the upgrade.
@@ -385,6 +387,7 @@ describeDb("food-tracking migrations (requires DATABASE_URL_TEST)", () => {
         await applyMigration(client, MIGRATION_007);
         await applyMigration(client, MIGRATION_008);
         await applyMigration(client, MIGRATION_009);
+        await applyMigration(client, MIGRATION_011);
 
         // Seed a populated pre-010 database: opt-in alcohol profile (UK
         // units), a real meal event, and a regimen-less supplement product
