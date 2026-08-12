@@ -517,6 +517,10 @@ function sha256Hex(content: string): string {
 
 const NUTRIENT_COLUMNS = NUTRIENT_FIELDS.map((f) => `${f}`).join(", ");
 
+function placeholders(start: number, count: number): string {
+    return Array.from({ length: count }, (_, i) => `$${start + i}`).join(", ");
+}
+
 // The legacy adapter has no caller-owned provider source.  The column is
 // required by the durable schema, so this fixed identifier explicitly marks
 // the row as compatibility data instead of pretending the request fingerprint
@@ -615,8 +619,8 @@ async function insertVersionChildren(
                 (event_id, version, ordinal, provider, source_id, status,
                  request_fingerprint, algorithm_version, raw_payload, provenance,
                  basis, units, ${NUTRIENT_COLUMNS}, error_code, error_message)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                     $13, $14, $15, $16, $17, $18, $19, $20, $21)
+             VALUES (${placeholders(1, 12)}, ${placeholders(13, NUTRIENT_FIELDS.length)},
+                     $${13 + NUTRIENT_FIELDS.length}, $${14 + NUTRIENT_FIELDS.length})
              RETURNING id`,
             [
                 eventId,
@@ -677,9 +681,8 @@ async function insertVersionChildren(
                  ${NUTRIENT_COLUMNS},
                  eligible_providers, outlier_providers, threshold_percent,
                  policy_version, source_result_ids, audit_evidence, algorithm_version)
-             VALUES ($1, $2, $3, $4, $5,
-                     $6, $7, $8, $9, $10, $11, $12,
-                     $13, $14, $15, $16, $17, $18, $19)`,
+             VALUES (${placeholders(1, 5)}, ${placeholders(6, NUTRIENT_FIELDS.length)},
+                     ${placeholders(6 + NUTRIENT_FIELDS.length, 7)})`,
             [
                 eventId,
                 version,
