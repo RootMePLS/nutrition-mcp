@@ -9,7 +9,11 @@
 
 import { getPool } from "./db.js";
 import { gramsFromDrink, formatAlcohol, type DrinkUnit } from "./alcohol.js";
-import { NUTRIENT_UNITS, type NutrientField } from "./meal-types.js";
+import {
+    NUTRIENT_FIELDS,
+    NUTRIENT_UNITS,
+    type NutrientField,
+} from "./meal-types.js";
 import { gToMg } from "./nutrient-units.js";
 
 const OFF_PRODUCT_URL = "https://world.openfoodfacts.org/api/v2/product";
@@ -316,19 +320,23 @@ async function getCachedFood(
         const ageMs = Date.now() - new Date(data.fetched_at).getTime();
         if (ageMs > ttlMs) return null;
         const payload = data.payload as FoodResult;
-        // Rows cached before fiber/sugar/alcohol shipped have no such keys, and
-        // stay servable for the whole TTL after deploy. Deserialized they would
-        // be `undefined`, not `null` — and an undefined field is an ABSENT one
-        // once it reaches a structuredContent literal, which for a .nullable()
-        // (hence *required*) schema field is a validation failure rather than a
-        // null. Backfill explicitly so a cache hit and a fresh fetch are always
-        // the same shape.
-        return {
-            ...payload,
-            fiber_g: payload.fiber_g ?? null,
-            sugar_g: payload.sugar_g ?? null,
-            alcohol_g: payload.alcohol_g ?? null,
-        };
+        // Rows cached before fiber/sugar/alcohol shipped have no such keys,
+        // and rows cached before migration 011 lack all 11 slice-1 micro
+        // fields; both stay servable for the whole TTL after deploy.
+        // Deserialized they would be `undefined`, not `null` — and an
+        // undefined field is an ABSENT one once it reaches a
+        // structuredContent literal, which for a .nullable() (hence
+        // *required*) schema field is a validation failure rather than a
+        // null. Backfill every nutrient field appended after the original
+        // four macros (fiber/sugar/alcohol plus the slice-1 micros, i.e.
+        // NUTRIENT_FIELDS.slice(4)) so a cache hit and a fresh fetch are
+        // always the same shape. Raw OFF `*_100g` source keys are NOT
+        // backfilled — only the canonical top-level fields.
+        const result = { ...payload };
+        for (const field of NUTRIENT_FIELDS.slice(4)) {
+            result[field] = payload[field] ?? null;
+        }
+        return result;
     } catch {
         return null;
     }

@@ -1,10 +1,21 @@
-import { test, expect, mock, beforeEach, afterEach, describe } from "bun:test";
+import {
+    test,
+    expect,
+    mock,
+    beforeEach,
+    afterEach,
+    afterAll,
+    describe,
+} from "bun:test";
 import {
     normalizeBarcode,
     fetchProductFromOFF,
+    lookupBarcode,
     formatFoodResult,
     type FoodResult,
 } from "./foods.js";
+import { NUTRIENT_FIELDS } from "./meal-types.js";
+import * as actualDb from "./db.js";
 
 const realFetch = globalThis.fetch;
 
@@ -590,5 +601,109 @@ describe("formatFoodResult", () => {
         expect(text).not.toContain("Potassium");
         expect(text).not.toContain("Cholesterol");
         expect(text).not.toContain("n/a mg");
+    });
+});
+
+// ---------- Cache-hit backfill (pre-011 payloads) ----------
+// mock.module swaps ./db.js for the whole test *process* (same pattern as
+// mcp.test.ts), so the real exports are spread back in and restored in
+// afterAll. Only getPool is stubbed: it hands back whatever rows the test
+// seeded, so lookupBarcode exercises the real getCachedFood cache-hit path
+// without a database.
+const dbRows: { rows: Array<{ payload: unknown; fetched_at: string }> } = {
+    rows: [],
+};
+
+mock.module("./db.js", () => ({
+    ...actualDb,
+    getPool: () => ({
+        query: async () => ({ rows: dbRows.rows }),
+    }),
+}));
+
+afterAll(() => {
+    mock.module("./db.js", () => actualDb);
+});
+
+// The 11 fields appended by the slice-1 nutrient expansion (migration 011).
+const SLICE1_FIELDS = NUTRIENT_FIELDS.slice(7);
+
+// Every key a fresh fetch produces on a FoodResult.
+const CANONICAL_FOOD_KEYS = [
+    "name",
+    "brand",
+    "serving",
+    ...NUTRIENT_FIELDS,
+    "source",
+    "source_name",
+    "barcode",
+];
+
+describe("lookupBarcode cache-hit backfill", () => {
+    // A food_cache payload written before migration 011: the 7 original
+    // macro keys plus the metadata keys, but none of the 11 slice-1 micros.
+    const PRE_011_PAYLOAD = {
+        name: "Stale Cached Product",
+        brand: "Old Brand",
+        serving: "100 g",
+        calories: 250,
+        protein_g: 8,
+        carbs_g: 30,
+        fat_g: 10,
+        fiber_g: 3,
+        sugar_g: 12,
+        alcohol_g: null,
+        source: "off:3017620422003",
+        source_name: "openfoodfacts",
+        barcode: "3017620422003",
+    };
+
+    beforeEach(() => {
+        dbRows.rows = [
+            {
+                payload: PRE_011_PAYLOAD,
+                fetched_at: new Date().toISOString(),
+            },
+        ];
+        // A cache hit must never reach the network: if the backfill regressed
+        // into a miss, this throw fails the test instead of silently fetching.
+        mockFetch(() => {
+            throw new Error("fetch must not be called on a cache hit");
+        });
+    });
+
+    test("backfills every slice-1 field to explicit null on a pre-011 row", async () => {
+        const food = await lookupBarcode("3017620422003");
+        expect(food).not.toBeNull();
+
+        for (const field of SLICE1_FIELDS) {
+            // Own-property present AND strictly null — an absent key would
+            // surface as `undefined` in structuredContent and fail the
+            // .nullable() (required) output schema instead of reading as null.
+            expect(Object.prototype.hasOwnProperty.call(food, field)).toBe(
+                true,
+            );
+            expect(food![field]).toBeNull();
+        }
+
+        // Pre-existing values are preserved untouched, not null-clobbered.
+        expect(food!.calories).toBe(250);
+        expect(food!.fiber_g).toBe(3);
+        expect(food!.sugar_g).toBe(12);
+        expect(food!.name).toBe("Stale Cached Product");
+    });
+
+    test("cache-hit shape parity: full canonical key set, all 18 nutrient keys present", async () => {
+        const food = await lookupBarcode("3017620422003");
+        expect(food).not.toBeNull();
+
+        expect(Object.keys(food!).sort()).toEqual(
+            [...CANONICAL_FOOD_KEYS].sort(),
+        );
+        for (const field of NUTRIENT_FIELDS) {
+            expect(Object.prototype.hasOwnProperty.call(food, field)).toBe(
+                true,
+            );
+        }
     });
 });
