@@ -458,6 +458,7 @@ import {
     type WeightEntry,
 } from "./db.js";
 import { withAnalytics } from "./analytics.js";
+import { getMealDayRows, summarizeDay } from "./daily-nutrient-summary.js";
 import {
     createSupplementProduct,
     getSupplementProduct,
@@ -3738,6 +3739,83 @@ export function registerTools(
                 },
                 { userId },
                 { date: date ?? "today" },
+            );
+        },
+    );
+
+    server.registerTool(
+        "get_daily_nutrient_summary",
+        {
+            title: "Get Daily Nutrient Summary",
+            description:
+                "MFP-style nutrient dashboard for one local day: per-nutrient total, goal, remaining, percent of goal, plus explicit completeness (high/partial/low/none) and data-coverage percent so missing micronutrient data is reported as missing, never as zero. Totals sum event-scope canonical results of active meals at their current version. Micronutrient goals are not stored yet — their goal/remaining are null. Defaults to today in the user's timezone when date is omitted.",
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                date: z
+                    .string()
+                    .regex(/^\d{4}-\d{2}-\d{2}$/, "date must be YYYY-MM-DD")
+                    .optional()
+                    .describe(
+                        "Local calendar date (YYYY-MM-DD). Defaults to today in the user's timezone.",
+                    ),
+            },
+            outputSchema: {
+                date: z.string(),
+                timezone: z.string(),
+                meal_count: z.number(),
+                nutrients: z.array(
+                    z.object({
+                        key: z.string(),
+                        unit: z.enum(["kcal", "g", "mg", "mcg_rae"]),
+                        total: z.number().nullable(),
+                        goal: z.number().nullable(),
+                        remaining: z.number().nullable(),
+                        percent_of_goal: z.number().nullable(),
+                        completeness_status: z.enum([
+                            "high",
+                            "partial",
+                            "low",
+                            "none",
+                        ]),
+                        data_coverage_percent: z.number(),
+                        contributing_meal_count: z.number(),
+                        missing_meal_count: z.number(),
+                    }),
+                ),
+                micronutrient_completeness_percent: z.number(),
+                notes: z.array(z.string()),
+            },
+        },
+        async ({ date }) => {
+            return withAnalytics(
+                "get_daily_nutrient_summary",
+                async () => {
+                    const tz = await getUserTimezone(userId);
+                    const day = date ?? todayInTz(tz);
+                    const nutrientPool = deps.mealEventsPool ?? getPool();
+                    const [rows, goals] = await Promise.all([
+                        getMealDayRows(nutrientPool, userId, day, tz),
+                        getNutritionGoals(userId),
+                    ]);
+                    const summary = summarizeDay(rows, goals);
+                    const payload = { date: day, timezone: tz, ...summary };
+                    return {
+                        content: [
+                            {
+                                type: "text" as const,
+                                text: JSON.stringify(payload, null, 2),
+                            },
+                        ],
+                        structuredContent: payload,
+                    };
+                },
+                { userId },
+                { date },
             );
         },
     );

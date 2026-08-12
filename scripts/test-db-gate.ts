@@ -34,6 +34,7 @@ const suites = [
     "src/meal-reuse.integration.test.ts",
     "src/mcp-reuse.integration.test.ts",
     "src/profile-settings.integration.test.ts",
+    "src/daily-nutrient-summary.integration.test.ts",
 ];
 const env = {
     ...process.env,
