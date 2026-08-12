@@ -19,9 +19,11 @@ cp .env.example .env
 bun run start
 ```
 
-Then configure an MCP client with `http://localhost:8080/mcp`. The hosted URL
-`https://nutrition-mcp.com/mcp` is a deployment-specific endpoint, not a
-different authentication flow.
+Then configure an MCP client with `http://localhost:8080/mcp`. The
+`https://nutrition-mcp.com/mcp` URL is the original upstream project's hosted
+endpoint — this checkout has no remote deployment; the runtime is the local
+Bun server (optionally via Docker, see "Run with Docker"), and the MCP
+endpoint is `http://localhost:8080/mcp`.
 
 Switching from another tracker? See the [nutrition-app alternatives](https://nutrition-mcp.com/alternatives) — how it compares to [MyFitnessPal](https://nutrition-mcp.com/myfitnesspal-mcp), [Cronometer](https://nutrition-mcp.com/cronometer-mcp), [Lose It!](https://nutrition-mcp.com/lose-it-mcp), [MacroFactor](https://nutrition-mcp.com/macrofactor-mcp), [Yazio](https://nutrition-mcp.com/yazio-mcp), and [Lifesum](https://nutrition-mcp.com/lifesum-mcp). Bring your history with you: say "import my meals" and an importer opens in the chat, where you pick the CSV you exported from your old app, map its columns, and check what will be added before anything is saved. Exports from MyFitnessPal, Cronometer, Lose It! and MacroFactor are recognised automatically; any other CSV works by mapping its columns yourself. In clients that can't show in-chat panels, paste the export instead and the AI imports it for you. If your export has an alcohol column and you want it kept, turn alcohol tracking on before importing — the importer skips that column while tracking is off, and re-importing the same file later won't backfill it.
 
