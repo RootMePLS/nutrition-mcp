@@ -283,16 +283,40 @@ bun run format:check
 The old OAuth discovery, registration, authorize, approve, and token paths are
 not part of this runtime.
 
-## Deploy
+## Run with Docker
 
-The project includes a `Dockerfile` for container-based deployment. The
-container still requires a reachable PostgreSQL `DATABASE_URL`; it does not
-provide Supabase or OAuth services.
+One-shot local stack (app + PostgreSQL 16, migrations auto-applied):
 
-1. Push your repo to a hosting provider (e.g. DigitalOcean App Platform)
-2. Set the runtime environment variables listed above, including `DATABASE_URL`
-3. The app auto-detects the Dockerfile and deploys on port `8080`
-4. Point your domain to the deployed URL
+    docker compose up -d --build
+
+- `db` — postgres:16-alpine with a named volume and pg_isready healthcheck.
+- `migrate` — one-shot job: applies `db/migrations/*.sql` in order with
+  `ON_ERROR_STOP=1`. All migrations are forward-only and idempotent, so it is
+  safe on every `up`.
+- `app` — the MCP server, started only after migrations succeed. Healthy when
+  `/ready` proves a real database query works.
+
+The app is published on http://localhost:18080 (container port 8080; host 8080
+is typically occupied by the non-Docker dev server). MCP endpoint:
+http://localhost:18080/mcp
+
+Check status / logs / teardown:
+
+    docker compose ps
+    docker compose logs -f app
+    docker compose down        # add -v to also drop the database volume
+
+The container still requires a reachable PostgreSQL `DATABASE_URL` (provided
+by the `db` service in compose); it does not provide Supabase or OAuth
+services.
+
+## CI
+
+Every PR and push to main runs, in order: `format:check`, `typecheck`,
+`test:unit`, `test:db` (the full destructive PostgreSQL gate against a
+disposable `postgres:16` service database — nothing is skipped), then validates
+`docker-compose.yml` and builds the Docker image. There is no auto-deploy; the
+runtime server is run locally.
 
 ## License
 
