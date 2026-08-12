@@ -171,6 +171,75 @@ reason/author/timestamp, user ownership, and idempotency identity. It appends
 prior rows, and creates only a pending sync journal intent when explicitly
 authorized.
 
+## Canonical nutrient expansion (slice 1)
+
+Migration `011_nutrient_expansion.sql` extends the canonical nutrient schema
+beyond the seven core fields (`calories` kcal, `protein_g`, `carbs_g`,
+`fat_g`, `fiber_g`, `sugar_g`, `alcohol_g`) with eleven first-class
+micronutrient and fat-subtype fields. The field-name suffix IS the unit
+contract — top-level fields store canonical units only:
+
+| Field                   | Canonical unit |
+| ----------------------- | -------------- |
+| `saturated_fat_g`       | g              |
+| `polyunsaturated_fat_g` | g              |
+| `monounsaturated_fat_g` | g              |
+| `trans_fat_g`           | g              |
+| `cholesterol_mg`        | mg             |
+| `sodium_mg`             | mg             |
+| `potassium_mg`          | mg             |
+| `calcium_mg`            | mg             |
+| `iron_mg`               | mg             |
+| `vitamin_c_mg`          | mg             |
+| `vitamin_a_mcg_rae`     | mcg RAE        |
+
+**Null policy.** Original provider units stay in `raw_payload`/`provenance`
+untouched; conversion happens at ingest, never at render. Ambiguous source
+units — vitamin A in IU with an unknown form, or any `%DV` value — map to
+`null`: preserved in the raw payload, never guessed and never coerced to
+`0`. Absent keys and community-corrupt values (non-finite, negative) also
+map to `null`. `%DV` values are refused outright in slice 1: converting
+them needs a declared DV basis, which is deferred. Callers supplying
+`myfitnesspal`, `nutrition-local`, or `own` results must convert to
+canonical units before calling `log_meal_event` and omit (send `null` for)
+anything ambiguous — never `0` for unknown.
+
+**Open Food Facts mapping** (server-owned, `src/foods.ts`). OFF normalizes
+mass nutrients to grams in `*_serving`/`*_100g`:
+
+| OFF key (`_serving`/`_100g`) | Canonical field         | Conversion                                                              |
+| ---------------------------- | ----------------------- | ----------------------------------------------------------------------- |
+| `saturated-fat`              | `saturated_fat_g`       | none (g)                                                                |
+| `polyunsaturated-fat`        | `polyunsaturated_fat_g` | none (g)                                                                |
+| `monounsaturated-fat`        | `monounsaturated_fat_g` | none (g)                                                                |
+| `trans-fat`                  | `trans_fat_g`           | none (g)                                                                |
+| `cholesterol`                | `cholesterol_mg`        | g → mg (×1000)                                                          |
+| `sodium`                     | `sodium_mg`             | g → mg (×1000)                                                          |
+| `potassium`                  | `potassium_mg`          | g → mg (×1000)                                                          |
+| `calcium`                    | `calcium_mg`            | g → mg (×1000)                                                          |
+| `iron`                       | `iron_mg`               | g → mg (×1000)                                                          |
+| `vitamin-c`                  | `vitamin_c_mg`          | g → mg (×1000)                                                          |
+| `vitamin-a`                  | `vitamin_a_mcg_rae`     | only when `vitamin-a_unit` is `µg`/`mcg` (×1e6); IU or missing → `null` |
+
+`salt` is NEVER used to derive sodium — OFF already computes `sodium` from
+salt, so deriving again would double-convert.
+
+**Daily summary contract.** `get_daily_nutrient_summary(date?)` returns an
+MFP-style per-nutrient dashboard for one local day (default: today in the
+user's timezone): `{ date, timezone, meal_count, nutrients[],
+micronutrient_completeness_percent, notes[] }`. Each nutrient entry carries
+`key`, `unit`, `total` (null when no meal had data — never 0-filled),
+`goal`, `remaining`, `percent_of_goal`, `completeness_status`
+(`high`/`partial`/`low`/`none`), `data_coverage_percent`,
+`contributing_meal_count`, and `missing_meal_count`. Totals sum event-scope
+canonical results of active meals at their current version. Coverage is
+calorie-weighted when every meal of the day has calories, otherwise
+meal-count-based; `none` means zero contributors, `high` ≥ 90%, `partial` ≥
+50%, else `low`. Macro goals map from the stored nutrition goals; all
+eleven new fields return `goal: null` until micronutrient goal storage
+ships. An empty day returns a full valid payload with every nutrient
+`total: null, status: "none"` — never an error.
+
 ## Corrections, retries, and rollback
 
 Corrections append a new event version; historical versions, raw evidence,

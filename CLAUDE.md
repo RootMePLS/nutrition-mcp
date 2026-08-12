@@ -102,6 +102,10 @@ Two bridge invariants that are easy to break: a message is only treated as a res
 
 ---
 
+## Tool inventory notes
+
+- **`get_daily_nutrient_summary`** returns the MFP-style per-nutrient day dashboard (totals, goals, remaining, percent-of-goal, completeness, data coverage) as **plain JSON only** — the dashboard widget is deferred to a later phase.
+
 ## Bulk meal import
 
 Two entry points, one write path.
