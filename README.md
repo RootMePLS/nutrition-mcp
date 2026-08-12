@@ -180,6 +180,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/007_ownership_lineage_i
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/008_supplement_create_idempotency.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/009_supplement_create_idem_reconciliation.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/010_supplement_regimen_idempotency.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/migrations/011_nutrient_expansion.sql
 ```
 
 Migration `002_food_tracking.sql` is **destructive**: it deletes the legacy
@@ -187,7 +188,7 @@ Migration `002_food_tracking.sql` is **destructive**: it deletes the legacy
 food-tracking schema. Export any data you need before applying it. Migration
 `002` is safe to rerun after a complete or interrupted run, but it is not a
 backfill and there is no rollback for the legacy meal reset. Migrations `003`
-through `010` are additive and safe to rerun: `006` adds the meal-reuse lineage
+through `011` are additive and safe to rerun: `006` adds the meal-reuse lineage
 and supplement/sports-nutrition catalogue substrate (products, regimens, and
 append-only intake facts), `007` adds the database-enforced ownership/lineage
 integrity constraints on top of it, `008` adds the partial unique index
@@ -198,12 +199,14 @@ product and label data preserved, one append-only audit row per decision)
 before creating that same index `IF NOT EXISTS`, and `010` adds a nullable
 `idempotency_key` column plus a partial unique index on `supplement_regimens
 (user_id, idempotency_key)` so regimen creates serialize per (user, key) at
-the database. If `008` fails on an older
+the database. `011` adds the nullable micronutrient/fat-subtype columns to both
+meal-event result tables and must be applied to production BEFORE any code
+release that reads or writes those columns. If `008` fails on an older
 database with `could not create unique index "uniq_spv_user_create_idem"`,
 that database carries pre-`008` duplicates: apply `009` (it reconciles and
 creates the index), then re-apply `008`, which succeeds as a no-op. A clean
 setup must apply all migrations
-through `010`; stopping at `005` leaves the reuse/supplement tables absent.
+through `011`; stopping at `005` leaves the reuse/supplement tables absent.
 
 ### 2. Environment variables
 
@@ -231,7 +234,7 @@ Use `start_meal_capture`, `append_meal_capture_message`, `answer_meal_capture`, 
 
 All nine capture lifecycle tools — `start_meal_capture`, `append_meal_capture_message`, `answer_meal_capture`, `save_meal_capture_draft`, `get_meal_capture`, `cancel_meal_capture`, `expire_meal_capture`, `confirm_meal_capture`, and `attach_meal_capture_media` — declare an `outputSchema` and return machine-checkable `structuredContent` alongside their human-readable text, so clients can consume typed capture state without parsing the text payload.
 
-Migration order for a new or test database is `001_initial_schema.sql`, `002_food_tracking.sql`, `003_meal_captures.sql`, `004_calculation_bundles.sql`, `005_calculation_corrections.sql`, `006_meal_reuse_and_supplements.sql`, `007_ownership_lineage_integrity.sql`, `008_supplement_create_idempotency.sql`, `009_supplement_create_idem_reconciliation.sql`, then `010_supplement_regimen_idempotency.sql`.
+Migration order for a new or test database is `001_initial_schema.sql`, `002_food_tracking.sql`, `003_meal_captures.sql`, `004_calculation_bundles.sql`, `005_calculation_corrections.sql`, `006_meal_reuse_and_supplements.sql`, `007_ownership_lineage_integrity.sql`, `008_supplement_create_idempotency.sql`, `009_supplement_create_idem_reconciliation.sql`, `010_supplement_regimen_idempotency.sql`, then `011_nutrient_expansion.sql`.
 
 ```bash
 bun install
